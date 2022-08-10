@@ -812,7 +812,7 @@ ReabstractionInfo::createSubstitutedType(SILFunction *OrigF,
 
   // First substitute concrete types into the existing function type.
   CanSILFunctionType FnTy =
-      cast<SILFunctionType>(CanSpecializedGenericSig.getCanonicalTypeInContext(
+      cast<SILFunctionType>(CanSpecializedGenericSig.getReducedType(
           OrigF->getLoweredFunctionType()
               ->substGenericArgs(M, SubstMap, getResilienceExpansion())
               ->getUnsubstitutedType(M)));
@@ -1449,7 +1449,7 @@ void FunctionSignaturePartialSpecializer::
     createGenericParamsForCalleeGenericParams() {
   for (auto GP : CalleeGenericSig.getGenericParams()) {
     auto CanTy = GP->getCanonicalType();
-    auto CanTyInContext = CalleeGenericSig.getCanonicalTypeInContext(CanTy);
+    auto CanTyInContext = CalleeGenericSig.getReducedType(CanTy);
     auto Replacement = CanTyInContext.subst(CalleeInterfaceToCallerArchetypeMap);
     LLVM_DEBUG(llvm::dbgs() << "\n\nChecking callee generic parameter:\n";
                CanTy->dump(llvm::dbgs()));
@@ -2027,7 +2027,7 @@ prepareCallArguments(ApplySite AI, SILBuilder &Builder,
                                            LoadOwnershipQualifier::Take);
     } else {
       Val = Builder.emitLoadBorrowOperation(Loc, InputValue);
-      if (Val.getOwnershipKind() == OwnershipKind::Guaranteed)
+      if (Val->getOwnershipKind() == OwnershipKind::Guaranteed)
         ArgAtIndexNeedsEndBorrow.push_back(Arguments.size());
     }
 
@@ -2401,7 +2401,7 @@ SILArgument *ReabstractionThunkGenerator::convertReabstractionThunkArguments(
         Arguments.push_back(argVal);
       } else {
         SILValue argVal = Builder.emitLoadBorrowOperation(Loc, NewArg);
-        if (argVal.getOwnershipKind() == OwnershipKind::Guaranteed)
+        if (argVal->getOwnershipKind() == OwnershipKind::Guaranteed)
           ArgsThatNeedEndBorrow.push_back(Arguments.size());
         Arguments.push_back(argVal);
       }

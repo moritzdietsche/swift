@@ -12,6 +12,7 @@
 
 #include "ClangSyntaxPrinter.h"
 #include "swift/ABI/MetadataValues.h"
+#include "swift/AST/Decl.h"
 #include "swift/AST/Module.h"
 
 using namespace swift;
@@ -147,13 +148,15 @@ void ClangSyntaxPrinter::printSwiftTypeMetadataAccessFunctionCall(
 }
 
 void ClangSyntaxPrinter::printValueWitnessTableAccessSequenceFromTypeMetadata(
-    StringRef metadataVariable) {
-  os << "    auto *vwTableAddr = ";
+    StringRef metadataVariable, StringRef vwTableVariable, int indent) {
+  os << std::string(indent, ' ');
+  os << "auto *vwTableAddr = ";
   os << "reinterpret_cast<";
   printSwiftImplQualifier();
   os << "ValueWitnessTable **>(" << metadataVariable << "._0) - 1;\n";
   os << "#ifdef __arm64e__\n";
-  os << "    auto *vwTable = ";
+  os << std::string(indent, ' ');
+  os << "auto *" << vwTableVariable << " = ";
   os << "reinterpret_cast<";
   printSwiftImplQualifier();
   os << "ValueWitnessTable *>(ptrauth_auth_data(";
@@ -162,6 +165,18 @@ void ClangSyntaxPrinter::printValueWitnessTableAccessSequenceFromTypeMetadata(
   os << "ptrauth_blend_discriminator(vwTableAddr, "
      << SpecialPointerAuthDiscriminators::ValueWitnessTable << ")));\n";
   os << "#else\n";
-  os << "    auto *vwTable = *vwTableAddr;\n";
+  os << std::string(indent, ' ');
+  os << "auto *" << vwTableVariable << " = *vwTableAddr;\n";
   os << "#endif\n";
+}
+
+void ClangSyntaxPrinter::printCTypeMetadataTypeFunction(
+    const NominalTypeDecl *typeDecl, StringRef typeMetadataFuncName) {
+  os << "// Type metadata accessor for " << typeDecl->getNameStr() << "\n";
+  os << "SWIFT_EXTERN ";
+  printSwiftImplQualifier();
+  os << "MetadataResponseTy " << typeMetadataFuncName << '(';
+  printSwiftImplQualifier();
+  os << "MetadataRequestTy)";
+  os << " SWIFT_NOEXCEPT SWIFT_CALL;\n\n";
 }

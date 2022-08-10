@@ -151,7 +151,7 @@ bool swift::isOverrideBasedOnType(const ValueDecl *decl, Type declTy,
   auto genericSig =
       decl->getInnermostDeclContext()->getGenericSignatureOfContext();
 
-  auto canDeclTy = declTy->getCanonicalType(genericSig);
+  auto canDeclTy = declTy->getReducedType(genericSig);
 
   auto declIUOAttr = decl->isImplicitlyUnwrappedOptional();
   auto parentDeclIUOAttr = parentDecl->isImplicitlyUnwrappedOptional();
@@ -198,7 +198,7 @@ bool swift::isOverrideBasedOnType(const ValueDecl *decl, Type declTy,
   if (parentDeclTy->hasError())
     return false;
 
-  auto canParentDeclTy = parentDeclTy->getCanonicalType(genericSig);
+  auto canParentDeclTy = parentDeclTy->getReducedType(genericSig);
 
   // If this is a constructor, let's compare only parameter types.
   if (isa<ConstructorDecl>(decl)) {
@@ -490,7 +490,8 @@ static bool noteFixableMismatchedTypes(ValueDecl *decl, const ValueDecl *base) {
     auto *fnType = baseTy->getAs<AnyFunctionType>();
     baseTy = fnType->getResult();
     Type argTy = FunctionType::composeTuple(
-        ctx, baseTy->getAs<AnyFunctionType>()->getParams());
+        ctx, baseTy->getAs<AnyFunctionType>()->getParams(),
+        ParameterFlagHandling::IgnoreNonEmpty);
     auto diagKind = diag::override_type_mismatch_with_fixits_init;
     unsigned numArgs = baseInit->getParameters()->size();
     return computeFixitsForOverriddenDeclaration(
@@ -620,8 +621,7 @@ static bool parameterTypesMatch(const ValueDecl *derivedDecl,
   if (baseParams->size() != derivedParams->size())
     return false;
 
-  auto subs = SubstitutionMap::getOverrideSubstitutions(baseDecl, derivedDecl,
-                                                        /*derivedSubs=*/None);
+  auto subs = SubstitutionMap::getOverrideSubstitutions(baseDecl, derivedDecl);
 
   for (auto i : indices(baseParams->getArray())) {
     auto *baseParam = baseParams->get(i);
@@ -1264,7 +1264,7 @@ bool OverrideMatcher::checkOverride(ValueDecl *baseDecl,
     auto parentPropertyTy = getSuperMemberDeclType(baseDecl);
 
     CanType parentPropertyCanTy =
-      parentPropertyTy->getCanonicalType(
+      parentPropertyTy->getReducedType(
         decl->getInnermostDeclContext()->getGenericSignatureOfContext());
     if (!propertyTy->matches(parentPropertyCanTy,
                              TypeMatchFlags::AllowOverride)) {
@@ -1613,6 +1613,7 @@ namespace  {
 
     UNINTERESTING_ATTR(UnsafeInheritExecutor)
     UNINTERESTING_ATTR(CompilerInitialized)
+    UNINTERESTING_ATTR(AlwaysEmitConformanceMetadata)
 #undef UNINTERESTING_ATTR
 
     void visitAvailableAttr(AvailableAttr *attr) {

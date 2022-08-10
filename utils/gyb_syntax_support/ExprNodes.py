@@ -49,9 +49,16 @@ EXPR_NODES = [
     # await foo()
     Node('AwaitExpr', kind='Expr',
          children=[
-             Child('AwaitKeyword', kind='IdentifierToken',
-                   classification='Keyword',
+             Child('AwaitKeyword', kind='ContextualKeywordToken',
                    text_choices=['await']),
+             Child('Expression', kind='Expr'),
+         ]),
+
+    # The move expr
+    Node('MoveExpr', kind='Expr',
+         children=[
+             Child('MoveKeyword', kind='ContextualKeywordToken',
+                   text_choices=['_move']),
              Child('Expression', kind='Expr'),
          ]),
 
@@ -198,6 +205,17 @@ EXPR_NODES = [
              Child('ThrowsToken', kind='ThrowsToken',
                    is_optional=True),
              Child('ArrowToken', kind='ArrowToken'),
+         ]),
+
+    # An infix binary expression like x + y.
+    # NOTE: This won't come directly out of the parser. Rather, it is the
+    # result of "folding" a SequenceExpr based on knowing the precedence
+    # relationships amongst the different infix operators.
+    Node('InfixOperatorExpr', kind='Expr',
+         children=[
+             Child('LeftOperand', kind='Expr'),
+             Child('OperatorOperand', kind='Expr'),
+             Child('RightOperand', kind='Expr'),
          ]),
 
     # A floating-point literal

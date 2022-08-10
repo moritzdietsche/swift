@@ -241,8 +241,12 @@ bool SplitterStep::mergePartialSolutions() const {
       // Finalize this solution.
       auto solution = CS.finalize();
       solutionMemory += solution.getTotalMemory();
-      if (CS.isDebugMode())
-        getDebugLogger() << "(composed solution " << CS.CurrentScore << ")\n";
+      if (CS.isDebugMode()) {
+        auto &log = getDebugLogger();
+        log << "(composed solution:";
+        CS.CurrentScore.print(log);
+        log << ")\n";
+      }
 
       // Save this solution.
       Solutions.push_back(std::move(solution));
@@ -429,8 +433,12 @@ StepResult ComponentStep::take(bool prevFailed) {
   }
 
   auto solution = CS.finalize();
-  if (CS.isDebugMode())
-    getDebugLogger() << "(found solution " << getCurrentScore() << ")\n";
+  if (CS.isDebugMode()) {
+    auto &log = getDebugLogger();
+    log << "(found solution:";
+    getCurrentScore().print(log);
+    log << ")\n";
+  }
 
   Solutions.push_back(std::move(solution));
   return finalize(/*isSuccess=*/true);
@@ -957,7 +965,7 @@ StepResult ConjunctionStep::resume(bool prevFailed) {
 
           // Transform all of the unbound outer variables into
           // placeholders since we are not going to solve for
-          // each ambguous solution.
+          // each ambiguous solution.
           {
             unsigned numHoles = 0;
             for (auto *typeVar : CS.getTypeVariables()) {

@@ -4186,8 +4186,13 @@ RValue CallEmission::applyEnumElementConstructor(SGFContext C) {
                                 resultFnType, argVals,
                                 std::move(*callSite).forward());
 
-    auto payloadTy = AnyFunctionType::composeTuple(SGF.getASTContext(),
-                                                   resultFnType->getParams());
+    // We need to implode a tuple rvalue for enum construction. This is
+    // essentially an implosion of the internal arguments of a pseudo case
+    // constructor, so we can drop the parameter flags.
+    auto payloadTy = AnyFunctionType::composeTuple(
+        SGF.getASTContext(), resultFnType->getParams(),
+        ParameterFlagHandling::IgnoreNonEmpty);
+
     auto arg = RValue(SGF, argVals, payloadTy->getCanonicalType());
     payload = ArgumentSource(uncurriedLoc, std::move(arg));
     formalResultType = cast<FunctionType>(formalResultType).getResult();
@@ -6159,7 +6164,7 @@ ManagedValue SILGenFunction::emitReadAsyncLetBinding(SILLocation loc,
   
   // Load and reabstract the value if needed.
   auto genericSig = F.getLoweredFunctionType()->getInvocationGenericSignature();
-  auto substVarTy = var->getType()->getCanonicalType(genericSig);
+  auto substVarTy = var->getType()->getReducedType(genericSig);
   auto substAbstraction = AbstractionPattern(genericSig, substVarTy);
   return emitLoad(loc, visitor.varAddr, substAbstraction, substVarTy,
                   getTypeLowering(substAbstraction, substVarTy),

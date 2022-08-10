@@ -999,30 +999,6 @@ namespace {
       return false;
     }
 
-    /// If the given parameter \p param has non-trivial ownership semantics,
-    /// adjust the type of the given expression \p expr to reflect it. The
-    /// expression is expected to serve as either an argument or reference
-    /// to the parameter.
-    void adjustExprOwnershipForParam(Expr *expr,
-                                     const AnyFunctionType::Param &param) {
-      // If the 'self' parameter has non-trivial ownership, adjust the
-      // argument accordingly.
-      switch (param.getValueOwnership()) {
-      case ValueOwnership::Default:
-      case ValueOwnership::InOut:
-        break;
-
-      case ValueOwnership::Owned:
-      case ValueOwnership::Shared:
-        assert(param.getPlainType()->isEqual(cs.getType(expr)));
-
-        expr->setType(ParenType::get(cs.getASTContext(), param.getPlainType(),
-                                     param.getParameterFlags()));
-        cs.cacheType(expr);
-        break;
-      }
-    }
-
     /// Build the call inside the body of a single curry thunk
     /// "{ args in base.fn(args) }".
     ///
@@ -1048,10 +1024,6 @@ namespace {
         const auto calleeSelfParam = calleeFnTy->getParams().front();
         baseExpr =
             coerceToType(baseExpr, calleeSelfParam.getOldType(), locator);
-
-        // If the 'self' parameter has non-trivial ownership, adjust the
-        // argument type accordingly.
-        adjustExprOwnershipForParam(baseExpr, calleeSelfParam);
 
         // Uncurry the callee type in the presence of a base expression; we
         // want '(args) -> result' vs. '(self) -> (args) -> result'.
@@ -1357,11 +1329,6 @@ namespace {
 
         selfOpenedRef = new (ctx) OpaqueValueExpr(SourceLoc(), opaqueValueTy);
         cs.cacheType(selfOpenedRef);
-
-        // If we're opening an existential and the thunk's 'self' parameter has
-        // non-trivial ownership, we must adjust the parameter reference type
-        // here, because the body will use the opaque value instead.
-        adjustExprOwnershipForParam(selfParamRef, selfThunkParam);
       }
 
       Expr *outerThunkBody = nullptr;
@@ -1385,11 +1352,6 @@ namespace {
 
         // Close the existential if warranted.
         if (hasOpenedExistential) {
-          // If the callee's 'self' parameter has non-trivial ownership, adjust
-          // the argument type accordingly.
-          adjustExprOwnershipForParam(selfOpenedRef,
-                                      selfCalleeTy->getParams().front());
-
           outerThunkBody = new (ctx) OpenExistentialExpr(
               selfParamRef, cast<OpaqueValueExpr>(selfOpenedRef),
               outerThunkBody, outerThunkBody->getType());
@@ -5224,6 +5186,10 @@ namespace {
       return E;
     }
 
+    Expr *visitTypeJoinExpr(TypeJoinExpr *E) {
+      llvm_unreachable("already type-checked?");
+    }
+
     /// Interface for ExprWalker
     void walkToExprPre(Expr *expr) {
       // If we have an apply, make a note of its callee locator prior to
@@ -5401,7 +5367,7 @@ Expr *ExprRewriter::coerceTupleToTuple(Expr *expr,
 
     converted.push_back(toElt);
     labels.push_back(toLabel);
-    convertedElts.emplace_back(toEltType, toLabel, ParameterTypeFlags());
+    convertedElts.emplace_back(toEltType, toLabel);
   }
 
   // Shuffling tuple elements is an anti-pattern worthy of a diagnostic.  We
@@ -7747,9 +7713,14 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, Type openedType,
     callee = resolveConcreteDeclRef(decl, calleeLoc);
   }
 
+  // Make sure we have a function type that is callable. This helps ensure
+  // Type::mayBeCallable stays up-to-date.
+  auto fnRValueTy = cs.getType(fn)->getRValueType();
+  assert(fnRValueTy->mayBeCallable(dc));
+
   // If this is an implicit call to a `callAsFunction` method, build the
   // appropriate member reference.
-  if (cs.getType(fn)->getRValueType()->isCallableNominalType(dc)) {
+  if (fnRValueTy->isCallAsFunctionType(dc)) {
     fn = buildCallAsFunctionMethodRef(*this, apply, *overload, calleeLoc);
     if (!fn)
       return nullptr;
@@ -8607,8 +8578,8 @@ static Optional<SolutionApplicationTarget> applySolutionToInitialization(
         wrappedVar, initType->mapTypeOutOfContext());
 
     // Record the semantic initializer on the outermost property wrapper.
-    wrappedVar->getAttachedPropertyWrappers().front()
-        ->setSemanticInit(initializer);
+    wrappedVar->getOutermostAttachedPropertyWrapper()->setSemanticInit(
+        initializer);
 
     // If this is a wrapped parameter, we're done.
     if (isa<ParamDecl>(wrappedVar))
@@ -9026,7 +8997,7 @@ ExprWalker::rewriteTarget(SolutionApplicationTarget target) {
     return target;
   } else if (auto *wrappedVar = target.getAsUninitializedWrappedVar()) {
     // Get the outermost wrapper type from the solution
-    auto outermostWrapper = wrappedVar->getAttachedPropertyWrappers().front();
+    auto outermostWrapper = wrappedVar->getOutermostAttachedPropertyWrapper();
     auto backingType = solution.simplifyType(
         solution.getType(outermostWrapper->getTypeExpr()));
 
@@ -9036,12 +9007,21 @@ ExprWalker::rewriteTarget(SolutionApplicationTarget target) {
 
     return target;
   } else if (auto *pattern = target.getAsUninitializedVar()) {
+    TypeResolutionOptions options(TypeResolverContext::PatternBindingDecl);
+
     auto contextualPattern = target.getContextualPattern();
     auto patternType = target.getTypeOfUninitializedVar();
+    auto *PB = target.getPatternBindingOfUninitializedVar();
+
+    // If this is a placeholder variable, let's override its type with
+    // inferred one.
+    if (isPlaceholderVar(PB)) {
+      patternType = solution.getResolvedType(PB->getSingleVar());
+      options |= TypeResolutionFlags::OverrideType;
+    }
 
     if (auto coercedPattern = TypeChecker::coercePatternToType(
-            contextualPattern, patternType,
-            TypeResolverContext::PatternBindingDecl)) {
+            contextualPattern, patternType, options)) {
       auto resultTarget = target;
       resultTarget.setPattern(coercedPattern);
       return resultTarget;
@@ -9144,9 +9124,9 @@ ExprWalker::rewriteTarget(SolutionApplicationTarget target) {
       
       auto &log = llvm::errs();
       if (isPartial) {
-        log << "---Partially type-checked expression---\n";
+        log << "\n---Partially type-checked expression---\n";
       } else {
-        log << "---Type-checked expression---\n";
+        log << "\n---Type-checked expression---\n";
       }
       resultExpr->dump(log);
       log << "\n";
@@ -9224,7 +9204,7 @@ Optional<SolutionApplicationTarget> ConstraintSystem::applySolution(
     auto node = target.getAsASTNode();
     if (node && needsPostProcessing) {
       auto &log = llvm::errs();
-      log << "---Fully type-checked target---\n";
+      log << "\n---Fully type-checked target---\n";
       node.dump(log);
       log << "\n";
     }

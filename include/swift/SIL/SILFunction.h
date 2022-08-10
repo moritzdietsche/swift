@@ -181,6 +181,16 @@ private:
   /// to the binary.  A pointer into the module's lookup table.
   StringRef Name;
 
+  /// A single-linked list of snapshots of the function.
+  ///
+  /// Snapshots are copies of the current function at a given point in time.
+  SILFunction *snapshots = nullptr;
+  
+  /// The snapshot ID of this function.
+  ///
+  /// 0 means, it's not a snapshot, but the original function.
+  int snapshotID = 0;
+
   /// The lowered type of the function.
   CanSILFunctionType LoweredType;
 
@@ -394,11 +404,11 @@ private:
 
   SILFunction(SILModule &module, SILLinkage linkage, StringRef mangledName,
               CanSILFunctionType loweredType, GenericEnvironment *genericEnv,
-              Optional<SILLocation> loc, IsBare_t isBareSILFunction,
-              IsTransparent_t isTrans, IsSerialized_t isSerialized,
-              ProfileCounter entryCount, IsThunk_t isThunk,
-              SubclassScope classSubclassScope, Inline_t inlineStrategy,
-              EffectsKind E, const SILDebugScope *debugScope,
+              IsBare_t isBareSILFunction, IsTransparent_t isTrans,
+              IsSerialized_t isSerialized, ProfileCounter entryCount,
+              IsThunk_t isThunk, SubclassScope classSubclassScope,
+              Inline_t inlineStrategy, EffectsKind E,
+              const SILDebugScope *debugScope,
               IsDynamicallyReplaceable_t isDynamic,
               IsExactSelfClass_t isExactSelfClass,
               IsDistributed_t isDistributed);
@@ -418,18 +428,14 @@ private:
          SILFunction *InsertBefore = nullptr,
          const SILDebugScope *DebugScope = nullptr);
 
-  void init(SILLinkage Linkage, StringRef Name,
-                         CanSILFunctionType LoweredType,
-                         GenericEnvironment *genericEnv,
-                         Optional<SILLocation> Loc, IsBare_t isBareSILFunction,
-                         IsTransparent_t isTrans, IsSerialized_t isSerialized,
-                         ProfileCounter entryCount, IsThunk_t isThunk,
-                         SubclassScope classSubclassScope,
-                         Inline_t inlineStrategy, EffectsKind E,
-                         const SILDebugScope *DebugScope,
-                         IsDynamicallyReplaceable_t isDynamic,
-                         IsExactSelfClass_t isExactSelfClass,
-                         IsDistributed_t isDistributed);
+  void init(SILLinkage Linkage, StringRef Name, CanSILFunctionType LoweredType,
+            GenericEnvironment *genericEnv, IsBare_t isBareSILFunction,
+            IsTransparent_t isTrans, IsSerialized_t isSerialized,
+            ProfileCounter entryCount, IsThunk_t isThunk,
+            SubclassScope classSubclassScope, Inline_t inlineStrategy,
+            EffectsKind E, const SILDebugScope *DebugScope,
+            IsDynamicallyReplaceable_t isDynamic,
+            IsExactSelfClass_t isExactSelfClass, IsDistributed_t isDistributed);
 
   /// Set has ownership to the given value. True means that the function has
   /// ownership, false means it does not.
@@ -437,10 +443,30 @@ private:
   /// Only for use by FunctionBuilders!
   void setHasOwnership(bool newValue) { HasOwnership = newValue; }
 
+  void setName(StringRef name) {
+    // All the snapshots share the same name.
+    SILFunction *sn = this;
+    do {
+      sn->Name = name;
+    } while ((sn = sn->snapshots) != nullptr);
+  }
+
 public:
   ~SILFunction();
 
   SILModule &getModule() const { return Module; }
+
+  /// Creates a snapshot with a given `ID` from the current function.
+  void createSnapshot(int ID);
+  
+  /// Returns the snapshot with the given `ID` or null if no such snapshot exists.
+  SILFunction *getSnapshot(int ID);
+  
+  /// Restores the current function from a given snapshot.
+  void restoreFromSnapshot(int ID);
+  
+  /// Deletes a snapshot with the `ID`.
+  void deleteSnapshot(int ID);
 
   SILType getLoweredType() const {
     return SILType::getPrimitiveObjectType(LoweredType);
