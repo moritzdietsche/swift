@@ -6904,6 +6904,11 @@ ConstraintSystem::matchTypes(Type type1, Type type2, ConstraintKind kind,
         if (constraints.back()->getKind() == ConstraintKind::Bind)
           constraints.back()->setFavored();
 
+        if (*restriction == ConversionRestrictionKind::OptionalToOptional) {
+          if(constraints.back()->getKind() == ConstraintKind::Conversion)
+            constraints.back()->setFavored();
+         }
+
         continue;
       }
 

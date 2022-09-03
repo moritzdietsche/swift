@@ -949,12 +949,10 @@ let _ = "foo \(42 /*
 // expected-error @-2 {{expected expression}}
 // expected-error @-3 {{unterminated string literal}}
 
-// GitHub #57079 / SR-14729
-func no57079_unchanged<T>(t: T, t2: T ) -> T? {
-    t ?? t2 // expected-warning {{left side of nil coalescing operator '??' has non-optional type 'T', so the right side is never used}}
+func no57079<T>(_ t: T?, _ t2: T?) -> T?? {
+  // t was implicitly be promoted to T??
+  return t ?? t2
 }
 
-func no57079_new<T>(t: T?, t2: T?
-) -> T?? {
-    t ?? t2 // expected-warning {{left side of nil coalescing operator '??' is implicitly promoted to non-optional type 'T??', so the right side is never used}}
-}
+
+
