@@ -1355,18 +1355,10 @@ static void diagSyntacticUseRestrictions(const Expr *E, const DeclContext *DC,
       Expr *subExpr = nullptr;
       if (calleeName == "??" &&
           (subExpr = isImplicitPromotionToOptional(lhs))) {
-        // Check if `subExpr` is optional before implicit promotion.
-        if (subExpr->getType()->getOptionalObjectType()) {
-          Ctx.Diags.diagnose(DRE->getLoc(), diag::use_of_qq_on_implicitly_promoted_optional_value,
-                             lhs->getType())
-            .highlight(lhs->getSourceRange())
-            .fixItRemove(SourceRange(DRE->getLoc(), rhs->getEndLoc()));
-        } else {
-          Ctx.Diags.diagnose(DRE->getLoc(), diag::use_of_qq_on_non_optional_value,
-                             subExpr->getType())
-            .highlight(lhs->getSourceRange())
-            .fixItRemove(SourceRange(DRE->getLoc(), rhs->getEndLoc()));
-        }
+        Ctx.Diags.diagnose(DRE->getLoc(), diag::use_of_qq_on_non_optional_value,
+                           subExpr->getType())
+          .highlight(lhs->getSourceRange())
+          .fixItRemove(SourceRange(DRE->getLoc(), rhs->getEndLoc()));
           
         return;
       }
