@@ -40,7 +40,7 @@ Expr *getVoidExpr(ASTContext &ctx, SourceLoc contextLoc = SourceLoc()) {
 /// Find any type variable references inside of an AST node.
 class TypeVariableRefFinder : public ASTWalker {
   /// A stack of all closures the walker encountered so far.
-  SmallVector<DeclContext *, 2> ClosureDCs;
+  SmallVector<DeclContext *> ClosureDCs;
 
   ConstraintSystem &CS;
   ASTNode Parent;
@@ -1662,7 +1662,7 @@ private:
       assert(isSingleExpression);
       resultTarget = SolutionApplicationTarget(
           resultExpr, context.getAsDeclContext(),
-          mode == convertToResult ? CTP_ReturnStmt : CTP_Unused,
+          mode == convertToResult ? CTP_ClosureResult : CTP_Unused,
           mode == convertToResult ? resultType : Type(),
           /*isDiscarded=*/false);
     }

@@ -511,7 +511,7 @@ Type TypeBase::typeEraseOpenedArchetypesWithRoot(
   if (!hasOpenedExistential())
     return type;
 
-  const auto sig = root->getASTContext().getOpenedArchetypeSignature(
+  const auto sig = root->getASTContext().getOpenedExistentialSignature(
       root->getExistentialType(), useDC->getGenericSignatureOfContext());
 
   unsigned metatypeDepth = 0;
@@ -578,6 +578,28 @@ Type TypeBase::typeEraseOpenedArchetypesWithRoot(
   };
 
   return transformFn(type);
+}
+
+void TypeBase::getTypeSequenceParameters(
+    SmallVectorImpl<Type> &rootTypeSequenceParams) const {
+  llvm::SmallDenseSet<CanType, 2> visited;
+
+  auto recordType = [&](Type t) {
+    if (visited.insert(t->getCanonicalType()).second)
+      rootTypeSequenceParams.push_back(t);
+  };
+
+  Type(const_cast<TypeBase *>(this)).visit([&](Type t) {
+    if (auto *paramTy = t->getAs<GenericTypeParamType>()) {
+      if (paramTy->isTypeSequence()) {
+        recordType(paramTy);
+      }
+    } else if (auto *archetypeTy = t->getAs<SequenceArchetypeType>()) {
+      if (archetypeTy->isRoot()) {
+        recordType(t);
+      }
+    }
+  });
 }
 
 Type TypeBase::addCurriedSelfType(const DeclContext *dc) {
@@ -882,7 +904,7 @@ Type TypeBase::lookThroughAllOptionalTypes(SmallVectorImpl<Type> &optionals){
 }
 
 unsigned int TypeBase::getOptionalityDepth() {
-  SmallVector<Type, 4> types;
+  SmallVector<Type> types;
   lookThroughAllOptionalTypes(types);
   return types.size();
 }
@@ -1593,8 +1615,9 @@ CanType TypeBase::computeCanonicalType() {
 
   case TypeKind::PackExpansion: {
     auto *expansion = cast<PackExpansionType>(this);
-    auto pattern = expansion->getPatternType()->getCanonicalType();
-    Result = PackExpansionType::get(pattern);
+    auto patternType = expansion->getPatternType()->getCanonicalType();
+    auto countType = expansion->getCountType()->getCanonicalType();
+    Result = PackExpansionType::get(patternType, countType);
     break;
   }
 
@@ -4163,7 +4186,7 @@ CanType ProtocolCompositionType::getMinimalCanonicalType(
   // Use generic signature minimization: the requirements of the signature will
   // represent the minimal composition.
   auto sig = useDC->getGenericSignatureOfContext();
-  const auto Sig = Ctx.getOpenedArchetypeSignature(CanTy, sig);
+  const auto Sig = Ctx.getOpenedExistentialSignature(CanTy, sig);
   const auto &Reqs = Sig.getRequirements();
   if (Reqs.size() == 1) {
     return Reqs.front().getSecondType()->getCanonicalType();
@@ -4178,6 +4201,8 @@ CanType ProtocolCompositionType::getMinimalCanonicalType(
     }
 
     switch (Req.getKind()) {
+    case RequirementKind::SameCount:
+      llvm_unreachable("Same-count requirement not supported here");
     case RequirementKind::Superclass:
     case RequirementKind::Conformance:
       MinimalMembers.push_back(Req.getSecondType());
@@ -4523,26 +4548,16 @@ static Type substGenericFunctionType(GenericFunctionType *genericFnType,
   for (const auto &req : genericFnType->getRequirements()) {
     // Substitute into the requirement.
     auto substReqt = req.subst(substitutions, lookupConformances, options);
-    if (!substReqt) {
-      anySemanticChanges = true;
-      continue;
-    }
 
     // Did anything change?
     if (!anySemanticChanges &&
-        (!req.getFirstType()->isEqual(substReqt->getFirstType()) ||
+        (!req.getFirstType()->isEqual(substReqt.getFirstType()) ||
          (req.getKind() != RequirementKind::Layout &&
-          !req.getSecondType()->isEqual(substReqt->getSecondType())))) {
+          !req.getSecondType()->isEqual(substReqt.getSecondType())))) {
       anySemanticChanges = true;
     }
 
-    // Skip any erroneous requirements.
-    if (substReqt->getFirstType()->hasError() ||
-        (substReqt->getKind() != RequirementKind::Layout &&
-         substReqt->getSecondType()->hasError()))
-      continue;
-
-    requirements.push_back(*substReqt);
+    requirements.push_back(substReqt);
   }
 
   GenericSignature genericSig;
@@ -4871,11 +4886,15 @@ TypeBase::getContextSubstitutions(const DeclContext *dc,
     break;
   }
 
+  // Add any outer generic parameters from the local context.
   while (n > 0) {
     auto *gp = params[--n];
-    auto substTy = (genericEnv
-                    ? genericEnv->mapTypeIntoContext(gp)
-                    : gp);
+    Type substTy = gp;
+    if (baseTy && baseTy->is<ErrorType>())
+      substTy = ErrorType::get(baseTy->getASTContext());
+    else if (genericEnv)
+      substTy = genericEnv->mapTypeIntoContext(gp);
+
     auto result = substitutions.insert(
       {gp->getCanonicalType()->castTo<GenericTypeParamType>(),
        substTy});
@@ -5545,12 +5564,9 @@ case TypeKind::Id:
           return remap;
         }
 
-        if (input->is<TypeVariableType>()) {
-          if (auto *PT = (*remap)->getAs<PackType>()) {
-            maxArity = std::max(maxArity, PT->getNumElements());
-            cache.insert({input, PT});
-          }
-        } else if (input->isTypeSequenceParameter()) {
+        if (input->is<TypeVariableType>() ||
+            input->isTypeSequenceParameter() ||
+            input->is<SequenceArchetypeType>()) {
           if (auto *PT = (*remap)->getAs<PackType>()) {
             maxArity = std::max(maxArity, PT->getNumElements());
             cache.insert({input, PT});
@@ -5573,7 +5589,13 @@ case TypeKind::Id:
     if (!transformedPat)
       return Type();
 
-    if (transformedPat.getPointer() == expand->getPatternType().getPointer())
+    Type transformedCount =
+        expand->getCountType().transformWithPosition(pos, gather);
+    if (!transformedCount)
+      return Type();
+
+    if (transformedPat.getPointer() == expand->getPatternType().getPointer() &&
+        transformedCount.getPointer() == expand->getCountType().getPointer())
       return *this;
 
     llvm::DenseMap<TypeBase *, PackType *> expansions;
@@ -5583,7 +5605,7 @@ case TypeKind::Id:
       // If we didn't find any expansions, either the caller wasn't interested
       // in expanding this pack, or something has gone wrong. Leave off the
       // expansion and return the transformed type.
-      return PackExpansionType::get(transformedPat);
+      return PackExpansionType::get(transformedPat, transformedCount);
     }
 
     SmallVector<Type, 8> elts;
@@ -6261,7 +6283,7 @@ TypeBase::getAutoDiffTangentSpace(LookupConformanceFn lookupConformance) {
           TangentSpace::getTuple(ctx.TheEmptyTupleType->castTo<TupleType>()));
     if (newElts.size() == 1)
       return cache(TangentSpace::getTangentVector(newElts.front().getType()));
-    auto *tupleType = TupleType::get(newElts, ctx)->castTo<TupleType>();
+    auto *tupleType = TupleType::get(newElts, ctx);
     return cache(TangentSpace::getTuple(tupleType));
   }
 

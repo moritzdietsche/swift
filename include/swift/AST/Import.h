@@ -84,12 +84,21 @@ enum class ImportFlags {
   /// concurrency.
   Preconcurrency = 0x20,
 
+  /// The module's symbols are linked weakly.
+  WeakLinked = 0x40,
+
   /// Used for DenseMap.
-  Reserved = 0x80
+  Reserved = 0x80,
+
+  /// The imported module can only be referenced from SPI decls, or
+  /// implementation details.
+  SPIOnly = 0x100
 };
 
 /// \see ImportFlags
 using ImportOptions = OptionSet<ImportFlags>;
+
+void simple_display(llvm::raw_ostream &out, ImportOptions options);
 
 // MARK: - Import Paths
 

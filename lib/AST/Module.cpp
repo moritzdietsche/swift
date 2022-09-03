@@ -1570,6 +1570,11 @@ void ModuleDecl::getImportedModules(SmallVectorImpl<ImportedModule> &modules,
   FORWARD(getImportedModules, (modules, filter));
 }
 
+void ModuleDecl::getMissingImportedModules(
+    SmallVectorImpl<ImportedModule> &imports) const {
+  FORWARD(getMissingImportedModules, (imports));
+}
+
 void
 SourceFile::getImportedModules(SmallVectorImpl<ImportedModule> &modules,
                                ModuleDecl::ImportFilter filter) const {
@@ -1591,6 +1596,8 @@ SourceFile::getImportedModules(SmallVectorImpl<ImportedModule> &modules,
       requiredFilter |= ModuleDecl::ImportFilterKind::Exported;
     else if (desc.options.contains(ImportFlags::ImplementationOnly))
       requiredFilter |= ModuleDecl::ImportFilterKind::ImplementationOnly;
+    else if (desc.options.contains(ImportFlags::SPIOnly))
+      requiredFilter |= ModuleDecl::ImportFilterKind::SPIOnly;
     else if (desc.options.contains(ImportFlags::SPIAccessControl))
       requiredFilter |= ModuleDecl::ImportFilterKind::SPIAccessControl;
     else
@@ -1602,6 +1609,12 @@ SourceFile::getImportedModules(SmallVectorImpl<ImportedModule> &modules,
     if (filter.contains(requiredFilter))
       modules.push_back(desc.module);
   }
+}
+
+void SourceFile::getMissingImportedModules(
+    SmallVectorImpl<ImportedModule> &modules) const {
+  for (auto module : MissingImportedModules)
+    modules.push_back(module);
 }
 
 void SourceFile::dumpSeparatelyImportedOverlays() const {
@@ -1893,6 +1906,7 @@ SourceFile::collectLinkLibraries(ModuleDecl::LinkLibraryCallback callback) const
 
   ModuleDecl::ImportFilter topLevelFilter = filter;
   topLevelFilter |= ModuleDecl::ImportFilterKind::ImplementationOnly;
+  topLevelFilter |= ModuleDecl::ImportFilterKind::SPIOnly;
   topLevel->getImportedModules(stack, topLevelFilter);
 
   // Make sure the top-level module is first; we want pre-order-ish traversal.
@@ -2389,19 +2403,64 @@ void SourceFile::setImportUsedPreconcurrency(
   PreconcurrencyImportsUsed.insert(import);
 }
 
-bool HasImplementationOnlyImportsRequest::evaluate(Evaluator &evaluator,
-                                                   SourceFile *SF) const {
-  return llvm::any_of(SF->getImports(),
-                      [](AttributedImport<ImportedModule> desc) {
-    return desc.options.contains(ImportFlags::ImplementationOnly);
-  });
+bool HasImportsMatchingFlagRequest::evaluate(Evaluator &evaluator,
+                                             SourceFile *SF,
+                                             ImportFlags flag) const {
+  for (auto desc : SF->getImports()) {
+    if (desc.options.contains(flag))
+      return true;
+  }
+  return false;
 }
 
-bool SourceFile::hasImplementationOnlyImports() const {
+Optional<bool> HasImportsMatchingFlagRequest::getCachedResult() const {
+  SourceFile *sourceFile = std::get<0>(getStorage());
+  ImportFlags flag = std::get<1>(getStorage());
+  if (sourceFile->validCachedImportOptions.contains(flag))
+    return sourceFile->cachedImportOptions.contains(flag);
+
+  return None;
+}
+
+void HasImportsMatchingFlagRequest::cacheResult(bool value) const {
+  SourceFile *sourceFile = std::get<0>(getStorage());
+  ImportFlags flag = std::get<1>(getStorage());
+
+  sourceFile->validCachedImportOptions |= flag;
+  if (value)
+    sourceFile->cachedImportOptions |= flag;
+}
+
+void swift::simple_display(llvm::raw_ostream &out, ImportOptions options) {
+  using Flag = std::pair<ImportFlags, StringRef>;
+  Flag possibleFlags[] = {
+#define FLAG(Name) {ImportFlags::Name, #Name},
+    FLAG(Exported)
+    FLAG(Testable)
+    FLAG(PrivateImport)
+    FLAG(ImplementationOnly)
+    FLAG(SPIAccessControl)
+    FLAG(Preconcurrency)
+    FLAG(WeakLinked)
+    FLAG(Reserved)
+#undef FLAG
+  };
+
+  auto flagsToPrint = llvm::make_filter_range(
+      possibleFlags, [&](Flag flag) { return options & flag.first; });
+
+  out << "{ ";
+  interleave(
+      flagsToPrint, [&](Flag flag) { out << flag.second; },
+      [&] { out << ", "; });
+  out << " }";
+}
+
+bool SourceFile::hasImportsWithFlag(ImportFlags flag) const {
   auto &ctx = getASTContext();
   auto *mutableThis = const_cast<SourceFile *>(this);
   return evaluateOrDefault(
-      ctx.evaluator, HasImplementationOnlyImportsRequest{mutableThis}, false);
+      ctx.evaluator, HasImportsMatchingFlagRequest{mutableThis, flag}, false);
 }
 
 bool SourceFile::hasTestableOrPrivateImport(
@@ -2490,6 +2549,21 @@ RestrictedImportKind SourceFile::getRestrictedImportKind(const ModuleDecl *modul
   if (imports.isImportedBy(module, getParentModule()))
     return RestrictedImportKind::None;
 
+  if (importKind == RestrictedImportKind::Implicit &&
+      (module->getLibraryLevel() == LibraryLevel::API ||
+       getParentModule()->getLibraryLevel() != LibraryLevel::API)) {
+    // Hack to fix swiftinterfaces in case of missing imports.
+    // We can get rid of this logic when we don't leak the use of non-locally
+    // imported things in API.
+    ImportPath::Element pathElement = {module->getName(), SourceLoc()};
+    auto pathArray = getASTContext().AllocateCopy(
+                       llvm::makeArrayRef(pathElement));
+    auto missingImport = ImportedModule(
+                           ImportPath::Access(pathArray),
+                           const_cast<ModuleDecl *>(module));
+    addMissingImportedModule(missingImport);
+  }
+
   return importKind;
 }
 
@@ -2529,6 +2603,7 @@ canBeUsedForCrossModuleOptimization(DeclContext *ctxt) const {
   // @_implementationOnly or @_spi.
   ModuleDecl::ImportFilter filter = {
     ModuleDecl::ImportFilterKind::ImplementationOnly,
+    ModuleDecl::ImportFilterKind::SPIOnly,
     ModuleDecl::ImportFilterKind::SPIAccessControl
   };
   SmallVector<ImportedModule, 4> results;
@@ -2574,6 +2649,25 @@ bool SourceFile::isImportedAsSPI(const ValueDecl *targetDecl) const {
   return false;
 }
 
+bool SourceFile::importsModuleAsWeakLinked(const ModuleDecl *module) const {
+  for (auto &import : *Imports) {
+    if (!import.options.contains(ImportFlags::WeakLinked))
+      continue;
+
+    const ModuleDecl *importedModule = import.module.importedModule;
+    if (module == importedModule)
+      return true;
+
+    // Also check whether the target module is actually the underlyingClang
+    // module for this @_weakLinked import.
+    const ModuleDecl *clangModule =
+        importedModule->getUnderlyingModuleIfOverlay();
+    if (module == clangModule)
+      return true;
+  }
+  return false;
+}
+
 bool ModuleDecl::isImportedAsSPI(const SpecializeAttr *attr,
                                  const ValueDecl *targetDecl) const {
   auto targetModule = targetDecl->getModuleContext();
@@ -2597,6 +2691,14 @@ bool ModuleDecl::isImportedAsSPI(Identifier spiGroup,
   if (importedSPIGroups.empty())
     return false;
   return importedSPIGroups.count(spiGroup);
+}
+
+bool ModuleDecl::isImportedAsWeakLinked(const ModuleDecl *module) const {
+  for (auto file : getFiles()) {
+    if (file->importsModuleAsWeakLinked(module))
+      return true;
+  }
+  return false;
 }
 
 bool Decl::isSPI() const {

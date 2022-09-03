@@ -310,19 +310,19 @@ namespace swift {
       return parseASTType(result, genericSig, genericParams);
     }
 
-    bool parseIsNoImplicitCopy() {
+    Optional<StringRef> parseOptionalAttribute(ArrayRef<StringRef> expected) {
       // We parse here @ <identifier>.
       if (P.Tok.getKind() != tok::at_sign)
-        return false;
+        return llvm::None;
 
-      // Make sure our text is no implicit copy.
-      if (P.peekToken().getText() != "noImplicitCopy")
-        return false;
+      auto name = P.peekToken().getText();
+      if (!is_contained(expected, name))
+        return llvm::None;
 
       // Ok, we can do this.
       P.consumeToken(tok::at_sign);
       P.consumeToken(tok::identifier);
-      return true;
+      return name;
     }
 
     bool parseSILOwnership(ValueOwnershipKind &OwnershipKind) {
@@ -4920,6 +4920,37 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
                                    IsInitialization_t(IsInit));
       break;
     }
+    case SILInstructionKind::ExplicitCopyAddrInst: {
+      bool IsTake = false, IsInit = false;
+      UnresolvedValueName SrcLName;
+      SILValue DestLVal;
+      SourceLoc ToLoc, DestLoc;
+      Identifier ToToken;
+      if (parseSILOptional(IsTake, *this, "take") || parseValueName(SrcLName) ||
+          parseSILIdentifier(ToToken, ToLoc, diag::expected_tok_in_sil_instr,
+                             "to") ||
+          parseSILOptional(IsInit, *this, "initialization") ||
+          parseTypedValueRef(DestLVal, DestLoc, B) ||
+          parseSILDebugLocation(InstLoc, B))
+        return true;
+
+      if (ToToken.str() != "to") {
+        P.diagnose(ToLoc, diag::expected_tok_in_sil_instr, "to");
+        return true;
+      }
+
+      if (!DestLVal->getType().isAddress()) {
+        P.diagnose(DestLoc, diag::sil_invalid_instr_operands);
+        return true;
+      }
+
+      SILValue SrcLVal =
+          getLocalValue(SrcLName, DestLVal->getType(), InstLoc, B);
+      ResultVal =
+          B.createExplicitCopyAddr(InstLoc, SrcLVal, DestLVal, IsTake_t(IsTake),
+                                   IsInitialization_t(IsInit));
+      break;
+    }
     case SILInstructionKind::MarkUnresolvedMoveAddrInst: {
       UnresolvedValueName SrcLName;
       SILValue DestLVal;
@@ -6338,7 +6369,31 @@ bool SILParser::parseSILBasicBlock(SILBuilder &B) {
             P.parseToken(tok::colon, diag::expected_sil_colon_value_ref))
           return true;
 
-        bool foundNoImplicitCopy = parseIsNoImplicitCopy();
+        bool foundNoImplicitCopy = false;
+        bool foundLexical = false;
+        bool foundEagerMove = false;
+        while (auto attributeName = parseOptionalAttribute(
+                   {"noImplicitCopy", "_lexical", "_eagerMove"})) {
+          if (*attributeName == "noImplicitCopy")
+            foundNoImplicitCopy = true;
+          else if (*attributeName == "_lexical")
+            foundLexical = true;
+          else if (*attributeName == "_eagerMove")
+            foundEagerMove = true;
+          else {
+            llvm_unreachable("Unexpected attribute!");
+          }
+        }
+
+        LifetimeAnnotation lifetime = LifetimeAnnotation::None;
+        if (foundEagerMove && foundLexical) {
+          P.diagnose(NameLoc, diag::sil_arg_both_lexical_and_eagerMove);
+          return true;
+        } else if (foundEagerMove) {
+          lifetime = LifetimeAnnotation::EagerMove;
+        } else if (foundLexical) {
+          lifetime = LifetimeAnnotation::Lexical;
+        }
 
         // If SILOwnership is enabled and we are not assuming that we are
         // parsing unqualified SIL, look for printed value ownership kinds.
@@ -6353,6 +6408,7 @@ bool SILParser::parseSILBasicBlock(SILBuilder &B) {
         if (IsEntry) {
           auto *fArg = BB->createFunctionArgument(Ty);
           fArg->setNoImplicitCopy(foundNoImplicitCopy);
+          fArg->setLifetimeAnnotation(lifetime);
           Arg = fArg;
 
           // Today, we construct the ownership kind straight from the function
@@ -6483,7 +6539,7 @@ bool SILParserState::parseDeclSIL(Parser &P) {
     if (!objCReplacementFor.empty())
       FunctionState.F->setObjCReplacement(objCReplacementFor);
     FunctionState.F->setSpecialPurpose(specialPurpose);
-    FunctionState.F->setAlwaysWeakImported(isWeakImported);
+    FunctionState.F->setIsAlwaysWeakImported(isWeakImported);
     FunctionState.F->setAvailabilityForLinkage(availability);
     FunctionState.F->setWithoutActuallyEscapingThunk(
       isWithoutActuallyEscapingThunk);

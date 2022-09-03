@@ -1255,7 +1255,7 @@ public:
   /// \param type The type for which we are retrieving the conformance.
   ///
   /// \param inherited The inherited conformance.
-  InheritedProtocolConformance *
+  ProtocolConformance *
   getInheritedConformance(Type type, ProtocolConformance *inherited);
 
   /// Get the lazy data for the given declaration.
@@ -1343,8 +1343,15 @@ public:
   /// particular, the opened archetype signature does not have requirements for
   /// conformances inherited from superclass constraints while existential
   /// values do.
-  CanGenericSignature getOpenedArchetypeSignature(Type type,
-                                                  GenericSignature parentSig);
+  CanGenericSignature getOpenedExistentialSignature(Type type,
+                                                    GenericSignature parentSig);
+
+  /// Get a generic signature where the generic parameter τ_d_i represents
+  /// the element of the pack generic parameter τ_d_i… in \p baseGenericSig.
+  ///
+  /// This drops the @_typeSequence attribute from each generic parameter,
+  /// and converts same-element requirements to same-type requirements.
+  CanGenericSignature getOpenedElementSignature(CanGenericSignature baseGenericSig);
 
   GenericSignature getOverrideGenericSignature(const ValueDecl *base,
                                                const ValueDecl *derived);

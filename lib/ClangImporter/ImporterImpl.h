@@ -53,6 +53,7 @@
 #include <functional>
 #include <set>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 namespace llvm {
@@ -621,6 +622,10 @@ public:
                      llvm::DenseSet<clang::FunctionDecl *>>>>
       cxxMethods;
 
+  // Keep track of the decls that were already cloned for this specific class.
+  llvm::DenseMap<std::pair<ValueDecl *, DeclContext *>, ValueDecl *>
+      clonedBaseMembers;
+
   // Cache for already-specialized function templates and any thunks they may
   // have.
   llvm::DenseMap<clang::FunctionDecl *, ValueDecl *>
@@ -765,7 +770,7 @@ public:
   /// Tracks macro definitions from the bridging header.
   std::vector<clang::IdentifierInfo *> BridgeHeaderMacros;
   /// Tracks included headers from the bridging header.
-  llvm::DenseSet<const clang::FileEntry *> BridgeHeaderFiles;
+  llvm::DenseSet<clang::FileEntryRef> BridgeHeaderFiles;
 
   void addBridgeHeaderTopLevelDecls(clang::Decl *D);
   bool shouldIgnoreBridgeHeaderTopLevelDecl(clang::Decl *D);

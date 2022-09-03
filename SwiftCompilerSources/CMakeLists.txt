@@ -230,18 +230,28 @@ else()
 
   add_subdirectory(Sources)
 
-  # This is a hack to get correct dependencies from imported C++ headers:
-  # step 1: generate a dummy source file, which just includes all headers defined in include/swift/module.modulemap
-  add_custom_command(
-    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/HeaderDependencies.cpp"
-    COMMAND
-        "sed"
-        -n -e "/header/!d" -e "s/.*header/#include/" -e "w ${CMAKE_CURRENT_BINARY_DIR}/HeaderDependencies.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../include/swift/module.modulemap"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../include/swift/module.modulemap"
-    COMMENT "Generate HeaderDependencies.cpp"
-)
-  
+  # TODO: generate this dynamically through the modulemap; this cannot use `sed`
+  # as that is not available on all paltforms (e.g. Windows).
+  #
+  # step 1: generate a dummy source file, which just includes all headers
+  # defined in include/swift/module.modulemap
+  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/HeaderDependencies.cpp"
+       "
+#include \"Basic/BridgedSwiftObject.h\"
+#include \"Basic/BasicBridging.h\"
+#include \"Basic/SourceLoc.h\"
+
+#include \"AST/ASTBridging.h\"
+#include \"AST/DiagnosticEngine.h\"
+#include \"AST/DiagnosticConsumer.h\"
+
+#include \"SIL/SILBridging.h\"
+
+#include \"SILOptimizer/OptimizerBridging.h\"
+
+#include \"Parse/RegexParserBridging.h\"
+")
+
   # step 2: build a library containing that source file. This library depends on all the included header files.
   #         The swift modules can now depend on that target.
   #         Note that this library is unused, i.e. not linked to anything.   
@@ -291,12 +301,13 @@ else()
       endif()
     endif()
     if(SWIFT_HOST_VARIANT_SDK IN_LIST SWIFT_DARWIN_PLATFORMS AND SWIFT_STDLIB_SUPPORT_BACK_DEPLOYMENT)
-      set(platform ${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_LIB_SUBDIR})
-      set(compatibility_libs
-          "swiftCompatibility50-${platform}"
-          "swiftCompatibility51-${platform}"
-          "swiftCompatibilityDynamicReplacements-${platform}")
-
+      # We cannot specify directly HostCompatibilityLibs
+      # because ultimately is used to specify a dependency for a
+      # custom target and, unlike `target_link_libraries`, such dependency
+      # would be lost at the generation of the build system.
+      get_property(compatibility_libs
+        TARGET HostCompatibilityLibs
+        PROPERTY INTERFACE_LINK_LIBRARIES)
       list(APPEND b0_deps ${compatibility_libs})
       list(APPEND b1_deps ${compatibility_libs})
     endif()

@@ -107,6 +107,33 @@ enum class FreeTypeVariableBinding {
   UnresolvedType
 };
 
+/// Describes whether or not a result builder method is supported.
+struct ResultBuilderOpSupport {
+  enum Classification {
+    Unsupported,
+    Unavailable,
+    Supported
+  };
+  Classification Kind;
+
+  ResultBuilderOpSupport(Classification Kind) : Kind(Kind) {}
+
+  /// Returns whether or not the builder method is supported. If
+  /// \p requireAvailable is true, an unavailable method will be considered
+  /// unsupported.
+  bool isSupported(bool requireAvailable) const {
+    switch (Kind) {
+    case Unsupported:
+      return false;
+    case Unavailable:
+      return !requireAvailable;
+    case Supported:
+      return true;
+    }
+    llvm_unreachable("Unhandled case in switch!");
+  }
+};
+
 namespace constraints {
 
 struct ResultBuilder {
@@ -115,7 +142,9 @@ private:
   /// An implicit variable that represents `Self` type of the result builder.
   VarDecl *BuilderSelf;
   Type BuilderType;
-  llvm::SmallDenseMap<DeclName, bool> SupportedOps;
+
+  /// Cache of supported result builder operations.
+  llvm::SmallDenseMap<DeclName, ResultBuilderOpSupport> SupportedOps;
 
   Identifier BuildOptionalId;
 
@@ -142,6 +171,13 @@ public:
                 bool checkAvailability = false);
 
   bool supportsOptional() { return supports(getBuildOptionalId()); }
+
+  /// Checks whether the `buildPartialBlock` method is supported.
+  bool supportsBuildPartialBlock(bool checkAvailability);
+
+  /// Checks whether the builder can use `buildPartialBlock` to combine
+  /// expressions, instead of `buildBlock`.
+  bool canUseBuildPartialBlock();
 
   Expr *buildCall(SourceLoc loc, Identifier fnName,
                   ArrayRef<Expr *> argExprs,
@@ -590,7 +626,7 @@ public:
 
   /// Print the type variable to the given output stream.
   void print(llvm::raw_ostream &OS);
-  
+
 private:
   StringRef getTypeVariableOptions(TypeVariableOptions TVO) const {
   #define ENTRY(Kind, String) case TypeVariableOptions::Kind: return String
@@ -715,13 +751,29 @@ class FunctionArgApplyInfo {
   FunctionType *FnType;
   const ValueDecl *Callee;
 
-public:
   FunctionArgApplyInfo(ArgumentList *argList, Expr *argExpr, unsigned argIdx,
                        Type argType, unsigned paramIdx, Type fnInterfaceType,
                        FunctionType *fnType, const ValueDecl *callee)
       : ArgList(argList), ArgExpr(argExpr), ArgIdx(argIdx), ArgType(argType),
         ParamIdx(paramIdx), FnInterfaceType(fnInterfaceType), FnType(fnType),
         Callee(callee) {}
+
+public:
+  static Optional<FunctionArgApplyInfo>
+  get(ArgumentList *argList, Expr *argExpr, unsigned argIdx, Type argType,
+      unsigned paramIdx, Type fnInterfaceType, FunctionType *fnType,
+      const ValueDecl *callee) {
+    assert(fnType);
+
+    if (argIdx >= argList->size())
+      return None;
+
+    if (paramIdx >= fnType->getNumParams())
+      return None;
+
+    return FunctionArgApplyInfo(argList, argExpr, argIdx, argType, paramIdx,
+                                fnInterfaceType, fnType, callee);
+  }
 
   /// \returns The list of the arguments used for this application.
   ArgumentList *getArgList() const { return ArgList; }
@@ -1092,15 +1144,14 @@ struct Score {
     bool hasNonDefault = false;
     for (unsigned int i = 0; i < NumScoreKinds; ++i) {
       if (Data[i] != 0) {
-        out << " [";
+        out << " [component: ";
         out << getNameFor(ScoreKind(i));
-        out << "(s) = ";
+        out << "(s), value: ";
         out << std::to_string(Data[i]);
         out << "]";
         hasNonDefault = true;
       }
     }
-
     if (!hasNonDefault) {
       out << " <default ";
       out << *this;
@@ -1544,6 +1595,10 @@ public:
 
   /// Retrieve the fixed score of this solution
   Score &getFixedScore() { return FixedScore; }
+
+  /// Check whether this solution has a fixed binding for the given type
+  /// variable.
+  bool hasFixedType(TypeVariableType *typeVar) const;
 
   /// Retrieve the fixed type for the given type variable.
   Type getFixedType(TypeVariableType *typeVar) const;
@@ -3053,9 +3108,9 @@ private:
     ConstraintSystem &CS;
 
     FreeTypeVariableBinding AllowFreeTypeVariables;
-
-    /// Depth of the solution stack.
-    unsigned depth = 0;
+    
+    /// Return current depth of solution stack for debug printing.
+    unsigned int getCurrentIndent() const { return depth * 2; }
 
     /// Maximum depth reached so far in exploring solutions.
     unsigned maxDepth = 0;
@@ -3238,6 +3293,9 @@ private:
 
     SmallVector<Constraint *, 4> disabledConstraints;
     SmallVector<Constraint *, 4> favoredConstraints;
+    
+    /// Depth of the solution stack.
+    unsigned depth = 0;
   };
 
   class CacheExprTypes : public ASTWalker {
@@ -4341,7 +4399,7 @@ public:
 
     if (isDebugMode()) {
       auto &log = llvm::errs();
-      log.indent(solverState ? solverState->depth * 2 : 0)
+      log.indent(solverState ? solverState->getCurrentIndent() : 0)
           << "(failed constraint ";
       constraint->print(log, &getASTContext().SourceMgr);
       log << ")\n";
@@ -4741,7 +4799,8 @@ public:
   Type getUnopenedTypeOfReference(VarDecl *value, Type baseType,
                                   DeclContext *UseDC,
                                   ConstraintLocator *memberLocator = nullptr,
-                                  bool wantInterfaceType = false);
+                                  bool wantInterfaceType = false,
+                                  bool adjustForPreconcurrency = true);
 
   /// Return the type-of-reference of the given value.
   ///
@@ -4763,6 +4822,7 @@ public:
       llvm::function_ref<Type(VarDecl *)> getType,
       ConstraintLocator *memberLocator = nullptr,
       bool wantInterfaceType = false,
+      bool adjustForPreconcurrency = true,
       llvm::function_ref<Type(const AbstractClosureExpr *)> getClosureType =
         [](const AbstractClosureExpr *) {
           return Type();
@@ -5521,6 +5581,9 @@ public:
 
   /// Apply the given result builder to the closure expression.
   ///
+  /// \note builderType must be a contexutal type - callers should
+  /// open the builder type or map it into context as appropriate.
+  ///
   /// \returns \c None when the result builder cannot be applied at all,
   /// otherwise the result of applying the result builder.
   Optional<TypeMatchResult>
@@ -5534,7 +5597,10 @@ public:
       Type wrapperType, Type paramType, ParamDecl *param, Identifier argLabel,
       ConstraintKind matchKind, ConstraintLocatorBuilder locator);
 
-  Optional<BindingSet> determineBestBindings();
+  /// Determine whether given type variable with its set of bindings is viable
+  /// to be attempted on the next step of the solver.
+  Optional<BindingSet> determineBestBindings(
+      llvm::function_ref<void(const BindingSet &)> onCandidate);
 
   /// Get bindings for the given type variable based on current
   /// state of the constraint system.

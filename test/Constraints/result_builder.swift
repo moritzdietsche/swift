@@ -217,7 +217,9 @@ print(mbuilders.methodBuilder(13))
 // CHECK: ("propertyBuilder", 12)
 print(mbuilders.propertyBuilder)
 
-// SR-11439: Operator builders
+// https://github.com/apple/swift/issues/53840
+// Operator builders
+
 infix operator ^^^
 func ^^^ (lhs: Int, @TupleBuilder rhs: (Int) -> (String, Int)) -> (String, Int) {
   return rhs(lhs)
@@ -1198,3 +1200,19 @@ func test_callAsFunction_with_resultBuilder() {
 test_callAsFunction_with_resultBuilder()
 // CHECK: (0, "with parens", true)
 // CHECK: (1, "without parens", true)
+
+do {
+  struct S {
+    static func test<T>(@TupleBuilder _ body: (Bool) -> T) -> S {
+      print(body(true))
+      return .init()
+    }
+  }
+
+  let _: S? = .test {
+    42
+    ""
+    [$0]
+  }
+  // CHECK: (42, "", [true])
+}

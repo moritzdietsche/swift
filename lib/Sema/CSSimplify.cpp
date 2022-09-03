@@ -3814,6 +3814,13 @@ ConstraintSystem::matchTypesBindTypeVar(
       // let's ignore this mismatch and mark affected type variable as a hole
       // because something else has to be fixed already for this to happen.
       if (type->is<DependentMemberType>() && !type->hasTypeVariable()) {
+        // Since the binding couldn't be performed, the type variable is a
+        // hole regardless whether it would be bound later to some other
+        // type or not. If this is not reflected in constraint system
+        // it would let the solver to form a _valid_ solution as if the
+        // constraint between the type variable and the unresolved dependent
+        // member type never existed.
+        increaseScore(SK_Hole);
         recordPotentialHole(typeVar);
         return getTypeMatchSuccess();
       }
@@ -3972,6 +3979,9 @@ static ConstraintFix *fixRequirementFailure(ConstraintSystem &cs, Type type1,
   auto *reqLoc = cs.getConstraintLocator(anchor, path);
 
   switch (req.getRequirementKind()) {
+  case RequirementKind::SameCount:
+    llvm_unreachable("Same-count requirement not supported here");
+
   case RequirementKind::SameType: {
     return SkipSameTypeRequirement::create(cs, type1, type2, reqLoc);
   }
@@ -8091,16 +8101,12 @@ allFromConditionalConformances(DeclContext *DC, Type baseTy,
     }
 
     if (auto *protocol = candidateDC->getSelfProtocolDecl()) {
-      SmallVector<ProtocolConformance *, 4> conformances;
-      if (!NTD->lookupConformance(protocol, conformances))
+      auto conformance = DC->getParentModule()->lookupConformance(
+          baseTy, protocol);
+      if (!conformance.isConcrete())
         return false;
 
-      // This is opportunistic, there should be a way to narrow the
-      // list down to a particular declaration member comes from.
-      return llvm::any_of(
-          conformances, [](const ProtocolConformance *conformance) {
-            return !conformance->getConditionalRequirements().empty();
-          });
+      return !conformance.getConcrete()->getConditionalRequirements().empty();
     }
 
     return false;
@@ -8860,15 +8866,12 @@ static ConstraintFix *validateInitializerRef(ConstraintSystem &cs,
   if (!anchor)
     return nullptr;
 
+  // Avoid checking implicit conversions injected by the compiler.
+  if (locator->findFirst<LocatorPathElt::ImplicitConversion>())
+    return nullptr;
+
   auto getType = [&cs](Expr *expr) -> Type {
     return cs.simplifyType(cs.getType(expr))->getRValueType();
-  };
-
-  auto locatorEndsWith =
-      [](ConstraintLocator *locator,
-         ConstraintLocator::PathElementKind eltKind) -> bool {
-    auto path = locator->getPath();
-    return !path.empty() && path.back().getKind() == eltKind;
   };
 
   Expr *baseExpr = nullptr;
@@ -8927,7 +8930,7 @@ static ConstraintFix *validateInitializerRef(ConstraintSystem &cs,
     // member.
     // We need to find type variable which represents contextual base.
     auto *baseLocator = cs.getConstraintLocator(
-        UME, locatorEndsWith(locator, ConstraintLocator::ConstructorMember)
+        UME, locator->isLastElement<LocatorPathElt::ConstructorMember>()
                  ? ConstraintLocator::UnresolvedMember
                  : ConstraintLocator::MemberRefBase);
 
@@ -8942,7 +8945,7 @@ static ConstraintFix *validateInitializerRef(ConstraintSystem &cs,
     baseType = cs.simplifyType(*result)->getRValueType();
     // Constraint for member base is formed as '$T.Type[.<member] = ...`
     // which means MetatypeType has to be added after finding a type variable.
-    if (locatorEndsWith(baseLocator, ConstraintLocator::MemberRefBase))
+    if (baseLocator->isLastElement<LocatorPathElt::MemberRefBase>())
       baseType = MetatypeType::get(baseType);
   } else if (auto *keyPathExpr = getAsExpr<KeyPathExpr>(anchor)) {
     // Key path can't refer to initializers e.g. `\Type.init`
@@ -9851,7 +9854,9 @@ static Type getOpenedResultBuilderTypeFor(ConstraintSystem &cs,
   auto *calleeLocator = cs.getCalleeLocator(cs.getConstraintLocator(locator));
   auto selectedOverload = cs.findSelectedOverloadFor(calleeLocator);
   if (!(selectedOverload &&
-        selectedOverload->choice.getKind() == OverloadChoiceKind::Decl))
+        (selectedOverload->choice.getKind() == OverloadChoiceKind::Decl ||
+         selectedOverload->choice.getKind() ==
+             OverloadChoiceKind::DeclViaUnwrappedOptional)))
     return Type();
 
   auto *choice = selectedOverload->choice.getDecl();
@@ -11192,7 +11197,7 @@ retry_after_fail:
     if (isDebugMode()) {
       PrintOptions PO;
       PO.PrintTypesForDebugging = true;
-      llvm::errs().indent(solverState ? solverState->depth * 2 : 0)
+      llvm::errs().indent(solverState ? solverState->getCurrentIndent() : 0)
         << "(common result type for $T" << fnTypeVar->getID() << " is "
         << commonResultType.getString(PO)
         << ")\n";
@@ -12698,7 +12703,7 @@ static bool isAugmentingFix(ConstraintFix *fix) {
 bool ConstraintSystem::recordFix(ConstraintFix *fix, unsigned impact) {
   if (isDebugMode()) {
     auto &log = llvm::errs();
-    log.indent(solverState ? solverState->depth * 2 : 0)
+    log.indent(solverState ? solverState->getCurrentIndent() : 0)
       << "(attempting fix ";
     fix->print(log);
     log << ")\n";
@@ -12894,7 +12899,7 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyFixConstraint(
       }
     }
     auto matchingType =
-        TupleType::get(newTupleTypes, getASTContext())->castTo<TupleType>();
+        TupleType::get(newTupleTypes, getASTContext());
     if (recordFix(fix))
       return SolutionKind::Error;
     return matchTupleTypes(matchingType, smaller, matchKind, subflags, locator);
@@ -13437,6 +13442,9 @@ void ConstraintSystem::addConstraint(Requirement req,
   bool conformsToAnyObject = false;
   Optional<ConstraintKind> kind;
   switch (req.getKind()) {
+  case RequirementKind::SameCount:
+    llvm_unreachable("Same-count requirement not supported here");
+
   case RequirementKind::Conformance:
     kind = ConstraintKind::ConformsTo;
     break;

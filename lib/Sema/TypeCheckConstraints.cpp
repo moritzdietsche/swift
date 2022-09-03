@@ -642,6 +642,9 @@ Type TypeChecker::typeCheckParameterDefault(Expr *&defaultValue,
       auto &requirement = requirements[reqIdx];
 
       switch (requirement.getKind()) {
+      case RequirementKind::SameCount:
+        llvm_unreachable("Same-count requirement not supported here");
+
       case RequirementKind::SameType: {
         auto lhsTy = requirement.getFirstType();
         auto rhsTy = requirement.getSecondType();
@@ -829,11 +832,7 @@ bool TypeChecker::typeCheckPatternBinding(PatternBindingDecl *PBD,
 
   if (hadError)
     PBD->setInvalid();
-
   PBD->setInitializerChecked(patternNumber);
-
-  checkPatternBindingDeclAsyncUsage(PBD);
-
   return hadError;
 }
 
@@ -1300,9 +1299,9 @@ void Solution::dump(raw_ostream &out) const {
   if (!overloadChoices.empty()) {
     out << "\nOverload choices:";
     for (auto ovl : overloadChoices) {
-      out.indent(2);
       if (ovl.first) {
         out << "\n";
+        out.indent(2);
         ovl.first->dump(sm, out);
       }
 
@@ -1362,10 +1361,19 @@ void Solution::dump(raw_ostream &out) const {
             Type(opened.first).print(out, PO);
             out << ")";
             out << " -> ";
-            out << getFixedType(opened.second);
-            out << " [from ";
-            Type(opened.second).print(out, PO);
-            out << "]";
+            // Let's check whether the type variable has been bound.
+            // This is important when solver is working on result
+            // builder transformed code, because dependent sub-components
+            // would not have parent type variables but `OpenedTypes`
+            // cannot be erased, so we'll just print them as unbound.
+            if (hasFixedType(opened.second)) {
+              out << getFixedType(opened.second);
+              out << " [from ";
+              Type(opened.second).print(out, PO);
+              out << "]";
+            } else {
+              Type(opened.second).print(out, PO);
+            }
           },
           [&]() { out << ", "; });
       out << "\n";
@@ -1458,16 +1466,17 @@ void ConstraintSystem::print(raw_ostream &out) const {
              });
   for (auto tv : typeVariables) {
     out.indent(2);
-    tv->getImpl().print(out);
     auto rep = getRepresentative(tv);
     if (rep == tv) {
       if (auto fixed = getFixedType(tv)) {
+        tv->getImpl().print(out);
         out << " as ";
         Type(fixed).print(out, PO);
       } else {
         const_cast<ConstraintSystem *>(this)->getBindingsFor(tv).dump(out, 1);
       }
     } else {
+      tv->getImpl().print(out);
       out << " equivalent to ";
       Type(rep).print(out, PO);
     }

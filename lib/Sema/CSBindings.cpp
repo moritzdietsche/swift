@@ -636,8 +636,6 @@ void BindingSet::determineLiteralCoverage() {
   if (Literals.empty())
     return;
 
-  SmallVector<PotentialBinding, 4> adjustedBindings;
-
   bool allowsNil = canBeNil();
 
   for (auto &entry : Literals) {
@@ -648,7 +646,6 @@ void BindingSet::determineLiteralCoverage() {
 
     for (auto binding = Bindings.begin(); binding != Bindings.end();
          ++binding) {
-
       bool isCovered = false;
       Type adjustedTy;
 
@@ -745,7 +742,8 @@ BindingSet::BindingScore BindingSet::formBindingScore(const BindingSet &b) {
                          -numNonDefaultableBindings);
 }
 
-Optional<BindingSet> ConstraintSystem::determineBestBindings() {
+Optional<BindingSet> ConstraintSystem::determineBestBindings(
+    llvm::function_ref<void(const BindingSet &)> onCandidate) {
   // Look for potential type variable bindings.
   Optional<BindingSet> bestBindings;
   llvm::SmallDenseMap<TypeVariableType *, BindingSet> cache;
@@ -807,9 +805,7 @@ Optional<BindingSet> ConstraintSystem::determineBestBindings() {
     if (!bindings || !isViable)
       continue;
 
-    if (isDebugMode()) {
-      bindings.dump(typeVar, llvm::errs(), solverState->depth * 2);
-    }
+    onCandidate(bindings);
 
     // If these are the first bindings, or they are better than what
     // we saw before, use them instead.
@@ -1655,21 +1651,17 @@ static std::string getCollectionLiteralAsString(KnownProtocolKind KPK) {
 #undef ENTRY
 }
 
-void BindingSet::dump(TypeVariableType *typeVar, llvm::raw_ostream &out,
-                      unsigned indent) const {
-  out.indent(indent);
-  out << "(";
-  if (typeVar)
-    out << "$T" << typeVar->getImpl().getID();
-  dump(out, 1);
-  out << ")\n";
-}
-
 void BindingSet::dump(llvm::raw_ostream &out, unsigned indent) const {
   PrintOptions PO;
   PO.PrintTypesForDebugging = true;
 
   out.indent(indent);
+  out << "(";
+  if (auto typeVar = getTypeVariable()) {
+    typeVar->print(out, PO);
+    out << " ";
+  }
+
   std::vector<std::string> attributes;
   if (isDirectHole())
     attributes.push_back("hole");
@@ -1710,7 +1702,7 @@ void BindingSet::dump(llvm::raw_ostream &out, unsigned indent) const {
     }
     case LiteralBindingKind::Float:
     case LiteralBindingKind::None:
-        out << getLiteralBindingKind(literalKind).str();
+      out << getLiteralBindingKind(literalKind).str();
       break;
     }
     if (attributes.empty()) {
@@ -1732,43 +1724,96 @@ void BindingSet::dump(llvm::raw_ostream &out, unsigned indent) const {
 
   auto numDefaultable = getNumViableDefaultableBindings();
   if (numDefaultable > 0)
-    out << "#defaultable_bindings: " << numDefaultable << " ";
+    out << "[#defaultable_bindings: " << numDefaultable << "] ";
 
-  auto printBinding = [&](const PotentialBinding &binding) {
-    auto type = binding.BindingType;
-    switch (binding.Kind) {
-    case AllowedBindingKind::Exact:
-      break;
+  struct PrintableBinding {
+  private:
+    enum class BindingKind { Exact, Subtypes, Supertypes, Literal };
+    BindingKind Kind;
+    Type BindingType;
+    PrintableBinding(BindingKind kind, Type bindingType)
+        : Kind(kind), BindingType(bindingType) {}
 
-    case AllowedBindingKind::Subtypes:
-      out << "(subtypes of) ";
-      break;
-
-    case AllowedBindingKind::Supertypes:
-      out << "(supertypes of) ";
-      break;
+  public:
+    static PrintableBinding supertypesOf(Type binding) {
+      return PrintableBinding{BindingKind::Supertypes, binding};
     }
-    if (auto *literal = binding.getDefaultedLiteralProtocol())
-      out << "(default from " << literal->getName() << ") ";
-    out << type.getString(PO);
+    
+    static PrintableBinding subtypesOf(Type binding) {
+      return PrintableBinding{BindingKind::Subtypes, binding};
+    }
+    
+    static PrintableBinding exact(Type binding) {
+      return PrintableBinding{BindingKind::Exact, binding};
+    }
+    
+    static PrintableBinding literalDefaultType(Type binding) {
+      return PrintableBinding{BindingKind::Literal, binding};
+    }
+
+    void print(llvm::raw_ostream &out, const PrintOptions &PO,
+               unsigned indent = 0) const {
+      switch (Kind) {
+      case BindingKind::Exact:
+        break;
+      case BindingKind::Subtypes:
+        out << "(subtypes of) ";
+        break;
+      case BindingKind::Supertypes:
+        out << "(supertypes of) ";
+        break;
+      case BindingKind::Literal:
+        out << "(default type of literal) ";
+        break;
+      }
+      BindingType.print(out);
+    }
   };
 
   out << "[with possible bindings: ";
-  interleave(Bindings, printBinding, [&]() { out << "; "; });
-  if (Bindings.empty())
+  SmallVector<PrintableBinding, 2> potentialBindings;
+  for (const auto &binding : Bindings) {
+    switch (binding.Kind) {
+    case AllowedBindingKind::Exact:
+      potentialBindings.push_back(PrintableBinding::exact(binding.BindingType));
+      break;
+    case AllowedBindingKind::Supertypes:
+      potentialBindings.push_back(
+          PrintableBinding::supertypesOf(binding.BindingType));
+      break;
+    case AllowedBindingKind::Subtypes:
+      potentialBindings.push_back(
+          PrintableBinding::subtypesOf(binding.BindingType));
+      break;
+    }
+  }
+  for (const auto &literal : Literals) {
+    if (literal.second.viableAsBinding()) {
+      potentialBindings.push_back(PrintableBinding::literalDefaultType(
+          literal.second.getDefaultType()));
+    }
+  }
+  if (potentialBindings.empty()) {
     out << "<empty>";
+  } else {
+    interleave(
+        potentialBindings,
+        [&](const PrintableBinding &binding) { binding.print(out, PO); },
+        [&] { out << ", "; });
+  }
   out << "]";
 
   if (!Defaults.empty()) {
-    out << "[defaults: ";
+    out << " [defaults: ";
     for (const auto &entry : Defaults) {
       auto *constraint = entry.second;
-      PotentialBinding binding{constraint->getSecondType(),
-                               AllowedBindingKind::Exact, constraint};
-      printBinding(binding);
+      auto defaultBinding =
+          PrintableBinding::exact(constraint->getSecondType());
+      defaultBinding.print(out, PO);
     }
-    out << "] ";
+    out << "]";
   }
+  out << ")";
 }
 
 // Given a possibly-Optional type, return the direct superclass of the
