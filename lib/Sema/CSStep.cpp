@@ -781,9 +781,9 @@ bool DisjunctionStep::shortCircuitDisjunctionAt(
     return false;
 
   if (auto restriction = currentChoice->getRestriction()) {
-    // Non-optional conversions are better than optional-to-optional
-    // conversions.
-    if (*restriction == ConversionRestrictionKind::OptionalToOptional)
+    // Non-optional and optional-to-optional conversions are better than
+    //  value-to-optional conversions.
+    if (*restriction == ConversionRestrictionKind::ValueToOptional)
       return true;
 
     // Array-to-pointer conversions are better than inout-to-pointer

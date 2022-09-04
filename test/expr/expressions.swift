@@ -951,3 +951,8 @@ let _ = "foo \(42 /*
 // expected-error @-3 {{cannot find ')' to match opening '(' in string interpolation}} expected-error @-3 {{unterminated string literal}}
 // expected-error @-2 {{expected expression}}
 // expected-error @-3 {{unterminated string literal}}
+
+func no57079<T>(_ t: T?, _ t2: T?) -> T?? {
+  // t was implicitly be promoted to T??, promting a warning
+  return t ?? t2
+}
