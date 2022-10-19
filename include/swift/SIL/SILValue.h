@@ -274,8 +274,12 @@ struct ValueOwnershipKind {
   bool operator==(ValueOwnershipKind other) const {
     return value == other.value;
   }
+  bool operator!=(ValueOwnershipKind other) const {
+    return !(value == other.value);
+  }
 
   bool operator==(innerty other) const { return value == other; }
+  bool operator!=(innerty other) const { return !(value == other); }
 
   /// We merge by moving down the lattice.
   ValueOwnershipKind merge(ValueOwnershipKind rhs) const {
@@ -571,6 +575,10 @@ public:
     Type = Type.removingMoveOnlyWrapper();
     return true;
   }
+
+  /// Returns true if this value should be traced for optimization debugging
+  /// (it has a debug_value [trace] user).
+  bool hasDebugTrace() const;
 
   static bool classof(SILNodePointer node) {
     return node->getKind() >= SILNodeKind::First_ValueBase &&

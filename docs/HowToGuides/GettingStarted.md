@@ -154,13 +154,26 @@ Double-check that running `pwd` prints a path ending with `swift`.
 
 1. The latest Linux dependencies are listed in the respective Dockerfiles:
    * [Ubuntu 20.04](https://github.com/apple/swift-docker/blob/main/swift-ci/master/ubuntu/20.04/Dockerfile)
+   * [Ubuntu 22.04](https://github.com/apple/swift-docker/blob/main/swift-ci/master/ubuntu/22.04/Dockerfile)
    * [CentOS 7](https://github.com/apple/swift-docker/blob/main/swift-ci/master/centos/7/Dockerfile)
    * [Amazon Linux 2](https://github.com/apple/swift-docker/blob/main/swift-ci/master/amazon-linux/2/Dockerfile)
 
-2. To install sccache (optional):
+2. To install `sccache` (optional):
+  * If you're not building within a Docker container:
    ```
    sudo snap install sccache --candidate --classic
    ```
+   * If you're building within a Docker container, you'll have to install `sccache` manually, since [`snap`
+   is not available in environments without `systemd`](https://unix.stackexchange.com/questions/541230/do-snaps-require-systemd):
+
+   ```
+   SCCACHE_VERSION=v0.3.0
+   curl -L "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-$(uname -m)-unknown-linux-musl.tar.gz" -o sccache.tar.gz
+   tar xzpvf sccache.tar.gz
+   sudo cp "sccache-${SCCACHE_VERSION}-$(uname -m)-unknown-linux-musl/sccache" /usr/local/bin
+   sudo chmod +x /usr/local/bin/sccache
+   ```
+
    **Note:** LLDB currently requires at least `swig-1.3.40` but will
    successfully build with version 2 shipped with Ubuntu.
 
@@ -227,25 +240,26 @@ Phew, that's a lot to digest! Now let's proceed to the actual build itself!
    [using both Ninja and Xcode](#using-both-ninja-and-xcode).
 3. Build the toolchain with optimizations, debuginfo, and assertions and run
    the tests.
-   macOS:
-   - Via Ninja:
+   - macOS:
+     - Via Ninja:
+       ```sh
+       utils/build-script --skip-build-benchmarks \
+         --skip-ios --skip-watchos --skip-tvos --swift-darwin-supported-archs "$(uname -m)" \
+         --sccache --release-debuginfo --swift-disable-dead-stripping --test
+       ```
+     - Via Xcode:
+       ```sh
+       utils/build-script --skip-build-benchmarks \
+         --skip-ios --skip-watchos --skip-tvos --swift-darwin-supported-archs "$(uname -m)" \
+         --sccache --release-debuginfo --swift-disable-dead-stripping \
+         --xcode
+       ```
+       **Note:** Building `--xcode` together with `--test` is a common source of issues. So to run
+       tests is recommended to use `ninja` because is normally more stable.
+   - Linux (uses Ninja):
      ```sh
-     utils/build-script --skip-build-benchmarks \
-       --skip-ios --skip-watchos --skip-tvos --swift-darwin-supported-archs "$(uname -m)" \
-       --sccache --release-debuginfo --swift-disable-dead-stripping --test
-     ```
-   - Via Xcode:
-     ```sh
-     utils/build-script --skip-build-benchmarks \
-       --skip-ios --skip-watchos --skip-tvos --swift-darwin-supported-archs "$(uname -m)" \
-       --sccache --release-debuginfo --swift-disable-dead-stripping \
-       --xcode
-     ```
-     **Note:** Building `--xcode` together with `--test` is a common source of issues. So to run
-     tests is recommended to use `ninja` because is normally more stable. 
-   Linux (uses Ninja):
-     ```sh
-     utils/build-script --release-debuginfo --test --skip-early-swift-driver
+     utils/build-script --release-debuginfo --test --skip-early-swift-driver \
+       --skip-early-swiftsyntax
      ```
    This will create a directory
    `swift-project/build/Ninja-RelWithDebInfoAssert`
@@ -382,11 +396,12 @@ In project settings, locate `Build, Execution, Deployment > CMake`. You will nee
     - latest versions of the IDE suggest valid values here. Generally `RelWithDebInfoAssert` is a good one to work with
 - Toolchain: Default should be fine
 - Generator: Ninja
-- CMake options:
+- CMake options: You want to duplicate the essential CMake flags that `build-script` had used here, so CLion understands the build configuration. You can get the full list of CMake arguments from `build-script` by providing the `-n` dry-run flag; look for the last `cmake` command with a `-G Ninja`. Here is a minimal list of what you should provide to CLion here for this setting:
     - `-D SWIFT_PATH_TO_CMARK_BUILD=SOME_PATH/swift-project/build/Ninja-RelWithDebInfoAssert/cmark-macosx-arm64 -D LLVM_DIR=SOME_PATH/swift-project/build/Ninja-RelWithDebInfoAssert/llvm-macosx-arm64/lib/cmake/llvm -D Clang_DIR=SOME_PATH/swift-project/build/Ninja-RelWithDebInfoAssert/llvm-macosx-arm64/lib/cmake/clang -D CMAKE_BUILD_TYPE=RelWithDebInfoAssert -G Ninja -S .`
     - replace the `SOME_PATH` to the path where your `swift-project` directory is
     - the CMAKE_BUILD_TYPE should match the build configuration name, so if you named this profile `RelWithDebInfo` the CMAKE_BUILD_TYPE should also be `RelWithDebInfo`
     - **Note**: If you're using an Intel machine to build swift, you'll need to replace the architecture in the options. (ex: `arm64` with `x86_64`)
+- Build Directory: change this to the Swift build directory corresponding to the `build-script` run you did earlier, for example, `SOME_PATH/swift-project/build/Ninja-RelWithDebInfoAssert/swift-macosx-arm64`.
 
 With this done, CLion should be able to successfully import the project and have full autocomplete and code navigation powers.
 

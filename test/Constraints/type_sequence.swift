@@ -1,11 +1,11 @@
 // RUN: %target-typecheck-verify-swift -enable-experimental-variadic-generics
 
-struct TupleStruct<First, @_typeSequence Rest> {
+struct TupleStruct<First, Rest...> {
   var first: First
   var rest: (Rest...)
 }
 
-func debugPrint<@_typeSequence T>(_ items: T...)
+func debugPrint<T...>(_ items: T...)
   where T: CustomDebugStringConvertible
 {
   /*for (item: T) in items {
@@ -13,28 +13,26 @@ func debugPrint<@_typeSequence T>(_ items: T...)
   }*/
 }
 
-func max<@_typeSequence T>(_ values: T...) -> T?
+func max<T...>(_ values: T...) -> T?
   where T: Comparable
 {
   return nil
 }
 
-func min<@_typeSequence T: Comparable>(_ values: T...) -> T? {
+func min<T...: Comparable>(_ values: T...) -> T? {
   return nil
 }
 
-func badParameter<T>(_ : @_typeSequence T) {} // expected-error {{attribute does not apply to type}}
-
 func directAliases() {
-  typealias Tuple<@_typeSequence Ts> = (Ts...)
+  typealias Tuple<Ts...> = (Ts...)
 
-  typealias Many<T, U, V, @_typeSequence Ws> = Tuple<T, U, V, Ws>
+  typealias Many<T, U, V, Ws...> = Tuple<T, U, V, Ws... >
 
   let _: Many<Int, String, Double, Void, Void, Void, Void> = 42 // expected-error {{cannot convert value of type 'Int' to specified type}}
 }
 
 func bindPrefix() {
-  struct Bind<Prefix, @_typeSequence U> {}
+  struct Bind<Prefix, U...> {}
 
   typealias TooFew0 = Bind<> // expected-error {{expected type}}
   typealias TooFew1 = Bind<String> // OK
@@ -44,7 +42,7 @@ func bindPrefix() {
 }
 
 func bindSuffix() {
-  struct Bind<@_typeSequence U, Suffix> {}
+  struct Bind<U..., Suffix> {}
 
   typealias TooFew0 = Bind<> // expected-error {{expected type}}
   typealias TooFew1 = Bind<String> // OK
@@ -54,7 +52,7 @@ func bindSuffix() {
 }
 
 func bindPrefixAndSuffix() {
-  struct Bind<Prefix, @_typeSequence U, Suffix> {} // expected-note {{generic type 'Bind' declared here}}
+  struct Bind<Prefix, U..., Suffix> {} // expected-note {{generic type 'Bind' declared here}}
 
   typealias TooFew0 = Bind<> // expected-error {{expected type}}
   typealias TooFew1 = Bind<String> // expected-error {{generic type 'Bind' specialized with too few type parameters (got 1, but expected at least 2)}}
@@ -64,23 +62,23 @@ func bindPrefixAndSuffix() {
 }
 
 func invalidPacks() {
-  func monovariadic1() -> (String...) {} // expected-error {{cannot create expansion with non-variadic type 'String'}}
-  func monovariadic2<T>() -> (T...) {} // expected-error {{cannot create expansion with non-variadic type 'T'}}
-  func monovariadic3<T, U>() -> (T, U...) {} // expected-error {{cannot create a variadic tuple}}
+  func monovariadic1() -> (String...) {} // expected-error {{variadic expansion 'String' must contain at least one variadic generic parameter}}
+  func monovariadic2<T>() -> (T...) {} // expected-error {{variadic expansion 'T' must contain at least one variadic generic parameter}}
+  func monovariadic3<T, U>() -> (T, U...) {} // expected-error {{variadic expansion 'U' must contain at least one variadic generic parameter}}
 }
 
 func call() {
-  func multipleParameters<@_typeSequence T>(xs: T..., ys: T...) -> (T...) { return xs }
+  func multipleParameters<T...>(xs: T..., ys: T...) -> (T...) { return (_: xs) }
   // expected-note@-1 {{in call to function 'multipleParameters(xs:ys:)'}}
   _ = multipleParameters()
   // expected-error@-1 2 {{generic parameter 'T' could not be inferred}}
-  let x: (String) = multipleParameters(xs: "", ys: "")
+  let x: (_: String) = multipleParameters(xs: "", ys: "")
   let (one, two) = multipleParameters(xs: "", 5.0, ys: "", 5.0)
   multipleParameters(xs: "", 5.0, ys: 5.0, "") // expected-error {{type of expression is ambiguous without more context}}
 
-  func multipleSequences<@_typeSequence T, @_typeSequence U>(xs: T..., ys: U...) -> (T...) { return ys }
+  func multipleSequences<T..., U...>(xs: T..., ys: U...) -> (T...) { return (_: ys) }
   // expected-note@-1 {{in call to function 'multipleSequences(xs:ys:)'}}
-  // expected-error@-2 {{cannot convert return expression of type 'U' to return type 'T'}}
+  // expected-error@-2 {{cannot convert return expression of type '(U...)' to return type '(T...)'}}
 
   _ = multipleSequences()
   // expected-error@-1 {{generic parameter 'T' could not be inferred}}
@@ -90,7 +88,7 @@ func call() {
 }
 
 func contextualTyping() {
-  func firsts<@_typeSequence T>(_ seqs: [T]...) -> (T?...) {
+  func firsts<T...>(_ seqs: [T]...) -> (T?...) {
     fatalError()
   }
 
@@ -99,7 +97,7 @@ func contextualTyping() {
   let (_, _): ([Int], String?) = firsts([42], [""]) // expected-error {{cannot convert value of type '(Int?, String?)' to specified type '([Int], String?)'}}
   let (_, _, _): (String?, String?, Int) = firsts([42], [""]) // expected-error {{'(Int?, String?)' is not convertible to '(String?, String?, Int)', tuples have a different number of elements}}
 
-  func dependent<@_typeSequence T>(_ seqs: Array<T>...) -> (Array<T>.Element?...) {
+  func dependent<T...>(_ seqs: Array<T>...) -> (Array<T>.Element?...) {
     fatalError()
   }
 

@@ -807,6 +807,9 @@ public:
   /// Check whether the current token starts with '>'.
   bool startsWithGreater(Token Tok) { return startsWithSymbol(Tok, '>'); }
 
+  /// Check whether the current token starts with '...'.
+  bool startsWithEllipsis(Token Tok);
+
   /// Returns true if token is an identifier with the given value.
   bool isIdentifier(Token Tok, StringRef value) {
     return Tok.is(tok::identifier) && Tok.getText() == value;
@@ -821,6 +824,11 @@ public:
   /// be a complete '>' token or some kind of operator token starting with '>',
   /// e.g., '>>'.
   SourceLoc consumeStartingGreater();
+
+  /// Consume the starting '...' of the current token, which may either be a
+  /// complete '...' token or some kind of operator token starting with '...',
+  /// e.g '...>'.
+  SourceLoc consumeStartingEllipsis();
 
   /// Consume the starting character of the current token, and split the
   /// remainder of the token into a new token (or tokens).
@@ -896,7 +904,7 @@ public:
   
   /// Parse the specified expected token and return its location on success.  On failure, emit the specified
   /// error diagnostic,  a note at the specified note location, and return the location of the previous token.
-  bool parseMatchingToken(tok K, SourceLoc &TokLoc, Diag<> ErrorDiag,
+  bool parseMatchingToken(tok K, SourceLoc &TokLoc, Diagnostic ErrorDiag,
                           SourceLoc OtherLoc);
 
   /// Returns the proper location for a missing right brace, parenthesis, etc.
@@ -976,13 +984,12 @@ public:
     PD_AllowTopLevel        = 1 << 1,
     PD_HasContainerType     = 1 << 2,
     PD_DisallowInit         = 1 << 3,
-    PD_AllowDestructor      = 1 << 4,
-    PD_AllowEnumElement     = 1 << 5,
-    PD_InProtocol           = 1 << 6,
-    PD_InClass              = 1 << 7,
-    PD_InExtension          = 1 << 8,
-    PD_InStruct             = 1 << 9,
-    PD_InEnum               = 1 << 10,
+    PD_AllowEnumElement     = 1 << 4,
+    PD_InProtocol           = 1 << 5,
+    PD_InClass              = 1 << 6,
+    PD_InExtension          = 1 << 7,
+    PD_InStruct             = 1 << 8,
+    PD_InEnum               = 1 << 9,
   };
 
   /// Options that control the parsing of declarations.
@@ -1106,6 +1113,7 @@ public:
       AvailabilityContext *SILAvailability,
       SmallVectorImpl<Identifier> &spiGroups,
       SmallVectorImpl<AvailableAttr *> &availableAttrs,
+      size_t &typeErasedParamsCount,
       llvm::function_ref<bool(Parser &)> parseSILTargetName,
       llvm::function_ref<bool(Parser &)> parseSILSIPModule);
 
@@ -1144,6 +1152,14 @@ public:
   /// Parse the @_backDeploy attribute.
   bool parseBackDeployAttribute(DeclAttributes &Attributes, StringRef AttrName,
                                 SourceLoc AtLoc, SourceLoc Loc);
+
+  /// Parse the @_documentation attribute.
+  ParserResult<DocumentationAttr> parseDocumentationAttribute(SourceLoc AtLoc,
+                                                              SourceLoc Loc);
+
+  /// Parse a single argument from a @_documentation attribute.
+  bool parseDocumentationAttributeArgument(Optional<StringRef> &Metadata,
+                                           Optional<AccessLevel> &Visibility);
 
   /// Parse a specific attribute.
   ParserStatus parseDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc,
@@ -1234,10 +1250,8 @@ public:
                bool HasLetOrVarKeyword = true);
 
   struct ParsedAccessors;
-  ParserStatus parseGetSet(ParseDeclOptions Flags,
-                           GenericParamList *GenericParams,
-                           ParameterList *Indices, TypeRepr *ResultType,
-                           ParsedAccessors &accessors,
+  ParserStatus parseGetSet(ParseDeclOptions Flags, ParameterList *Indices,
+                           TypeRepr *ResultType, ParsedAccessors &accessors,
                            AbstractStorageDecl *storage, SourceLoc StaticLoc);
   ParserResult<VarDecl> parseDeclVarGetSet(PatternBindingEntry &entry,
                                            ParseDeclOptions Flags,
@@ -1307,6 +1321,10 @@ public:
     /// Whether the type is for a closure attribute.
     CustomAttribute,
   };
+
+  ParserResult<TypeRepr> parseTypeScalar(
+      Diag<> MessageID,
+      ParseTypeReason reason);
 
   ParserResult<TypeRepr> parseType();
   ParserResult<TypeRepr> parseType(
@@ -1424,9 +1442,6 @@ public:
     ///
     /// \p SecondName is the name.
     SourceLoc SecondNameLoc;
-
-    /// The location of the '...', if present.
-    SourceLoc EllipsisLoc;
 
     /// The first name.
     Identifier FirstName;
@@ -1830,6 +1845,7 @@ public:
   ParserStatus parseStmtCondition(StmtCondition &Result, Diag<> ID,
                                   StmtKind ParentKind);
   ParserResult<PoundAvailableInfo> parseStmtConditionPoundAvailable();
+  ParserResult<PoundHasSymbolInfo> parseStmtConditionPoundHasSymbol();
   ParserResult<Stmt> parseStmtIf(LabeledStmtInfo LabelInfo,
                                  bool IfWasImplicitlyInserted = false);
   ParserResult<Stmt> parseStmtGuard();

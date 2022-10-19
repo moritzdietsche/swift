@@ -861,6 +861,28 @@ std::string ASTMangler::mangleGenericSignature(const GenericSignature sig) {
   return finalize();
 }
 
+std::string ASTMangler::mangleHasSymbolQuery(const ValueDecl *Decl) {
+  beginMangling();
+
+  if (auto Ctor = dyn_cast<ConstructorDecl>(Decl)) {
+    appendConstructorEntity(Ctor, /*isAllocating=*/false);
+  } else if (auto Dtor = dyn_cast<DestructorDecl>(Decl)) {
+    appendDestructorEntity(Dtor, /*isDeallocating=*/false);
+  } else if (auto GTD = dyn_cast<GenericTypeDecl>(Decl)) {
+    appendAnyGenericType(GTD);
+  } else if (isa<AssociatedTypeDecl>(Decl)) {
+    appendContextOf(Decl);
+    appendDeclName(Decl);
+    appendOperator("Qa");
+  } else {
+    appendEntity(Decl);
+  }
+
+  appendSymbolKind(ASTMangler::SymbolKind::HasSymbolQuery);
+
+  return finalize();
+}
+
 void ASTMangler::appendSymbolKind(SymbolKind SKind) {
   switch (SKind) {
     case SymbolKind::Default: return;
@@ -872,6 +894,7 @@ void ASTMangler::appendSymbolKind(SymbolKind SKind) {
     case SymbolKind::AccessibleFunctionRecord: return appendOperator("HF");
     case SymbolKind::BackDeploymentThunk: return appendOperator("Twb");
     case SymbolKind::BackDeploymentFallback: return appendOperator("TwB");
+    case SymbolKind::HasSymbolQuery: return appendOperator("TwS");
   }
 }
 
@@ -1330,7 +1353,8 @@ void ASTMangler::appendType(Type type, GenericSignature sig,
     case TypeKind::Struct:
     case TypeKind::BoundGenericClass:
     case TypeKind::BoundGenericEnum:
-    case TypeKind::BoundGenericStruct: {
+    case TypeKind::BoundGenericStruct:
+    case TypeKind::BuiltinTuple: {
       GenericTypeDecl *Decl;
       if (auto typeAlias = dyn_cast<TypeAliasType>(type.getPointer()))
         Decl = typeAlias->getDecl();
@@ -1366,7 +1390,7 @@ void ASTMangler::appendType(Type type, GenericSignature sig,
 
       // type ::= archetype
     case TypeKind::PrimaryArchetype:
-    case TypeKind::SequenceArchetype:
+    case TypeKind::PackArchetype:
       llvm_unreachable("Cannot mangle free-standing archetypes");
 
     case TypeKind::OpenedArchetype: {
@@ -2473,6 +2497,9 @@ void ASTMangler::appendAnyGenericType(const GenericTypeDecl *decl) {
     return;
   }
 
+  if (nominal && isa<BuiltinTupleDecl>(nominal))
+    return appendOperator("BT");
+
   appendContextOf(decl);
 
   // Always use Clang names for imported Clang declarations, unless they don't
@@ -2554,6 +2581,8 @@ void ASTMangler::appendAnyGenericType(const GenericTypeDecl *decl) {
     case DeclKind::Struct:
       appendOperator("V");
       break;
+    case DeclKind::BuiltinTuple:
+      llvm_unreachable("Not implemented");
     }
   }
 
@@ -2862,8 +2891,8 @@ void ASTMangler::appendRequirement(const Requirement &reqt,
   Type FirstTy = reqt.getFirstType()->getCanonicalType();
 
   switch (reqt.getKind()) {
-  case RequirementKind::SameCount:
-    llvm_unreachable("Same-count requirement not supported here");
+  case RequirementKind::SameShape:
+    llvm_unreachable("Same-shape requirement not supported here");
   case RequirementKind::Layout:
     break;
   case RequirementKind::Conformance: {
@@ -2885,8 +2914,8 @@ void ASTMangler::appendRequirement(const Requirement &reqt,
   if (auto *DT = FirstTy->getAs<DependentMemberType>()) {
     if (tryMangleTypeSubstitution(DT, sig)) {
       switch (reqt.getKind()) {
-        case RequirementKind::SameCount:
-          llvm_unreachable("Same-count requirement not supported here");
+        case RequirementKind::SameShape:
+          llvm_unreachable("Same-shape requirement not supported here");
         case RequirementKind::Conformance:
           return appendOperator("RQ");
         case RequirementKind::Layout:
@@ -2906,8 +2935,8 @@ void ASTMangler::appendRequirement(const Requirement &reqt,
     addTypeSubstitution(DT, sig);
     assert(gpBase);
     switch (reqt.getKind()) {
-      case RequirementKind::SameCount:
-        llvm_unreachable("Same-count requirement not supported here");
+      case RequirementKind::SameShape:
+        llvm_unreachable("Same-shape requirement not supported here");
       case RequirementKind::Conformance:
         return appendOpWithGenericParamIndex(isAssocTypeAtDepth ? "RP" : "Rp",
                                              gpBase, lhsBaseIsProtocolSelf);
@@ -2927,8 +2956,8 @@ void ASTMangler::appendRequirement(const Requirement &reqt,
   }
   GenericTypeParamType *gpBase = FirstTy->castTo<GenericTypeParamType>();
   switch (reqt.getKind()) {
-    case RequirementKind::SameCount:
-      llvm_unreachable("Same-count requirement not supported here");
+    case RequirementKind::SameShape:
+      llvm_unreachable("Same-shape requirement not supported here");
     case RequirementKind::Conformance:
       return appendOpWithGenericParamIndex("R", gpBase);
     case RequirementKind::Layout:
@@ -3488,8 +3517,8 @@ void ASTMangler::appendConcreteProtocolConformance(
   bool firstRequirement = true;
   for (const auto &conditionalReq : conformance->getConditionalRequirements()) {
     switch (conditionalReq.getKind()) {
-    case RequirementKind::SameCount:
-      llvm_unreachable("Same-count requirement not supported here");
+    case RequirementKind::SameShape:
+      llvm_unreachable("Same-shape requirement not supported here");
     case RequirementKind::Layout:
     case RequirementKind::SameType:
     case RequirementKind::Superclass:
@@ -3639,8 +3668,8 @@ void ASTMangler::appendConstrainedExistential(Type base, GenericSignature sig,
   bool firstRequirement = true;
   for (const auto &reqt : requirements) {
     switch (reqt.getKind()) {
-    case RequirementKind::SameCount:
-      llvm_unreachable("Same-count requirement not supported here");
+    case RequirementKind::SameShape:
+      llvm_unreachable("Same-shape requirement not supported here");
     case RequirementKind::Layout:
     case RequirementKind::Conformance:
     case RequirementKind::Superclass:

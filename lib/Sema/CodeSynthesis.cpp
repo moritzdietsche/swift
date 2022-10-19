@@ -16,13 +16,15 @@
 
 #include "CodeSynthesis.h"
 
-#include "TypeChecker.h"
 #include "TypeCheckDecl.h"
+#include "TypeCheckDistributed.h"
 #include "TypeCheckObjC.h"
 #include "TypeCheckType.h"
-#include "TypeCheckDistributed.h"
+#include "TypeChecker.h"
+#include "swift/AST/ASTMangler.h"
 #include "swift/AST/ASTPrinter.h"
 #include "swift/AST/Availability.h"
+#include "swift/AST/DistributedDecl.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/Initializer.h"
@@ -31,7 +33,6 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeCheckRequests.h"
-#include "swift/AST/DistributedDecl.h"
 #include "swift/Basic/Defer.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/Sema/ConstraintSystem.h"
@@ -385,8 +386,12 @@ static ConstructorDecl *createImplicitConstructor(NominalTypeDecl *decl,
         if (var->isImplicit())
           continue;
 
-        // Computed properties are not included.
-        if (!var->hasStorage())
+        // Computed properties are not included, except in cases
+        // where property has a property wrapper and `@typeWrapperIgnored`
+        // attribute.
+        if (!var->hasStorage() &&
+            !(var->hasAttachedPropertyWrapper() &&
+              var->getAttrs().hasAttribute<TypeWrapperIgnoredAttr>()))
           continue;
 
         // If this is a memberwise initializeable property include
@@ -580,10 +585,9 @@ createDesignatedInitOverrideGenericParams(ASTContext &ctx,
 
   SmallVector<GenericTypeParamDecl *, 4> newParams;
   for (auto *param : genericParams->getParams()) {
-    auto *newParam = GenericTypeParamDecl::create(
-        classDecl, param->getName(), SourceLoc(), param->isTypeSequence(),
-        depth, param->getIndex(), param->isOpaqueType(),
-        /*opaqueTypeRepr=*/nullptr);
+    auto *newParam = GenericTypeParamDecl::createImplicit(
+        classDecl, param->getName(), depth, param->getIndex(),
+        param->isParameterPack(), param->isOpaqueType());
     newParams.push_back(newParam);
   }
 
@@ -1255,10 +1259,14 @@ void TypeChecker::addImplicitConstructors(NominalTypeDecl *decl) {
     return;
 
   if (!shouldAttemptInitializerSynthesis(decl)) {
-    // If declaration is type wrapped, synthesize a
-    // special initializer that would instantiate storage.
-    if (decl->hasTypeWrapper())
-      (void)decl->getTypeWrapperInitializer();
+    if (decl->hasTypeWrapper()) {
+      auto &ctx = decl->getASTContext();
+      // If declaration is type wrapped and there are no
+      // designated initializers, synthesize a special
+      // memberwise initializer that would instantiate `$_storage`.
+      if (!hasUserDefinedDesignatedInit(ctx.evaluator, decl))
+        (void)decl->getTypeWrappedTypeMemberwiseInitializer();
+    }
 
     decl->setAddedImplicitInitializers();
     return;
@@ -1580,9 +1588,8 @@ void swift::addNonIsolatedToSynthesized(
   value->getAttrs().add(new (ctx) NonisolatedAttr(/*isImplicit=*/true));
 }
 
-ConstructorDecl *
-SynthesizeTypeWrapperInitializer::evaluate(Evaluator &evaluator,
-                                           NominalTypeDecl *wrappedType) const {
+ConstructorDecl *SynthesizeTypeWrappedTypeMemberwiseInitializer::evaluate(
+    Evaluator &evaluator, NominalTypeDecl *wrappedType) const {
   if (!wrappedType->hasTypeWrapper())
     return nullptr;
 
@@ -1593,10 +1600,40 @@ SynthesizeTypeWrapperInitializer::evaluate(Evaluator &evaluator,
   wrappedType->addMember(ctor);
 
   auto *body = evaluateOrDefault(
-      evaluator, SynthesizeTypeWrapperInitializerBody{ctor}, nullptr);
+      evaluator, SynthesizeTypeWrappedTypeMemberwiseInitializerBody{ctor},
+      nullptr);
   if (!body)
     return nullptr;
 
   ctor->setBody(body, AbstractFunctionDecl::BodyKind::Parsed);
   return ctor;
+}
+
+FuncDecl *ValueDecl::getHasSymbolQueryDecl() const {
+  return evaluateOrDefault(getASTContext().evaluator,
+                           SynthesizeHasSymbolQueryRequest{this}, nullptr);
+}
+
+FuncDecl *
+SynthesizeHasSymbolQueryRequest::evaluate(Evaluator &evaluator,
+                                          const ValueDecl *decl) const {
+  auto &ctx = decl->getASTContext();
+  auto dc = decl->getModuleContext();
+
+  Mangle::ASTMangler mangler;
+  auto mangledName = ctx.AllocateCopy(mangler.mangleHasSymbolQuery(decl));
+
+  ParameterList *params = ParameterList::createEmpty(ctx);
+
+  DeclName funcName =
+      DeclName(ctx, DeclBaseName(ctx.getIdentifier(mangledName)),
+               /*argumentNames=*/ArrayRef<Identifier>());
+
+  auto i1 = BuiltinIntegerType::get(1, ctx);
+  FuncDecl *func = FuncDecl::createImplicit(
+      ctx, swift::StaticSpellingKind::None, funcName, SourceLoc(),
+      /*async=*/false, /*throws=*/false, nullptr, params, i1, dc);
+
+  func->getAttrs().add(new (ctx) SILGenNameAttr(mangledName, IsImplicit));
+  return func;
 }

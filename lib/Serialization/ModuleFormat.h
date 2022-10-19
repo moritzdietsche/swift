@@ -58,7 +58,7 @@ const uint16_t SWIFTMODULE_VERSION_MAJOR = 0;
 /// describe what change you made. The content of this comment isn't important;
 /// it just ensures a conflict if two people change the module format.
 /// Don't worry about adhering to the 80-column limit for this line.
-const uint16_t SWIFTMODULE_VERSION_MINOR = 707; // @typeWrapper attribute
+const uint16_t SWIFTMODULE_VERSION_MINOR = 716; // remove @_typeSequence
 
 /// A standard hash seed used for all string hashes in a serialized module.
 ///
@@ -435,7 +435,7 @@ static inline OperatorFixity getASTOperatorFixity(OperatorKind fixity) {
 // These IDs must \em not be renumbered or reordered without incrementing
 // the module version.
 enum GenericRequirementKind : uint8_t {
-  SameCount = 0,
+  SameShape = 0,
   Conformance = 1,
   SameType    = 2,
   Superclass  = 3,
@@ -1046,7 +1046,7 @@ namespace decls_block {
 
   TYPE_LAYOUT(GenericTypeParamTypeLayout,
     GENERIC_TYPE_PARAM_TYPE,
-    BCFixed<1>,  // type sequence?
+    BCFixed<1>,  // parameter pack?
     DeclIDField, // generic type parameter decl or depth
     BCVBR<4> // index + 1, or zero if we have a generic type
             // parameter decl
@@ -1137,8 +1137,8 @@ namespace decls_block {
     SubstitutionMapIDField // the arguments
   );
 
-  TYPE_LAYOUT(SequenceArchetypeTypeLayout,
-    SEQUENCE_ARCHETYPE_TYPE,
+  TYPE_LAYOUT(PackArchetypeTypeLayout,
+    PACK_ARCHETYPE_TYPE,
     GenericSignatureIDField, // generic environment
     TypeIDField              // interface type
   );
@@ -1272,7 +1272,7 @@ namespace decls_block {
   using GenericTypeParamDeclLayout = BCRecordLayout<GENERIC_TYPE_PARAM_DECL,
     IdentifierIDField, // name
     BCFixed<1>,        // implicit flag
-    BCFixed<1>,        // type sequence?
+    BCFixed<1>,        // parameter pack?
     BCVBR<4>,          // depth
     BCVBR<4>,          // index
     BCFixed<1>         // opaque type?
@@ -2032,7 +2032,8 @@ namespace decls_block {
       BCVBR<4>, // # of arguments (+1) or 1 if simple decl name, 0 if no target
       BCVBR<4>, // # of SPI groups
       BCVBR<4>, // # of availability attributes
-      BCArray<IdentifierIDField> // target function pieces, spi groups
+      BCVBR<4>, // # of type erased parameters
+      BCArray<IdentifierIDField> // target function pieces, spi groups, type erased params
       >;
 
   using DifferentiableDeclAttrLayout = BCRecordLayout<
@@ -2061,8 +2062,6 @@ namespace decls_block {
     DeclIDField, // Original function declaration.
     BCArray<BCFixed<1>> // Transposed parameter indices' bitvector.
   >;
-
-  using TypeSequenceDeclAttrLayout = BCRecordLayout<TypeSequence_DECL_ATTR>;
 
 #define SIMPLE_DECL_ATTR(X, CLASS, ...)         \
   using CLASS##DeclAttrLayout = BCRecordLayout< \
@@ -2109,6 +2108,14 @@ namespace decls_block {
                                               BCFixed<1>, // implicit flag
                                               BCBlob      // declaration name
                                               >;
+
+  using DocumentationDeclAttrLayout = BCRecordLayout<
+    Documentation_DECL_ATTR,
+    BCFixed<1>,         // implicit flag
+    IdentifierIDField,  // metadata text
+    BCFixed<1>,         // has visibility
+    AccessLevelField    // visibility
+  >;
 
 #undef SYNTAX_SUGAR_TYPE_LAYOUT
 #undef TYPE_LAYOUT

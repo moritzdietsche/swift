@@ -123,6 +123,15 @@ static void printGenericParameters(raw_ostream &OS, GenericParamList *Params) {
   Params->print(OS);
 }
 
+static void printSourceRange(raw_ostream &OS, const SourceRange R,
+                             const ASTContext &Ctx) {
+  if (!R.isValid())
+    return;
+
+  PrintWithColorRAII(OS, RangeColor) << " range=";
+  R.print(PrintWithColorRAII(OS, RangeColor).getOS(), Ctx.SourceMgr,
+          /*PrintText=*/false);
+}
 
 static StringRef
 getSILFunctionTypeRepresentationString(SILFunctionType::Representation value) {
@@ -497,12 +506,7 @@ namespace {
       if (D->isHoisted())
         PrintWithColorRAII(OS, DeclModifierColor) << " hoisted";
 
-      auto R = D->getSourceRange();
-      if (R.isValid()) {
-        PrintWithColorRAII(OS, RangeColor) << " range=";
-        R.print(PrintWithColorRAII(OS, RangeColor).getOS(),
-                D->getASTContext().SourceMgr, /*PrintText=*/false);
-      }
+      printSourceRange(OS, D->getSourceRange(), D->getASTContext());
 
       if (D->TrailingSemiLoc.isValid())
         PrintWithColorRAII(OS, DeclModifierColor) << " trailing_semi";
@@ -847,6 +851,11 @@ namespace {
       printCommonPost(CD);
     }
 
+    void visitBuiltinTupleDecl(BuiltinTupleDecl *BTD) {
+      printCommon(BTD, "builtin_tuple_decl");
+      printCommonPost(BTD);
+    }
+
     void visitPatternBindingDecl(PatternBindingDecl *PBD) {
       printCommon(PBD, "pattern_binding_decl");
 
@@ -960,8 +969,9 @@ namespace {
         }
       }
 
-      if (P->isVariadic())
-        OS << " variadic";
+      if (P->hasInterfaceType())
+        if (P->isVariadic())
+          OS << " variadic";
 
       if (P->isAutoClosure())
         OS << " autoclosure";
@@ -980,7 +990,7 @@ namespace {
         break;
       }
 
-      if (P->getAttrs().hasAttribute<NoImplicitCopyAttr>())
+      if (P->isNoImplicitCopy())
         OS << " noImplicitCopy";
 
       if (P->getDefaultArgumentKind() != DefaultArgumentKind::None) {
@@ -1012,12 +1022,7 @@ namespace {
         ctx = &params->get(0)->getASTContext();
 
       if (ctx) {
-        auto R = params->getSourceRange();
-        if (R.isValid()) {
-          PrintWithColorRAII(OS, RangeColor) << " range=";
-          R.print(PrintWithColorRAII(OS, RangeColor).getOS(),
-                  ctx->SourceMgr, /*PrintText=*/false);
-        }
+        printSourceRange(OS, params->getSourceRange(), *ctx);
       }
 
       Indent += 2;
@@ -1482,6 +1487,18 @@ public:
       PrintWithColorRAII(OS, ParenthesisColor) << ")";
       Indent -= 2;
       break;
+    case StmtConditionElement::CK_HasSymbol:
+      Indent += 2;
+      OS.indent(Indent);
+      PrintWithColorRAII(OS, ParenthesisColor) << '(';
+      OS << "#_hasSymbol";
+      if (Ctx)
+        printSourceRange(OS, C.getSourceRange(), *Ctx);
+      OS << "\n";
+      printRec(C.getHasSymbolInfo()->getSymbolExpr());
+      PrintWithColorRAII(OS, ParenthesisColor) << ")";
+      Indent -= 2;
+      break;
     }
   }
 
@@ -1493,14 +1510,8 @@ public:
     if (S->isImplicit())
       OS << " implicit";
 
-    if (Ctx) {
-      auto R = S->getSourceRange();
-      if (R.isValid()) {
-        PrintWithColorRAII(OS, RangeColor) << " range=";
-        R.print(PrintWithColorRAII(OS, RangeColor).getOS(),
-                Ctx->SourceMgr, /*PrintText=*/false);
-      }
-    }
+    if (Ctx)
+      printSourceRange(OS, S->getSourceRange(), *Ctx);
 
     if (S->TrailingSemiLoc.isValid())
       OS << " trailing_semi";
@@ -1554,9 +1565,10 @@ public:
 
   void visitIfStmt(IfStmt *S) {
     printCommon(S, "if_stmt") << '\n';
-    for (auto elt : S->getCond())
+    for (auto elt : S->getCond()) {
       printRec(elt);
-    OS << '\n';
+      OS << "\n";
+    }
     printRec(S->getThenStmt());
     if (S->getElseStmt()) {
       OS << '\n';
@@ -1825,12 +1837,7 @@ public:
         L.print(PrintWithColorRAII(OS, LocationColor).getOS(), Ctx.SourceMgr);
       }
 
-      auto R = E->getSourceRange();
-      if (R.isValid()) {
-        PrintWithColorRAII(OS, RangeColor) << " range=";
-        R.print(PrintWithColorRAII(OS, RangeColor).getOS(),
-                Ctx.SourceMgr, /*PrintText=*/false);
-      }
+      printSourceRange(OS, E->getSourceRange(), Ctx);
     }
 
     if (E->TrailingSemiLoc.isValid())
@@ -2133,15 +2140,6 @@ public:
     }
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
-  void visitPackExpr(PackExpr *E) {
-    printCommon(E, "pack_expr");
-
-    for (unsigned i = 0, e = E->getNumElements(); i != e; ++i) {
-      OS << '\n';
-      printRec(E->getElement(i));
-    }
-    PrintWithColorRAII(OS, ParenthesisColor) << ')';
-  }
   void visitArrayExpr(ArrayExpr *E) {
     printCommon(E, "array_expr");
     PrintWithColorRAII(OS, LiteralValueColor) << " initializer=";
@@ -2288,11 +2286,6 @@ public:
     printRec(E->getSubExpr());
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
-  void visitReifyPackExpr(ReifyPackExpr *E) {
-    printCommon(E, "reify_pack") << '\n';
-    printRec(E->getSubExpr());
-    PrintWithColorRAII(OS, ParenthesisColor) << ')';
-  }
   void visitLoadExpr(LoadExpr *E) {
     printCommon(E, "load_expr") << '\n';
     printRec(E->getSubExpr());
@@ -2422,6 +2415,12 @@ public:
   void visitVarargExpansionExpr(VarargExpansionExpr *E) {
     printCommon(E, "vararg_expansion_expr") << '\n';
     printRec(E->getSubExpr());
+    PrintWithColorRAII(OS, ParenthesisColor) << ')';
+  }
+
+  void visitPackExpansionExpr(PackExpansionExpr *E) {
+    printCommon(E, "pack_expansion_expr") << "\n";
+    printRec(E->getPatternExpr());
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
 
@@ -2707,8 +2706,8 @@ public:
     printRec(E->getSubExpr());
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
-  void visitIfExpr(IfExpr *E) {
-    printCommon(E, "if_expr") << '\n';
+  void visitTernaryExpr(TernaryExpr *E) {
+    printCommon(E, "ternary_expr") << '\n';
     printRec(E->getCondExpr());
     OS << '\n';
     printRec(E->getThenExpr());
@@ -3085,6 +3084,12 @@ public:
     printRec(T->getKey());
     OS << '\n';
     printRec(T->getValue());
+    PrintWithColorRAII(OS, ParenthesisColor) << ')';
+  }
+
+  void visitPackExpansionTypeRepr(PackExpansionTypeRepr *T) {
+    printCommon("pack_expansion") << '\n';
+    printRec(T->getPatternType());
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
 
@@ -3715,9 +3720,7 @@ namespace {
       printField("num_elements", T->getNumElements());
       Indent += 2;
       for (Type elt : T->getElementTypes()) {
-        OS.indent(Indent) << "(";
         printRec(elt);
-        OS << ")";
       }
       Indent -= 2;
       PrintWithColorRAII(OS, ParenthesisColor) << ')';
@@ -3725,8 +3728,8 @@ namespace {
 
     void visitPackExpansionType(PackExpansionType *T, StringRef label) {
       printCommon(label, "pack_expansion_type");
-      printField("pattern", T->getPatternType());
-      printField("count", T->getCountType());
+      printRec("pattern", T->getPatternType());
+      printRec("count", T->getCountType());
       PrintWithColorRAII(OS, ParenthesisColor) << ')';
     }
 
@@ -3790,6 +3793,12 @@ namespace {
       printField("decl", T->getDecl()->printRef());
       if (T->getParent())
         printRec("parent", T->getParent());
+      PrintWithColorRAII(OS, ParenthesisColor) << ')';
+    }
+
+    void visitBuiltinTupleType(BuiltinTupleType *T, StringRef label) {
+      printCommon(label, "builtin_tuple_type");
+      printField("decl", T->getDecl()->printRef());
       PrintWithColorRAII(OS, ParenthesisColor) << ')';
     }
 
@@ -3866,8 +3875,8 @@ namespace {
       }
       PrintWithColorRAII(OS, ParenthesisColor) << ')';
     }
-    void visitSequenceArchetypeType(SequenceArchetypeType *T, StringRef label) {
-      printArchetypeCommon(T, "sequence_archetype_type", label);
+    void visitPackArchetypeType(PackArchetypeType *T, StringRef label) {
+      printArchetypeCommon(T, "pack_archetype_type", label);
       printField("name", T->getFullName());
       OS << "\n";
       PrintWithColorRAII(OS, ParenthesisColor) << ')';
@@ -4258,8 +4267,8 @@ void Requirement::dump() const {
 }
 void Requirement::dump(raw_ostream &out) const {
   switch (getKind()) {
-  case RequirementKind::SameCount:
-    out << "same_count: ";
+  case RequirementKind::SameShape:
+    out << "same_shape: ";
     break;
   case RequirementKind::Conformance:
     out << "conforms_to: ";

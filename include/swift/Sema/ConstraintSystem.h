@@ -330,6 +330,9 @@ enum TypeVariableOptions {
   /// Whether a more specific deduction for this type variable implies a
   /// better solution to the constraint system.
   TVO_PrefersSubtypeBinding = 0x10,
+
+  /// Whether the type variable can be bound to a pack type or not.
+  TVO_CanBindToPack = 0x20,
 };
 
 /// The implementation object for a type variable used within the
@@ -387,17 +390,20 @@ public:
            && "Truncation");
   }
 
-  /// Whether this type variable can bind to an lvalue type.
+  /// Whether this type variable can bind to an LValueType.
   bool canBindToLValue() const { return getRawOptions() & TVO_CanBindToLValue; }
 
-  /// Whether this type variable can bind to an inout type.
+  /// Whether this type variable can bind to an InOutType.
   bool canBindToInOut() const { return getRawOptions() & TVO_CanBindToInOut; }
 
-  /// Whether this type variable can bind to an inout type.
+  /// Whether this type variable can bind to a noescape FunctionType.
   bool canBindToNoEscape() const { return getRawOptions() & TVO_CanBindToNoEscape; }
 
-  /// Whether this type variable can bind to a hole.
+  /// Whether this type variable can bind to a PlaceholderType.
   bool canBindToHole() const { return getRawOptions() & TVO_CanBindToHole; }
+
+  /// Whether this type variable can bind to a PackType.
+  bool canBindToPack() const { return getRawOptions() & TVO_CanBindToPack; }
 
   /// Whether this type variable prefers a subtype binding over a supertype
   /// binding.
@@ -472,7 +478,9 @@ public:
   /// Determine whether this type variable represents a subscript result type.
   bool isSubscriptResultType() const;
 
-  bool isTypeSequence() const;
+  /// Determine whether this type variable represents an opened
+  /// type parameter pack.
+  bool isParameterPack() const;
 
   /// Determine whether this type variable represents a code completion
   /// expression.
@@ -636,6 +644,7 @@ private:
     ENTRY(TVO_CanBindToNoEscape, "noescape");
     ENTRY(TVO_CanBindToHole, "hole");
     ENTRY(TVO_PrefersSubtypeBinding, "");
+    ENTRY(TVO_CanBindToPack, "pack");
     }
   #undef ENTRY
   }
@@ -3307,10 +3316,10 @@ private:
     CacheExprTypes(Expr *expr, ConstraintSystem &cs, bool excludeRoot)
         : RootExpr(expr), CS(cs), ExcludeRoot(excludeRoot) {}
 
-    Expr *walkToExprPost(Expr *expr) override {
+    PostWalkResult<Expr *> walkToExprPost(Expr *expr) override {
       if (ExcludeRoot && expr == RootExpr) {
         assert(!expr->getType() && "Unexpected type in root of expression!");
-        return expr;
+        return Action::Continue(expr);
       }
 
       if (expr->getType())
@@ -3321,16 +3330,18 @@ private:
           if (kp->getComponents()[i].getComponentType())
             CS.cacheType(kp, i);
 
-      return expr;
+      return Action::Continue(expr);
     }
 
     /// Ignore statements.
-    std::pair<bool, Stmt *> walkToStmtPre(Stmt *stmt) override {
-      return { false, stmt };
+    PreWalkResult<Stmt *> walkToStmtPre(Stmt *stmt) override {
+      return Action::SkipChildren(stmt);
     }
 
     /// Ignore declarations.
-    bool walkToDeclPre(Decl *decl) override { return false; }
+    PreWalkAction walkToDeclPre(Decl *decl) override {
+      return Action::SkipChildren();
+    }
   };
 
 public:
@@ -4352,6 +4363,26 @@ public:
     }
   }
 
+  /// Add a value witness constraint to the constraint system.
+  void addValueWitnessConstraint(
+      Type baseTy, ValueDecl *requirement, Type memberTy, DeclContext *useDC,
+      FunctionRefKind functionRefKind, ConstraintLocatorBuilder locator) {
+    assert(baseTy);
+    assert(memberTy);
+    assert(requirement);
+    assert(useDC);
+    switch (simplifyValueWitnessConstraint(
+        ConstraintKind::ValueWitness, baseTy, requirement, memberTy, useDC,
+        functionRefKind, TMF_GenerateConstraints, locator)) {
+    case SolutionKind::Unsolved:
+      llvm_unreachable("Unsolved result when generating constraints!");
+
+    case SolutionKind::Solved:
+    case SolutionKind::Error:
+      break;
+    }
+  }
+
   /// Add an explicit conversion constraint (e.g., \c 'x as T').
   ///
   /// \param fromType The type of the expression being converted.
@@ -4399,7 +4430,7 @@ public:
 
     if (isDebugMode()) {
       auto &log = llvm::errs();
-      log.indent(solverState ? solverState->getCurrentIndent() : 0)
+      log.indent(solverState ? solverState->getCurrentIndent() + 4 : 0)
           << "(failed constraint ";
       constraint->print(log, &getASTContext().SourceMgr);
       log << ")\n";
@@ -4422,6 +4453,14 @@ public:
     // Add this constraint to the constraint graph.
     CG.addConstraint(constraint);
 
+    if (isDebugMode() && getPhase() == ConstraintSystemPhase::Solving) {
+      auto &log = llvm::errs();
+      log.indent(solverState->getCurrentIndent() + 4) << "(added constraint: ";
+      constraint->print(log, &getASTContext().SourceMgr,
+                        solverState->getCurrentIndent() + 4);
+      log << ")\n";
+    }
+
     // Record this as a newly-generated constraint.
     if (solverState)
       solverState->addGeneratedConstraint(constraint);
@@ -4431,6 +4470,15 @@ public:
   void removeInactiveConstraint(Constraint *constraint) {
     CG.removeConstraint(constraint);
     InactiveConstraints.erase(constraint);
+
+    if (isDebugMode() && getPhase() == ConstraintSystemPhase::Solving) {
+      auto &log = llvm::errs();
+      log.indent(solverState->getCurrentIndent() + 4)
+          << "(removed constraint: ";
+      constraint->print(log, &getASTContext().SourceMgr,
+                        solverState->getCurrentIndent() + 4);
+      log << ")\n";
+    }
 
     if (solverState)
       solverState->retireConstraint(constraint);
@@ -5149,21 +5197,18 @@ public:
                  ConstraintKind kind, TypeMatchOptions flags,
                  ConstraintLocatorBuilder locator);
 
+  TypeMatchResult
+  matchPackExpansionTypes(PackExpansionType *expansion1,
+                          PackExpansionType *expansion2,
+                          ConstraintKind kind, TypeMatchOptions flags,
+                          ConstraintLocatorBuilder locator);
+
   /// Subroutine of \c matchTypes(), which matches up two tuple types.
   ///
   /// \returns the result of performing the tuple-to-tuple conversion.
   TypeMatchResult matchTupleTypes(TupleType *tuple1, TupleType *tuple2,
                                   ConstraintKind kind, TypeMatchOptions flags,
                                   ConstraintLocatorBuilder locator);
-
-  /// Subroutine of \c matchTypes(), which matches a scalar type to
-  /// a tuple type.
-  ///
-  /// \returns the result of performing the scalar-to-tuple conversion.
-  TypeMatchResult matchScalarToTupleTypes(Type type1, TupleType *tuple2,
-                                          ConstraintKind kind,
-                                          TypeMatchOptions flags,
-                                          ConstraintLocatorBuilder locator);
 
   /// Subroutine of \c matchTypes(), which matches up two function
   /// types.
@@ -6042,11 +6087,9 @@ public:
 /// Compute the shuffle required to map from a given tuple type to
 /// another tuple type.
 ///
-/// \param fromTuple The tuple type we're converting from, as represented by its
-/// TupleTypeElt members.
+/// \param fromTuple The tuple type we're converting from.
 ///
-/// \param toTuple The tuple type we're converting to, as represented by its
-/// TupleTypeElt members.
+/// \param toTuple The tuple type we're converting to.
 ///
 /// \param sources Will be populated with information about the source of each
 /// of the elements for the result tuple. The indices into this array are the
@@ -6054,15 +6097,9 @@ public:
 /// an index into the source tuple.
 ///
 /// \returns true if no tuple conversion is possible, false otherwise.
-bool computeTupleShuffle(ArrayRef<TupleTypeElt> fromTuple,
-                         ArrayRef<TupleTypeElt> toTuple,
+bool computeTupleShuffle(TupleType *fromTuple,
+                         TupleType *toTuple,
                          SmallVectorImpl<unsigned> &sources);
-static inline bool computeTupleShuffle(TupleType *fromTuple,
-                                       TupleType *toTuple,
-                                       SmallVectorImpl<unsigned> &sources){
-  return computeTupleShuffle(fromTuple->getElements(), toTuple->getElements(),
-                             sources);
-}
 
 /// Class used as the base for listeners to the \c matchCallArguments process.
 ///
@@ -6751,7 +6788,7 @@ public:
   : NumOverloads(overloads)
   {}
 
-  std::pair<bool, Expr *> walkToExprPre(Expr *expr) override {
+  PreWalkResult<Expr *> walkToExprPre(Expr *expr) override {
     if (auto applyExpr = dyn_cast<ApplyExpr>(expr)) {
       // If we've found function application and it's
       // function is an overload set, count it.
@@ -6760,7 +6797,7 @@ public:
     }
 
     // Always recur into the children.
-    return { true, expr };
+    return Action::Continue(expr);
   }
 };
 

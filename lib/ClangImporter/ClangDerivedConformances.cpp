@@ -159,7 +159,7 @@ void swift::conformToCxxIteratorIfNeeded(
   if (pointees.size() != 1)
     return;
   auto pointee = dyn_cast<VarDecl>(pointees.front());
-  if (!pointee || pointee->isGetterMutating())
+  if (!pointee || pointee->isGetterMutating() || pointee->getType()->hasError())
     return;
 
   // Check if present: `func successor() -> Self`
@@ -228,9 +228,9 @@ void swift::conformToCxxSequenceIfNeeded(
     return;
 
   // Check if RawIterator conforms to UnsafeCxxInputIterator.
-  auto rawIteratorConformanceRef = decl->getModuleContext()->lookupConformance(
+  auto rawIteratorConformanceRef = decl->getModuleContext()->conformsToProtocol(
       rawIteratorTy, cxxIteratorProto);
-  if (!rawIteratorConformanceRef.isConcrete())
+  if (!rawIteratorConformanceRef || !rawIteratorConformanceRef.isConcrete())
     return;
   auto rawIteratorConformance = rawIteratorConformanceRef.getConcrete();
   auto pointeeDecl =

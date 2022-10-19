@@ -1337,7 +1337,7 @@ static uint8_t getRawStableRequirementKind(RequirementKind kind) {
     return GenericRequirementKind::KIND;
 
   switch (kind) {
-  CASE(SameCount)
+  CASE(SameShape)
   CASE(Conformance)
   CASE(Superclass)
   CASE(SameType)
@@ -1787,6 +1787,9 @@ static bool shouldSerializeMember(Decl *D) {
     if (D->getASTContext().LangOpts.AllowModuleWithCompilerErrors)
       return false;
     llvm_unreachable("should never need to reserialize a member placeholder");
+
+  case DeclKind::BuiltinTuple:
+    llvm_unreachable("BuiltinTupleDecl should not show up here");
 
   case DeclKind::IfConfig:
   case DeclKind::PoundDiagnostic:
@@ -2711,16 +2714,22 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
         pieces.push_back(S.addDeclBaseNameRef(spi));
       }
 
+      for (auto ty : attr->getTypeErasedParams()) {
+        pieces.push_back(S.addTypeRef(ty));
+      }
+
       auto numSPIGroups = attr->getSPIGroups().size();
-      assert(pieces.size() == numArgs + numSPIGroups ||
-             pieces.size() == (numArgs - 1 + numSPIGroups));
+      auto numTypeErasedParams = attr->getTypeErasedParams().size();
+      assert(pieces.size() == numArgs + numSPIGroups + numTypeErasedParams ||
+             pieces.size() == (numArgs - 1 + numSPIGroups + numTypeErasedParams));
       auto numAvailabilityAttrs = attr->getAvailableAttrs().size();
       SpecializeDeclAttrLayout::emitRecord(
           S.Out, S.ScratchRecord, abbrCode, (unsigned)attr->isExported(),
           (unsigned)attr->getSpecializationKind(),
           S.addGenericSignatureRef(attr->getSpecializedSignature()),
           S.addDeclRef(targetFunDecl), numArgs, numSPIGroups,
-          numAvailabilityAttrs, pieces);
+          numAvailabilityAttrs, numTypeErasedParams,
+          pieces);
       for (auto availAttr : attr->getAvailableAttrs()) {
         writeDeclAttribute(D, availAttr);
       }
@@ -2848,12 +2857,6 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
       return;
     }
 
-    case DAK_TypeSequence: {
-      auto abbrCode = S.DeclTypeAbbrCodes[TypeSequenceDeclAttrLayout::Code];
-      TypeSequenceDeclAttrLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode);
-      return;
-    }
-
     case DAK_UnavailableFromAsync: {
       auto abbrCode =
           S.DeclTypeAbbrCodes[UnavailableFromAsyncDeclAttrLayout::Code];
@@ -2869,6 +2872,23 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
       auto abbrCode = S.DeclTypeAbbrCodes[ExposeDeclAttrLayout::Code];
       ExposeDeclAttrLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode,
                                        theAttr->isImplicit(), theAttr->Name);
+      return;
+    }
+
+    case DAK_Documentation: {
+      auto *theAttr = cast<DocumentationAttr>(DA);
+      auto abbrCode = S.DeclTypeAbbrCodes[DocumentationDeclAttrLayout::Code];
+      auto metadataIDPair = S.addUniquedString(theAttr->Metadata);
+      bool hasVisibility = false;
+      uint8_t visibility = static_cast<uint8_t>(AccessLevel::Private);
+      if (theAttr->Visibility) {
+        hasVisibility = true;
+        visibility = getRawStableAccessLevel(*theAttr->Visibility);
+      }
+
+      DocumentationDeclAttrLayout::emitRecord(
+          S.Out, S.ScratchRecord, abbrCode, theAttr->isImplicit(),
+          metadataIDPair.second, hasVisibility, visibility);
       return;
     }
     }
@@ -3520,7 +3540,7 @@ public:
     GenericTypeParamDeclLayout::emitRecord(
         S.Out, S.ScratchRecord, abbrCode,
         S.addDeclBaseNameRef(genericParam->getName()),
-        genericParam->isImplicit(), genericParam->isTypeSequence(),
+        genericParam->isImplicit(), genericParam->isParameterPack(),
         genericParam->getDepth(), genericParam->getIndex(),
         genericParam->isOpaqueType());
   }
@@ -4256,6 +4276,10 @@ public:
   void visitMissingMemberDecl(const MissingMemberDecl *) {
     llvm_unreachable("member placeholders shouldn't be serialized");
   }
+
+  void visitBuiltinTupleDecl(const BuiltinTupleDecl *) {
+    llvm_unreachable("BuiltinTupleDecl are not serialized");
+  }
 };
 
 /// When allowing modules with errors there may be cases where there's little
@@ -4649,16 +4673,16 @@ public:
                                           declID, interfaceTypeID, substMapID);
   }
 
-  void visitSequenceArchetypeType(const SequenceArchetypeType *archetypeTy) {
+  void visitPackArchetypeType(const PackArchetypeType *archetypeTy) {
     using namespace decls_block;
     auto sig = archetypeTy->getGenericEnvironment()->getGenericSignature();
 
     GenericSignatureID sigID = S.addGenericSignatureRef(sig);
     TypeID interfaceTypeID = S.addTypeRef(archetypeTy->getInterfaceType());
 
-    unsigned abbrCode = S.DeclTypeAbbrCodes[SequenceArchetypeTypeLayout::Code];
-    SequenceArchetypeTypeLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode,
-                                            sigID, interfaceTypeID);
+    unsigned abbrCode = S.DeclTypeAbbrCodes[PackArchetypeTypeLayout::Code];
+    PackArchetypeTypeLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode,
+                                        sigID, interfaceTypeID);
   }
 
   void visitGenericTypeParamType(const GenericTypeParamType *genericParam) {
@@ -4677,7 +4701,7 @@ public:
       indexPlusOne = genericParam->getIndex() + 1;
     }
     GenericTypeParamTypeLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode,
-                                           genericParam->isTypeSequence(),
+                                           genericParam->isParameterPack(),
                                            declIDOrDepth, indexPlusOne);
   }
 
@@ -5072,7 +5096,7 @@ void Serializer::writeAllDeclsAndTypes() {
   registerDeclTypeAbbr<PrimaryArchetypeTypeLayout>();
   registerDeclTypeAbbr<OpenedArchetypeTypeLayout>();
   registerDeclTypeAbbr<OpaqueArchetypeTypeLayout>();
-  registerDeclTypeAbbr<SequenceArchetypeTypeLayout>();
+  registerDeclTypeAbbr<PackArchetypeTypeLayout>();
   registerDeclTypeAbbr<ProtocolCompositionTypeLayout>();
   registerDeclTypeAbbr<ParameterizedProtocolTypeLayout>();
   registerDeclTypeAbbr<ExistentialTypeLayout>();

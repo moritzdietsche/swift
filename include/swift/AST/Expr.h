@@ -359,11 +359,6 @@ protected:
     IsPlaceholder : 1
   );
 
-  SWIFT_INLINE_BITFIELD_FULL(PackExpr, Expr, 32,
-    : NumPadBits,
-    NumElements : 32
-  );
-
   SWIFT_INLINE_BITFIELD_FULL(TypeJoinExpr, Expr, 32,
     : NumPadBits,
     NumElements : 32
@@ -3399,18 +3394,6 @@ public:
   }
 };
 
-/// ReifyPackExpr - Drop the pack structure and reify it either as a tuple or
-/// single value.
-class ReifyPackExpr : public ImplicitConversionExpr {
-public:
-  ReifyPackExpr(Expr *subExpr, Type type)
-    : ImplicitConversionExpr(ExprKind::ReifyPack, subExpr, type) {}
-
-  static bool classof(const Expr *E) {
-    return E->getKind() == ExprKind::ReifyPack;
-  }
-};
-
 /// UnresolvedSpecializeExpr - Represents an explicit specialization using
 /// a type parameter list (e.g. "Vector<Int>") that has not been resolved.
 class UnresolvedSpecializeExpr final : public Expr,
@@ -3524,6 +3507,51 @@ public:
 
   static bool classof(const Expr *E) {
     return E->getKind() == ExprKind::VarargExpansion;
+  }
+};
+
+/// A pack expansion expression is a pattern expression followed by
+/// the expansion operator '...'. The pattern expression contains
+/// references to parameter packs of length N, and the expansion
+/// operator will repeat the pattern N times.
+///
+/// Pack expansion expressions are permitted in expression contexts
+/// that naturally accept a comma-separated list of values, including
+/// call argument lists, the elements of a tuple value, and the source
+/// of a for-in loop.
+class PackExpansionExpr: public Expr {
+  Expr *PatternExpr;
+  SourceLoc DotsLoc;
+
+  PackExpansionExpr(Expr *patternExpr,
+                    SourceLoc dotsLoc,
+                    bool implicit, Type type)
+    : Expr(ExprKind::PackExpansion, implicit, type),
+      PatternExpr(patternExpr), DotsLoc(dotsLoc) {}
+
+public:
+  static PackExpansionExpr *create(ASTContext &ctx,
+                                   Expr *patternExpr,
+                                   SourceLoc dotsLoc,
+                                   bool implicit = false,
+                                   Type type = Type());
+
+  Expr *getPatternExpr() const { return PatternExpr; }
+
+  void setPatternExpr(Expr *patternExpr) {
+    PatternExpr = patternExpr;
+  }
+
+  SourceLoc getStartLoc() const {
+    return PatternExpr->getStartLoc();
+  }
+
+  SourceLoc getEndLoc() const {
+    return DotsLoc;
+  }
+
+  static bool classof(const Expr *E) {
+    return E->getKind() == ExprKind::PackExpansion;
   }
 };
 
@@ -3658,6 +3686,8 @@ public:
   bool preconcurrency() const {
     return storage.getInt();
   }
+
+  ActorIsolation getActorIsolation() const;
 };
 
 /// A base class for closure expressions.
@@ -4045,14 +4075,6 @@ public:
 ///   func f(x : @autoclosure () -> Int)
 ///   f(42)  // AutoclosureExpr convert from Int to ()->Int
 /// \endcode
-///
-///  They are also created when key path expressions are converted to function
-///  type, in which case, a pair of nested implicit closures are formed:
-/// \code
-///   { $kp$ in { $0[keyPath: $kp$] } }( \(E) )
-/// \endcode
-/// This is to ensure side effects of the key path expression (mainly indices in
-/// subscripts) are only evaluated once.
 class AutoClosureExpr : public AbstractClosureExpr {
   BraceStmt *Body;
 
@@ -4150,10 +4172,10 @@ class CaptureListExpr final : public Expr,
     private llvm::TrailingObjects<CaptureListExpr, CaptureListEntry> {
   friend TrailingObjects;
 
-  ClosureExpr *closureBody;
+  AbstractClosureExpr *closureBody;
 
   CaptureListExpr(ArrayRef<CaptureListEntry> captureList,
-                  ClosureExpr *closureBody)
+                  AbstractClosureExpr *closureBody)
     : Expr(ExprKind::CaptureList, /*Implicit=*/false, Type()),
       closureBody(closureBody) {
     Bits.CaptureListExpr.NumCaptures = captureList.size();
@@ -4164,16 +4186,16 @@ class CaptureListExpr final : public Expr,
 public:
   static CaptureListExpr *create(ASTContext &ctx,
                                  ArrayRef<CaptureListEntry> captureList,
-                                 ClosureExpr *closureBody);
+                                 AbstractClosureExpr *closureBody);
 
   ArrayRef<CaptureListEntry> getCaptureList() {
     return {getTrailingObjects<CaptureListEntry>(),
             Bits.CaptureListExpr.NumCaptures};
   }
-  ClosureExpr *getClosureBody() { return closureBody; }
-  const ClosureExpr *getClosureBody() const { return closureBody; }
+  AbstractClosureExpr *getClosureBody() { return closureBody; }
+  const AbstractClosureExpr *getClosureBody() const { return closureBody; }
 
-  void setClosureBody(ClosureExpr *body) { closureBody = body; }
+  void setClosureBody(AbstractClosureExpr *body) { closureBody = body; }
 
   /// This is a bit weird, but the capture list is lexically contained within
   /// the closure, so the ClosureExpr has the full source range.
@@ -5067,25 +5089,21 @@ public:
     return E->getKind() == ExprKind::RebindSelfInConstructor;
   }
 };
-  
-/// The conditional expression 'x ? y : z'.
-class IfExpr : public Expr {
+
+/// The ternary conditional expression 'x ? y : z'.
+class TernaryExpr : public Expr {
   Expr *CondExpr, *ThenExpr, *ElseExpr;
   SourceLoc QuestionLoc, ColonLoc;
 public:
-  IfExpr(Expr *CondExpr,
-         SourceLoc QuestionLoc, Expr *ThenExpr,
-         SourceLoc ColonLoc, Expr *ElseExpr,
-         Type Ty = Type())
-    : Expr(ExprKind::If, /*Implicit=*/false, Ty),
-      CondExpr(CondExpr), ThenExpr(ThenExpr), ElseExpr(ElseExpr),
-      QuestionLoc(QuestionLoc), ColonLoc(ColonLoc)
-  {}
-  
-  IfExpr(SourceLoc QuestionLoc, Expr *ThenExpr, SourceLoc ColonLoc)
-    : IfExpr(nullptr, QuestionLoc, ThenExpr, ColonLoc, nullptr)
-  {}
-  
+  TernaryExpr(Expr *CondExpr, SourceLoc QuestionLoc, Expr *ThenExpr,
+              SourceLoc ColonLoc, Expr *ElseExpr, Type Ty = Type())
+      : Expr(ExprKind::Ternary, /*Implicit=*/false, Ty), CondExpr(CondExpr),
+        ThenExpr(ThenExpr), ElseExpr(ElseExpr), QuestionLoc(QuestionLoc),
+        ColonLoc(ColonLoc) {}
+
+  TernaryExpr(SourceLoc QuestionLoc, Expr *ThenExpr, SourceLoc ColonLoc)
+      : TernaryExpr(nullptr, QuestionLoc, ThenExpr, ColonLoc, nullptr) {}
+
   SourceLoc getLoc() const { return QuestionLoc; }
   SourceLoc getStartLoc() const {
     return (isFolded() ? CondExpr->getStartLoc() : QuestionLoc);
@@ -5109,7 +5127,7 @@ public:
   bool isFolded() const { return CondExpr && ElseExpr; }
   
   static bool classof(const Expr *E) {
-    return E->getKind() == ExprKind::If;
+    return E->getKind() == ExprKind::Ternary;
   }
 };
 
@@ -5740,8 +5758,8 @@ private:
 public:
   /// Create a new parsed Swift key path expression.
   static KeyPathExpr *createParsed(ASTContext &ctx, SourceLoc backslashLoc,
-                                   Expr *parsedRoot, Expr *parsedPath,
-                                   bool hasLeadingDot);
+     Expr *parsedRoot, Expr *parsedPath,
+     bool hasLeadingDot);
 
   /// Create a new parsed #keyPath expression.
   static KeyPathExpr *createParsedPoundKeyPath(ASTContext &ctx,
@@ -5885,56 +5903,6 @@ public:
   }
 };
 
-/// An expression node that aggregates a set of heterogeneous arguments into a
-/// parameter pack suitable for passing off to a variadic generic function
-/// argument.
-///
-/// There is no user-visible way to spell a pack expression, they are always
-/// implicitly created at applies. As such, any appearance of pack types outside
-/// of applies are illegal. In general, packs appearing in such positions should
-/// have a \c ReifyPackExpr to convert them to a user-available AST type.
-class PackExpr final : public Expr,
-    private llvm::TrailingObjects<PackExpr, Expr *> {
-  friend TrailingObjects;
-
-  size_t numTrailingObjects() const {
-    return getNumElements();
-  }
-
-  PackExpr(ArrayRef<Expr *> SubExprs, Type Ty);
-
-public:
-  /// Create a pack.
-  static PackExpr *create(ASTContext &ctx, ArrayRef<Expr *> SubExprs, Type Ty);
-
-  /// Create an empty pack.
-  static PackExpr *createEmpty(ASTContext &ctx);
-
-  SourceLoc getLoc() const { return SourceLoc(); }
-  SourceRange getSourceRange() const { return SourceRange(); }
-
-  /// Retrieve the elements of this pack.
-  MutableArrayRef<Expr *> getElements() {
-    return { getTrailingObjects<Expr *>(), getNumElements() };
-  }
-
-  /// Retrieve the elements of this pack.
-  ArrayRef<Expr *> getElements() const {
-    return { getTrailingObjects<Expr *>(), getNumElements() };
-  }
-
-  unsigned getNumElements() const { return Bits.PackExpr.NumElements; }
-
-  Expr *getElement(unsigned i) const {
-    return getElements()[i];
-  }
-  void setElement(unsigned i, Expr *e) {
-    getElements()[i] = e;
-  }
-
-  static bool classof(const Expr *E) { return E->getKind() == ExprKind::Pack; }
-};
-
 class TypeJoinExpr final : public Expr,
                            private llvm::TrailingObjects<TypeJoinExpr, Expr *> {
   friend TrailingObjects;
@@ -5985,7 +5953,7 @@ public:
 };
 
 inline bool Expr::isInfixOperator() const {
-  return isa<BinaryExpr>(this) || isa<IfExpr>(this) ||
+  return isa<BinaryExpr>(this) || isa<TernaryExpr>(this) ||
          isa<AssignExpr>(this) || isa<ExplicitCastExpr>(this);
 }
 

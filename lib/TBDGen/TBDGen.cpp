@@ -689,11 +689,15 @@ void TBDGenVisitor::visitAbstractFunctionDecl(AbstractFunctionDecl *AFD) {
   for (auto *attr : AFD->getAttrs().getAttributes<SpecializeAttr>()) {
     if (!attr->isExported())
       continue;
+
+    auto erasedSignature = attr->getSpecializedSignature()
+        .typeErased(attr->getTypeErasedParams());
+
     if (auto *targetFun = attr->getTargetFunctionDecl(AFD)) {
-      auto declRef = SILDeclRef(targetFun, attr->getSpecializedSignature());
+      auto declRef = SILDeclRef(targetFun, erasedSignature);
       addSymbol(declRef.mangle(), SymbolSource::forSILDeclRef(declRef));
     } else {
-      auto declRef = SILDeclRef(AFD, attr->getSpecializedSignature());
+      auto declRef = SILDeclRef(AFD, erasedSignature);
       addSymbol(declRef.mangle(), SymbolSource::forSILDeclRef(declRef));
     }
   }
@@ -999,15 +1003,16 @@ void TBDGenVisitor::visitConstructorDecl(ConstructorDecl *CD) {
 }
 
 void TBDGenVisitor::visitDestructorDecl(DestructorDecl *DD) {
-  // Class destructors come in two forms (deallocating and non-deallocating),
-  // like constructors above. This is the deallocating one:
+  // Destructors come in two forms (deallocating and non-deallocating), like
+  // constructors above. Classes use both but move only non-class nominal types
+  // only use the deallocating one. This is the deallocating one:
   visitAbstractFunctionDecl(DD);
 
-  auto parentClass = DD->getParent()->getSelfClassDecl();
-
-  // But the non-deallocating one doesn't apply to some @objc classes.
-  if (!Lowering::usesObjCAllocator(parentClass)) {
-    addSymbol(SILDeclRef(DD, SILDeclRef::Kind::Destroyer));
+  if (auto parentClass = DD->getParent()->getSelfClassDecl()) {
+    // But the non-deallocating one doesn't apply to some @objc classes.
+    if (!Lowering::usesObjCAllocator(parentClass)) {
+      addSymbol(SILDeclRef(DD, SILDeclRef::Kind::Destroyer));
+    }
   }
 }
 
@@ -1054,6 +1059,8 @@ static bool isValidProtocolMemberForTBDGen(const Decl *D) {
   case DeclKind::PrefixOperator:
   case DeclKind::PostfixOperator:
     return false;
+  case DeclKind::BuiltinTuple:
+    llvm_unreachable("BuiltinTupleDecl should not show up here");
   }
   llvm_unreachable("covered switch");
 }
@@ -1347,6 +1354,10 @@ void swift::writeTBDFile(ModuleDecl *M, llvm::raw_ostream &os,
 }
 
 class APIGenRecorder final : public APIRecorder {
+  bool isSPI(const ValueDecl* VD) {
+    assert(VD);
+    return VD->isSPI() || VD->isAvailableAsSPI();
+  }
 public:
   APIGenRecorder(apigen::API &api, ModuleDecl *module)
       : api(api), module(module) {
@@ -1366,13 +1377,13 @@ public:
       auto ref = source.getSILDeclRef();
       if (ref.hasDecl()) {
         availability = getAvailability(ref.getDecl());
-        if (ref.getDecl()->isSPI())
+        if (isSPI(ref.getDecl()))
           access = apigen::APIAccess::Private;
       }
     } else if (source.kind == SymbolSource::Kind::IR) {
       auto ref = source.getIRLinkEntity();
       if (ref.hasDecl()) {
-        if (ref.getDecl()->isSPI())
+        if (isSPI(ref.getDecl()))
           access = apigen::APIAccess::Private;
       }
     }

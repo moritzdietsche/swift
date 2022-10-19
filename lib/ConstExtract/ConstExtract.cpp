@@ -43,13 +43,13 @@ public:
       std::vector<NominalTypeDecl *> &ConformanceDecls)
       : Protocols(Protocols), ConformanceTypeDecls(ConformanceDecls) {}
 
-  bool walkToDeclPre(Decl *D) override {
+  PreWalkAction walkToDeclPre(Decl *D) override {
     if (auto *NTD = llvm::dyn_cast<NominalTypeDecl>(D))
       if (!isa<ProtocolDecl>(NTD))
         for (auto &Protocol : NTD->getAllProtocols())
           if (Protocols.count(Protocol->getName().str().str()) != 0)
             ConformanceTypeDecls.push_back(NTD);
-    return true;
+    return Action::Continue();
   }
 };
 
@@ -98,7 +98,10 @@ parseProtocolListFromFile(StringRef protocolListFilePath,
           ParseFailed = true;
           break;
         }
-        protocols.insert(ScalarNode->getRawValue().str());
+        auto protocolNameStr = ScalarNode->getRawValue().str();
+        if (protocolNameStr.front() == '"' && protocolNameStr.back() == '"')
+          protocolNameStr = protocolNameStr.substr(1, protocolNameStr.size() - 2);
+        protocols.insert(protocolNameStr);
       }
     } else
       ParseFailed = true;

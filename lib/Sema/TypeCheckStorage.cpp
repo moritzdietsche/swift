@@ -617,20 +617,6 @@ buildIndexForwardingParamList(AbstractStorageDecl *storage,
   return ParameterList::create(context, elements);
 }
 
-/// Create the generic parameters needed for the given accessor, if any.
-static GenericParamList *createAccessorGenericParams(
-                                              AbstractStorageDecl *storage) {
-  // Accessors of generic subscripts get a copy of the subscript's
-  // generic parameter list, because they're not nested inside the
-  // subscript.
-  if (auto *subscript = dyn_cast<SubscriptDecl>(storage)) {
-    if (auto genericParams = subscript->getGenericParams())
-      return genericParams->clone(subscript->getDeclContext());
-  }
-
-  return nullptr;
-}
-
 static bool doesAccessorHaveBody(AccessorDecl *accessor) {
   // Protocol requirements don't have bodies.
   //
@@ -1344,11 +1330,11 @@ namespace {
   public:
     RecontextualizeClosures(DeclContext *NewDC) : NewDC(NewDC) {}
 
-    std::pair<bool, Expr *> walkToExprPre(Expr *E) override {
+    PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
       // If we find a closure, update its declcontext and do *not* walk into it.
       if (auto CE = dyn_cast<AbstractClosureExpr>(E)) {
         CE->setParent(NewDC);
-        return { false, E };
+        return Action::SkipChildren(E);
       }
       
       if (auto CLE = dyn_cast<CaptureListExpr>(E)) {
@@ -1369,12 +1355,16 @@ namespace {
           node.walk(RecontextualizeClosures(NewDC));
       }
 
-      return { true, E };
+      return Action::Continue(E);
     }
 
     /// We don't want to recurse into declarations or statements.
-    bool walkToDeclPre(Decl *) override { return false; }
-    std::pair<bool, Stmt*> walkToStmtPre(Stmt *S) override { return {false,S}; }
+    PreWalkAction walkToDeclPre(Decl *) override {
+      return Action::SkipChildren();
+    }
+    PreWalkResult<Stmt *> walkToStmtPre(Stmt *S) override {
+      return Action::SkipChildren(S);
+    }
   };
 } // end anonymous namespace
 
@@ -2040,8 +2030,6 @@ static AccessorDecl *createGetterPrototype(AbstractStorageDecl *storage,
     }
   }
 
-  GenericParamList *genericParams = createAccessorGenericParams(storage);
-
   // Add an index-forwarding clause.
   auto *getterParams = buildIndexForwardingParamList(storage, {}, ctx);
 
@@ -2050,14 +2038,10 @@ static AccessorDecl *createGetterPrototype(AbstractStorageDecl *storage,
     staticLoc = storage->getLoc();
 
   auto getter = AccessorDecl::create(
-      ctx, loc, /*AccessorKeywordLoc*/ loc,
-      AccessorKind::Get, storage,
+      ctx, loc, /*AccessorKeywordLoc*/ loc, AccessorKind::Get, storage,
       staticLoc, StaticSpellingKind::None,
       /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
-      /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
-      genericParams,
-      getterParams,
-      Type(),
+      /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(), getterParams, Type(),
       storage->getDeclContext());
   getter->setSynthesized();
 
@@ -2140,8 +2124,6 @@ static AccessorDecl *createSetterPrototype(AbstractStorageDecl *storage,
 
   bool isMutating = storage->isSetterMutating();
 
-  GenericParamList *genericParams = createAccessorGenericParams(storage);
-
   // Add a "(value : T, indices...)" argument list.
   auto *param = new (ctx) ParamDecl(SourceLoc(), SourceLoc(),
                                     Identifier(), loc,
@@ -2153,13 +2135,10 @@ static AccessorDecl *createSetterPrototype(AbstractStorageDecl *storage,
   auto *params = buildIndexForwardingParamList(storage, param, ctx);
 
   auto setter = AccessorDecl::create(
-      ctx, loc, /*AccessorKeywordLoc*/ SourceLoc(),
-      AccessorKind::Set, storage,
+      ctx, loc, /*AccessorKeywordLoc*/ SourceLoc(), AccessorKind::Set, storage,
       /*StaticLoc=*/SourceLoc(), StaticSpellingKind::None,
       /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
-      /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
-      genericParams, params,
-      Type(),
+      /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(), params, Type(),
       storage->getDeclContext());
   setter->setSynthesized();
 
@@ -2234,15 +2213,11 @@ createCoroutineAccessorPrototype(AbstractStorageDecl *storage,
   // Coroutine accessors always return ().
   const Type retTy = TupleType::getEmpty(ctx);
 
-  GenericParamList *genericParams = createAccessorGenericParams(storage);
-
   auto *accessor = AccessorDecl::create(
-      ctx, loc, /*AccessorKeywordLoc=*/SourceLoc(),
-      kind, storage,
+      ctx, loc, /*AccessorKeywordLoc=*/SourceLoc(), kind, storage,
       /*StaticLoc=*/SourceLoc(), StaticSpellingKind::None,
       /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
-      /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
-      genericParams, params, retTy, dc);
+      /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(), params, retTy, dc);
   accessor->setSynthesized();
 
   if (isMutating)
@@ -3302,7 +3277,8 @@ static void finishStorageImplInfo(AbstractStorageDecl *storage,
     } else if (var->hasAttachedPropertyWrapper()) {
       finishPropertyWrapperImplInfo(var, info);
     } else if (var->isAccessedViaTypeWrapper()) {
-      info = StorageImplInfo::getMutableComputed();
+      info = var->isLet() ? StorageImplInfo::getImmutableComputed()
+                          : StorageImplInfo::getMutableComputed();
     }
   }
 
@@ -3540,19 +3516,19 @@ bool SimpleDidSetRequest::evaluate(Evaluator &evaluator,
   public:
     OldValueFinder(const ParamDecl *param) : OldValueParam(param) {}
 
-    virtual std::pair<bool, Expr *> walkToExprPre(Expr *E) override {
+    virtual PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
       if (!E)
-        return {true, E};
+        return Action::Continue(E);
       if (auto DRE = dyn_cast<DeclRefExpr>(E)) {
         if (auto decl = DRE->getDecl()) {
           if (decl == OldValueParam) {
             foundOldValueRef = true;
-            return {false, nullptr};
+            return Action::Stop();
           }
         }
       }
 
-      return {true, E};
+      return Action::Continue(E);
     }
 
     bool didFindOldValueRef() { return foundOldValueRef; }
@@ -3584,7 +3560,8 @@ bool SimpleDidSetRequest::evaluate(Evaluator &evaluator,
   // If we find a reference to the implicit 'oldValue' parameter, then it is
   // not a "simple" didSet because we need to fetch it.
   auto walker = OldValueFinder(param);
-  decl->getTypecheckedBody()->walk(walker);
+  if (auto *body = decl->getTypecheckedBody())
+    body->walk(walker);
   auto hasOldValueRef = walker.didFindOldValueRef();
   if (!hasOldValueRef) {
     // If the body does not refer to implicit 'oldValue', it means we can

@@ -90,6 +90,9 @@ public:
   void printNominalTypeReference(const NominalTypeDecl *typeDecl,
                                  const ModuleDecl *moduleContext);
 
+  /// Print out the C++ record qualifier for the given C++ record.
+  void printNominalClangTypeReference(const clang::Decl *typeDecl);
+
   /// Print out the C++ class access qualifier for the given Swift  type
   /// declaration.
   ///
@@ -180,6 +183,12 @@ public:
   // class for the given nominal type.
   void printPrimaryCxxTypeName(const NominalTypeDecl *type,
                                const ModuleDecl *moduleContext);
+
+  // Print the #include sequence for the specified C++ interop shim header.
+  void printIncludeForShimHeader(StringRef headerName);
+
+  // Print the #define for the given macro.
+  void printDefine(StringRef macroName);
 
 protected:
   raw_ostream &os;

@@ -263,6 +263,35 @@ IndexSubset *SILFunctionType::getDifferentiabilityResultIndices() {
   return IndexSubset::get(getASTContext(), numSemanticResults, resultIndices);
 }
 
+CanSILFunctionType SILFunctionType::getDifferentiableComponentType(
+    NormalDifferentiableFunctionTypeComponent component, SILModule &module) {
+  assert(getDifferentiabilityKind() == DifferentiabilityKind::Reverse &&
+         "Must be a `@differentiable(reverse)` function");
+  auto originalFnTy = getWithoutDifferentiability();
+  if (auto derivativeKind = component.getAsDerivativeFunctionKind()) {
+    return originalFnTy->getAutoDiffDerivativeFunctionType(
+        getDifferentiabilityParameterIndices(),
+        getDifferentiabilityResultIndices(), *derivativeKind, module.Types,
+        LookUpConformanceInModule(module.getSwiftModule()));
+  }
+  return originalFnTy;
+}
+
+CanSILFunctionType SILFunctionType::getLinearComponentType(
+    LinearDifferentiableFunctionTypeComponent component, SILModule &module) {
+  assert(getDifferentiabilityKind() == DifferentiabilityKind::Linear &&
+         "Must be a `@differentiable(linear)` function");
+  auto originalFnTy = getWithoutDifferentiability();
+  switch (component) {
+  case LinearDifferentiableFunctionTypeComponent::Original:
+    return originalFnTy;
+  case LinearDifferentiableFunctionTypeComponent::Transpose:
+    return originalFnTy->getAutoDiffTransposeFunctionType(
+        getDifferentiabilityParameterIndices(), module.Types,
+        LookUpConformanceInModule(module.getSwiftModule()));
+  }
+}
+
 CanSILFunctionType
 SILFunctionType::getWithDifferentiability(DifferentiabilityKind kind,
                                           IndexSubset *parameterIndices,
@@ -463,7 +492,7 @@ static CanType getAutoDiffTangentTypeForLinearMap(
   // Otherwise, the tangent type is a new generic parameter substituted for the
   // tangent type.
   auto gpIndex = substGenericParams.size();
-  auto gpType = CanGenericTypeParamType::get(/*type sequence*/ false,
+  auto gpType = CanGenericTypeParamType::get(/*isParameterPack*/ false,
                                              0, gpIndex, context);
   substGenericParams.push_back(gpType);
   substReplacements.push_back(tanType);
@@ -1960,9 +1989,12 @@ static CanSILFunctionType getSILFunctionType(
 
     if (reqtSubs) {
       valueType = valueType.subst(*reqtSubs);
+      coroutineSubstYieldType = valueType->getReducedType(
+          genericSig);
+    } else {
+      coroutineSubstYieldType = valueType->getReducedType(
+          accessor->getGenericSignature());
     }
-
-    coroutineSubstYieldType = valueType->getReducedType(genericSig);
   }
 
   bool shouldBuildSubstFunctionType = [&]{
@@ -2446,7 +2478,7 @@ buildThunkSignature(SILFunction *fn,
 
   // Add a new generic parameter to replace the opened existential.
   auto *newGenericParam =
-      GenericTypeParamType::get(/*type sequence*/ false, depth, 0, ctx);
+      GenericTypeParamType::get(/*isParameterPack*/ false, depth, 0, ctx);
 
   assert(openedExistential->isRoot());
   auto constraint = openedExistential->getExistentialType();
@@ -2702,6 +2734,8 @@ static bool isCFTypedef(const TypeLowering &tl, clang::QualType type) {
 static ParameterConvention getIndirectCParameterConvention(clang::QualType type) {
   // Non-trivial C++ types would be Indirect_Inout (at least in Itanium).
   // A trivial const * parameter in C should be considered @in.
+  if (type->isReferenceType() && type->getPointeeType().isConstQualified())
+    return ParameterConvention::Indirect_In_Guaranteed;
   return ParameterConvention::Indirect_In;
 }
 

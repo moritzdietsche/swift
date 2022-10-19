@@ -240,7 +240,7 @@ PrintOptions PrintOptions::printSwiftInterfaceFile(ModuleDecl *ModuleToPrint,
             if (!isPublicOrUsableFromInline(req.getSecondType()))
               return false;
             break;
-          case RequirementKind::SameCount:
+          case RequirementKind::SameShape:
           case RequirementKind::Layout:
             break;
           }
@@ -1415,8 +1415,8 @@ bestRequirementPrintLocation(ProtocolDecl *proto, const Requirement &req) {
   bool inWhereClause;
 
   switch (req.getKind()) {
-  case RequirementKind::SameCount:
-    llvm_unreachable("Same-count requirements not supported here");
+  case RequirementKind::SameShape:
+    llvm_unreachable("Same-shape requirements not supported here");
   case RequirementKind::Layout:
   case RequirementKind::Conformance:
   case RequirementKind::Superclass: {
@@ -1473,9 +1473,10 @@ void PrintAST::printInheritedFromRequirementSignature(ProtocolDecl *proto,
       [&](const Requirement &req) {
         // Skip the inferred 'Self : AnyObject' constraint if this is an
         // @objc protocol.
-        if (req.getKind() == RequirementKind::Layout &&
+        if ((req.getKind() == RequirementKind::Layout) &&
             req.getFirstType()->isEqual(proto->getProtocolSelfType()) &&
-            req.getLayoutConstraint()->getKind() == LayoutConstraintKind::Class &&
+            req.getLayoutConstraint()->getKind() ==
+                LayoutConstraintKind::Class &&
             proto->isObjC()) {
           return false;
         }
@@ -1509,7 +1510,7 @@ static unsigned getDepthOfRequirement(const Requirement &req) {
 
   case RequirementKind::Superclass:
   case RequirementKind::SameType:
-  case RequirementKind::SameCount: {
+  case RequirementKind::SameShape: {
     // Return the max valid depth of firstType and secondType.
     unsigned firstDepth = getDepthOfType(req.getFirstType());
     unsigned secondDepth = getDepthOfType(req.getSecondType());
@@ -1683,9 +1684,6 @@ void PrintAST::printSingleDepthOfGenericSignature(
     llvm::interleave(
         genericParams,
         [&](GenericTypeParamType *param) {
-          if (param->isTypeSequence())
-            Printer.printAttrName("@_typeSequence ");
-
           if (!subMap.empty()) {
             printType(substParam(param));
           } else if (auto *GP = param->getDecl()) {
@@ -1698,6 +1696,8 @@ void PrintAST::printSingleDepthOfGenericSignature(
           } else {
             printType(param);
           }
+          if (param->isParameterPack())
+            Printer << "...";
         },
         [&] { Printer << ", "; });
   }
@@ -1756,8 +1756,8 @@ void PrintAST::printSingleDepthOfGenericSignature(
         // We only print the second part of a requirement in the "inherited"
         // clause.
         switch (req.getKind()) {
-        case RequirementKind::SameCount:
-          llvm_unreachable("Same-count requirement not supported here");
+        case RequirementKind::SameShape:
+          llvm_unreachable("Same-shape requirement not supported here");
 
         case RequirementKind::Layout:
           req.getLayoutConstraint()->print(Printer, Options);
@@ -1787,10 +1787,10 @@ void PrintAST::printSingleDepthOfGenericSignature(
 void PrintAST::printRequirement(const Requirement &req) {
   printTransformedType(req.getFirstType());
   switch (req.getKind()) {
-  case RequirementKind::SameCount:
-    Printer << ".count == ";
+  case RequirementKind::SameShape:
+    Printer << ".shape == ";
     printTransformedType(req.getSecondType());
-    Printer << ".count";
+    Printer << ".shape";
     return;
   case RequirementKind::Layout:
     Printer << " : ";
@@ -2737,10 +2737,6 @@ static bool usesFeatureConcurrentFunctions(Decl *decl) {
   return false;
 }
 
-static bool usesFeatureActors2(Decl *decl) {
-  return false;
-}
-
 static bool usesFeatureSendable(Decl *decl) {
   if (auto func = dyn_cast<AbstractFunctionDecl>(decl)) {
     if (func->isSendable())
@@ -2843,17 +2839,6 @@ static bool usesFeatureRethrowsProtocol(Decl *decl) {
 }
 
 static bool usesFeatureGlobalActors(Decl *decl) {
-  if (auto nominal = dyn_cast<NominalTypeDecl>(decl)) {
-    if (nominal->getAttrs().hasAttribute<GlobalActorAttr>())
-      return true;
-  }
-
-  if (auto ext = dyn_cast<ExtensionDecl>(decl)) {
-    if (auto nominal = ext->getExtendedNominal())
-      if (usesFeatureGlobalActors(nominal))
-        return true;
-  }
-
   return false;
 }
 
@@ -2917,13 +2902,11 @@ static bool usesFeatureBuiltinCreateAsyncTaskInGroup(Decl *decl) {
   return false;
 }
 
-static bool usesFeatureBuiltinMove(Decl *decl) {
-  return false;
-}
-
 static bool usesFeatureBuiltinCopy(Decl *decl) { return false; }
 
 static bool usesFeatureBuiltinTaskRunInline(Decl *) { return false; }
+
+static bool usesFeatureBuiltinUnprotectedAddressOf(Decl *) { return false; }
 
 static bool usesFeatureSpecializeAttributeWithAvailability(Decl *decl) {
   if (auto func = dyn_cast<AbstractFunctionDecl>(decl)) {
@@ -2937,6 +2920,18 @@ static bool usesFeatureSpecializeAttributeWithAvailability(Decl *decl) {
 
 static bool usesFeatureTypeWrappers(Decl *decl) {
   return decl->getAttrs().hasAttribute<TypeWrapperAttr>();
+}
+
+static bool usesFeatureParserRoundTrip(Decl *decl) {
+  return false;
+}
+
+static bool usesFeatureParserValidation(Decl *decl) {
+  return false;
+}
+
+static bool usesFeatureParserSequenceFolding(Decl *decl) {
+  return false;
 }
 
 static void suppressingFeatureSpecializeAttributeWithAvailability(
@@ -3035,6 +3030,10 @@ static bool usesFeatureExistentialAny(Decl *decl) {
   return false;
 }
 
+static bool usesFeatureImplicitSome(Decl *decl) {
+  return false;
+}
+
 static bool usesFeatureForwardTrailingClosures(Decl *decl) {
   return false;
 }
@@ -3044,6 +3043,10 @@ static bool usesFeatureBareSlashRegexLiterals(Decl *decl) {
 }
 
 static bool usesFeatureVariadicGenerics(Decl *decl) {
+  return false;
+}
+
+static bool usesFeatureLayoutPrespecialization(Decl *decl) {
   return false;
 }
 
@@ -3084,6 +3087,10 @@ static bool usesFeatureForwardModeDifferentiation(Decl *decl) {
 }
 
 static bool usesFeatureAdditiveArithmeticDerivedConformances(Decl *decl) {
+  return false;
+}
+
+static bool usesFeatureParserASTGen(Decl *decl) {
   return false;
 }
 
@@ -3494,9 +3501,9 @@ void PrintAST::visitTypeAliasDecl(TypeAliasDecl *decl) {
 
 void PrintAST::visitGenericTypeParamDecl(GenericTypeParamDecl *decl) {
   recordDeclLoc(decl, [&] {
-    if (decl->isTypeSequence())
-      Printer.printAttrName("@_typeSequence ");
     Printer.printName(decl->getName(), PrintNameContext::GenericParameter);
+    if (decl->isParameterPack())
+      Printer << "...";
   });
 
   printInherited(decl);
@@ -3667,6 +3674,11 @@ void PrintAST::visitProtocolDecl(ProtocolDecl *decl) {
                        Options.BracketOptions.shouldCloseNominal(decl));
   }
 }
+
+void PrintAST::visitBuiltinTupleDecl(BuiltinTupleDecl *decl) {
+  llvm_unreachable("Not implemented");
+}
+
 static bool isStructOrClassContext(DeclContext *dc) {
   auto *nominal = dc->getSelfNominalTypeDecl();
   if (nominal == nullptr)
@@ -3836,13 +3848,6 @@ void PrintAST::printOneParameter(const ParamDecl *param,
     TheTypeLoc = TypeLoc::withoutLoc(param->getInterfaceType());
   }
 
-  // If the parameter is variadic, we will print the "..." after it, but we have
-  // to strip off the added array type.
-  if (param->isVariadic() && TheTypeLoc.getType()) {
-    if (auto *BGT = TheTypeLoc.getType()->getAs<BoundGenericType>())
-      TheTypeLoc.setType(BGT->getGenericArgs()[0]);
-  }
-
   {
     Printer.printStructurePre(PrintStructureKind::FunctionParameterType);
     SWIFT_DEFER {
@@ -3857,9 +3862,6 @@ void PrintAST::printOneParameter(const ParamDecl *param,
 
     printTypeLocForImplicitlyUnwrappedOptional(
       TheTypeLoc, param->isImplicitlyUnwrappedOptional());
-
-    if (param->isVariadic())
-      Printer << "...";
   }
 
   if (param->isDefaultArgument() && Options.PrintDefaultArgumentValue) {
@@ -4459,8 +4461,7 @@ void PrintAST::visitErrorExpr(ErrorExpr *expr) {
   Printer << "<error>";
 }
 
-void PrintAST::visitIfExpr(IfExpr *expr) {
-}
+void PrintAST::visitTernaryExpr(TernaryExpr *expr) {}
 
 void PrintAST::visitIsExpr(IsExpr *expr) {
 }
@@ -4580,12 +4581,6 @@ void PrintAST::visitTupleExpr(TupleExpr *expr) {
     isFirst = false;
   }
   Printer << ")";
-}
-
-void PrintAST::visitPackExpr(PackExpr *expr) {
-}
-
-void PrintAST::visitReifyPackExpr(ReifyPackExpr *expr) {
 }
 
 void PrintAST::visitTypeJoinExpr(TypeJoinExpr *expr) {
@@ -4750,6 +4745,10 @@ void PrintAST::visitStringToPointerExpr(StringToPointerExpr *expr) {
 
 void PrintAST::visitVarargExpansionExpr(VarargExpansionExpr *expr) {
   visit(expr->getSubExpr());
+}
+
+void PrintAST::visitPackExpansionExpr(PackExpansionExpr *expr) {
+  visit(expr->getPatternExpr());
 }
 
 void PrintAST::visitArchetypeToSuperExpr(ArchetypeToSuperExpr *expr) {
@@ -5546,7 +5545,7 @@ public:
   }
 
   void visitPackType(PackType *T) {
-    Printer << "(";
+    Printer << "Pack{";
 
     auto Fields = T->getElementTypes();
     for (unsigned i = 0, e = Fields.size(); i != e; ++i) {
@@ -5555,7 +5554,7 @@ public:
       Type EltType = Fields[i];
       visit(EltType);
     }
-    Printer << ")";
+    Printer << "}";
   }
 
   void visitPackExpansionType(PackExpansionType *T) {
@@ -5566,13 +5565,6 @@ public:
   void visitTupleType(TupleType *T) {
     Printer.callPrintStructurePre(PrintStructureKind::TupleType);
     SWIFT_DEFER { Printer.printStructurePost(PrintStructureKind::TupleType); };
-
-    // Single-element tuples can only appear in SIL mode.
-    if (T->getNumElements() == 1 &&
-        !T->getElement(0).hasName() &&
-        !T->getElementType(0)->is<PackExpansionType>()) {
-      Printer << "@tuple ";
-    }
 
     Printer << "(";
 
@@ -5591,6 +5583,10 @@ public:
       if (TD.hasName()) {
         Printer.printName(TD.getName(), PrintNameContext::TupleElement);
         Printer << ": ";
+      } else if (e == 1 && !EltType->is<PackExpansionType>()) {
+        // Unlabeled one-element tuples always print the empty label to
+        // distinguish them from the older syntax for ParenType.
+        Printer << "_: ";
       }
       visit(EltType);
     }
@@ -6338,6 +6334,10 @@ public:
     }
   }
 
+  void visitBuiltinTupleType(BuiltinTupleType *T) {
+    printQualifiedType(T);
+  }
+
   void visitLValueType(LValueType *T) {
     Printer << "@lvalue ";
     visit(T->getObjectType());
@@ -6483,7 +6483,7 @@ public:
     }
   }
 
-  void visitSequenceArchetypeType(SequenceArchetypeType *T) {
+  void visitPackArchetypeType(PackArchetypeType *T) {
     printArchetypeCommon(T);
   }
 
@@ -6616,7 +6616,7 @@ void LayoutConstraint::print(raw_ostream &OS,
 
 void LayoutConstraintInfo::print(ASTPrinter &Printer,
                                  const PrintOptions &PO) const {
-  Printer << getName();
+  Printer << getName(PO.PrintClassLayoutName);
   switch (getKind()) {
   case LayoutConstraintKind::UnknownLayout:
   case LayoutConstraintKind::RefCountedObject:

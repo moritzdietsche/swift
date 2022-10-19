@@ -1,5 +1,5 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend %s -typecheck -module-name Core -clang-header-expose-public-decls -emit-clang-header-path %t/core.h
+// RUN: %target-swift-frontend %s -typecheck -module-name Core -clang-header-expose-decls=all-public -emit-clang-header-path %t/core.h
 // RUN: %FileCheck %s < %t/core.h
 
 // RUN: %check-interop-cxx-header-in-clang(%t/core.h)
@@ -99,7 +99,7 @@
 // CHECK-NEXT: #endif
 // CHECK-EMPTY:
 // CHECK-NEXT: /// Naive exception class that should be thrown
-// CHECK-NEXT: class NaiveException {
+// CHECK-NEXT: class NaiveException : public swift::Error {
 // CHECK-NEXT: public:
 // CHECK-NEXT: inline NaiveException(const char * _Nonnull msg) noexcept : msg_(msg) { }
 // CHECK-NEXT: inline NaiveException(NaiveException&& other) noexcept : msg_(other.msg_) { other.msg_ = nullptr; }

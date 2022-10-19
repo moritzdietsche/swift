@@ -15,12 +15,12 @@
 // - `AccessPath`: a pair of an `AccessBase` and `SmallProjectionPath` with the
 //   the path describing the specific address (in terms of projections) of the
 //   access.
-// - `AccessStoragePath`: identifies the reference (or a value which contains a
-//   reference) an address originates from.
+// - Access storage path (which is of type `ProjectedValue`): identifies the
+//   reference (or a value which contains a reference) an address originates from.
 //
 // The snippet below shows the relationship between the access concepts.
 // ```
-// %ref = struct_extract %value, #f1                                         AccessStoragePath
+// %ref = struct_extract %value, #f1                                        access storage path
 // %base = ref_element_addr %ref, #f2         AccessBase       AccessPath            |
 // %scope = begin_access %base                AccessScope          |                 |
 // %t = tuple_element_addr %scope, 0                               |                 |
@@ -253,22 +253,6 @@ struct AccessPath : CustomStringConvertible {
   }
 }
 
-/// An `AccessStoragePath` is the reference (or a value which contains a reference)
-/// an address originates from.
-/// In the following example the `storage` is `contains_ref` with `path` `"s0.c0.s0"`
-/// ```
-///   %ref = struct_extract %contains_ref : $S, #S.l
-///   %base = ref_element_addr %ref : $List, #List.x
-///   %addr = struct_element_addr %base : $X, #X.e
-///   store %v to [trivial] %addr : $*Int
-/// ```
-struct AccessStoragePath {
-  let storage: Value
-
-  /// Only valid paths are: `"<sequence of value projections>.<one reference projection>.<sequence of address projections>"`
-  let path: SmallProjectionPath
-}
-
 private func canBeOperandOfIndexAddr(_ value: Value) -> Bool {
   switch value {
   case is IndexAddrInst, is RefTailAddrInst, is PointerToAddressInst:
@@ -278,67 +262,53 @@ private func canBeOperandOfIndexAddr(_ value: Value) -> Bool {
   }
 }
 
-/// Given a `%addr = pointer_to_address %ptr_operand` instruction tries to identify
-/// where the pointer operand `ptr_operand` originates from.
+/// Tries to identify from which address the pointer operand originates from.
 /// This is useful to identify patterns like
 /// ```
 /// %orig_addr = global_addr @...
 /// %ptr = address_to_pointer %orig_addr
 /// %addr = pointer_to_address %ptr
 /// ```
-struct PointerIdentification {
-  private var walker = PointerIdentificationUseDefWalker()
+extension PointerToAddressInst {
+  var originatingAddress: Value? {
 
-  mutating func getOriginatingAddress(of pointerToAddr: PointerToAddressInst) -> Value? {
-    defer { walker.clear() }
+    struct Walker : ValueUseDefWalker {
+      let addrType: Type
+      var result: Value?
+      var walkUpCache = WalkerCache<Path>()
 
-    walker.start(pointerToAddr.type)
-    if walker.walkUp(value: pointerToAddr.operand, path: SmallProjectionPath()) == .abortWalk {
+      mutating func rootDef(value: Value, path: SmallProjectionPath) -> WalkResult {
+        if let atp = value as? AddressToPointerInst {
+          if let res = result, atp.operand != res {
+            return .abortWalk
+          }
+
+          if addrType != atp.operand.type { return .abortWalk }
+          if !path.isEmpty { return .abortWalk }
+
+          self.result = atp.operand
+          return .continueWalk
+        }
+        return .abortWalk
+      }
+
+      mutating func walkUp(value: Value, path: SmallProjectionPath) -> WalkResult {
+        switch value {
+        case is BlockArgument, is MarkDependenceInst, is CopyValueInst,
+             is StructExtractInst, is TupleExtractInst, is StructInst, is TupleInst,
+             is FunctionArgument, is AddressToPointerInst:
+          return walkUpDefault(value: value, path: path)
+        default:
+          return .abortWalk
+        }
+      }
+    }
+
+    var walker = Walker(addrType: type)
+    if walker.walkUp(value: operand, path: SmallProjectionPath()) == .abortWalk {
       return nil
     }
     return walker.result
-  }
-
-  private struct PointerIdentificationUseDefWalker : ValueUseDefWalker {
-    private var addrType: Type!
-    private(set) var result: Value?
-    var walkUpCache = WalkerCache<Path>()
-
-    mutating func start(_ addrType: Type) {
-      self.addrType = addrType
-      assert(result == nil)
-    }
-
-    mutating func clear() {
-      result = nil
-      walkUpCache.clear()
-    }
-
-    mutating func rootDef(value: Value, path: SmallProjectionPath) -> WalkResult {
-      if let atp = value as? AddressToPointerInst {
-        if let res = result, atp.operand != res {
-          return .abortWalk
-        }
-
-        if addrType != atp.operand.type { return .abortWalk }
-        if !path.isEmpty { return .abortWalk }
-
-        self.result = atp.operand
-        return .continueWalk
-      }
-      return .abortWalk
-    }
-
-    mutating func walkUp(value: Value, path: SmallProjectionPath) -> WalkResult {
-      switch value {
-      case is BlockArgument, is MarkDependenceInst, is CopyValueInst,
-           is StructExtractInst, is TupleExtractInst, is StructInst, is TupleInst,
-           is FunctionArgument, is AddressToPointerInst:
-        return walkUpDefault(value: value, path: path)
-      default:
-        return .abortWalk
-      }
-    }
   }
 }
 
@@ -367,112 +337,75 @@ enum EnclosingScope {
   case base(AccessBase)
 }
 
-/// A walker utility that, given an address value, computes the `AccessPath`
-/// of the access (the base address and the address projections to the accessed fields) and
-/// the innermost enclosing scope (`begin_access`).
-struct AccessPathWalker {
-  mutating func getAccessPath(of address: Value) -> AccessPath {
-    assert(address.type.isAddress, "Expected address")
-    walker.start()
-    if walker.walkUp(address: address, path: Walker.Path()) == .abortWalk {
-      assert(walker.result.base == .unidentified,
+private struct AccessPathWalker : AddressUseDefWalker {
+  var result = AccessPath.unidentified()
+  var foundBeginAccess: BeginAccessInst?
+
+  mutating func walk(startAt address: Value, initialPath: SmallProjectionPath = SmallProjectionPath()) {
+    if walkUp(address: address, path: Path(projectionPath: initialPath)) == .abortWalk {
+      assert(result.base == .unidentified,
              "shouldn't have set an access base in an aborted walk")
     }
-    return walker.result
   }
 
-  mutating func getAccessPathWithScope(of address: Value) -> (AccessPath, EnclosingScope) {
-    let ap = getAccessPath(of: address)
-    return (ap, walker.scope)
+  struct Path : SmallProjectionWalkingPath {
+    let projectionPath: SmallProjectionPath
+
+    // Tracks whether an `index_addr` instruction was crossed.
+    // It should be (FIXME: check if it's enforced) that operands
+    // of `index_addr` must be `tail_addr` or other `index_addr` results.
+    let indexAddr: Bool
+
+    init(projectionPath: SmallProjectionPath = SmallProjectionPath(), indexAddr: Bool = false) {
+      self.projectionPath = projectionPath
+      self.indexAddr = indexAddr
+    }
+
+    func with(projectionPath: SmallProjectionPath) -> Self {
+      return Self(projectionPath: projectionPath, indexAddr: indexAddr)
+    }
+
+    func with(indexAddr: Bool) -> Self {
+      return Self(projectionPath: projectionPath, indexAddr: indexAddr)
+    }
+
+    func merge(with other: Self) -> Self {
+      return Self(
+        projectionPath: projectionPath.merge(with: other.projectionPath),
+        indexAddr: indexAddr || other.indexAddr
+      )
+    }
   }
 
-  mutating func getAccessBase(of address: Value) -> AccessBase {
-    getAccessPath(of: address).base
-  }
-
-  mutating func getAccessScope(of address: Value) -> EnclosingScope {
-    getAccessPathWithScope(of: address).1
-  }
-
-  private var walker = Walker()
-
-  private struct Walker : AddressUseDefWalker {
-    private(set) var result = AccessPath.unidentified()
-    private var foundBeginAccess: BeginAccessInst? = nil
-    private var pointerId = PointerIdentification()
-
-    var scope: EnclosingScope {
-      if let ba = foundBeginAccess {
-        return .scope(ba)
+  mutating func rootDef(address: Value, path: Path) -> WalkResult {
+    assert(result.base == .unidentified, "rootDef should only called once")
+    // Try identifying the address a pointer originates from
+    if let p2ai = address as? PointerToAddressInst {
+      if let originatingAddr = p2ai.originatingAddress {
+        return walkUp(address: originatingAddr, path: path)
       } else {
-        return .base(result.base)
+        self.result = AccessPath(base: .pointer(p2ai), projectionPath: path.projectionPath)
+        return .continueWalk
       }
     }
 
-    mutating func start() {
-      result = .unidentified()
-      foundBeginAccess = nil
+    let base = AccessBase(baseAddress: address)
+    self.result = AccessPath(base: base, projectionPath: path.projectionPath)
+    return .continueWalk
+  }
+
+  mutating func walkUp(address: Value, path: Path) -> WalkResult {
+    if address is IndexAddrInst {
+      // Track that we crossed an `index_addr` during the walk-up
+      return walkUpDefault(address: address, path: path.with(indexAddr: true))
+    } else if path.indexAddr && !canBeOperandOfIndexAddr(address) {
+      // An `index_addr` instruction cannot be derived from an address
+      // projection. Bail out
+      return .abortWalk
+    } else if let ba = address as? BeginAccessInst, foundBeginAccess == nil {
+      foundBeginAccess = ba
     }
-
-    struct Path : SmallProjectionWalkingPath {
-      let projectionPath: SmallProjectionPath
-
-      // Tracks whether an `index_addr` instruction was crossed.
-      // It should be (FIXME: check if it's enforced) that operands
-      // of `index_addr` must be `tail_addr` or other `index_addr` results.
-      let indexAddr: Bool
-
-      init(projectionPath: SmallProjectionPath = SmallProjectionPath(), indexAddr: Bool = false) {
-        self.projectionPath = projectionPath
-        self.indexAddr = indexAddr
-      }
-
-      func with(projectionPath: SmallProjectionPath) -> Self {
-        return Self(projectionPath: projectionPath, indexAddr: indexAddr)
-      }
-
-      func with(indexAddr: Bool) -> Self {
-        return Self(projectionPath: projectionPath, indexAddr: indexAddr)
-      }
-
-      func merge(with other: Self) -> Self {
-        return Self(
-          projectionPath: projectionPath.merge(with: other.projectionPath),
-          indexAddr: indexAddr || other.indexAddr
-        )
-      }
-    }
-
-    mutating func rootDef(address: Value, path: Path) -> WalkResult {
-      assert(result.base == .unidentified, "rootDef should only called once")
-      // Try identifying the address a pointer originates from
-      if let p2ai = address as? PointerToAddressInst {
-        if let originatingAddr = pointerId.getOriginatingAddress(of: p2ai) {
-          return walkUp(address: originatingAddr, path: path)
-        } else {
-          self.result = AccessPath(base: .pointer(p2ai), projectionPath: path.projectionPath)
-          return .continueWalk
-        }
-      }
-
-      let base = AccessBase(baseAddress: address)
-      self.result = AccessPath(base: base, projectionPath: path.projectionPath)
-      return .continueWalk
-    }
-
-    mutating func walkUp(address: Value, path: Path) -> WalkResult {
-      if address is IndexAddrInst {
-        // Track that we crossed an `index_addr` during the walk-up
-        return walkUpDefault(address: address, path: path.with(indexAddr: true))
-      } else if path.indexAddr && !canBeOperandOfIndexAddr(address) {
-        // An `index_addr` instruction cannot be derived from an address
-        // projection. Bail out
-        return .abortWalk
-      } else if let ba = address as? BeginAccessInst, foundBeginAccess == nil {
-        foundBeginAccess = ba
-      }
-      return walkUpDefault(address: address, path: path.with(indexAddr: false))
-    }
+    return walkUpDefault(address: address, path: path.with(indexAddr: false))
   }
 }
 
@@ -485,25 +418,51 @@ extension Value {
   // go through phi-arguments, the AccessPathWalker will allocate memnory in its cache.
 
   /// Computes the access base of this address value.
-  var accessBase: AccessBase {
-    var apWalker = AccessPathWalker()
-    return apWalker.getAccessBase(of: self)
+  var accessBase: AccessBase { accessPath.base }
+
+  /// Computes the access path of this address value.
+  var accessPath: AccessPath {
+    var walker = AccessPathWalker()
+    walker.walk(startAt: self)
+    return walker.result
   }
-  
+
+  func getAccessPath(fromInitialPath: SmallProjectionPath) -> AccessPath {
+    var walker = AccessPathWalker()
+    walker.walk(startAt: self, initialPath: fromInitialPath)
+    return walker.result
+  }
+
+  /// Computes the access path of this address value and also returns the scope.
+  var accessPathWithScope: (AccessPath, scope: BeginAccessInst?) {
+    var walker = AccessPathWalker()
+    walker.walk(startAt: self)
+    return (walker.result, walker.foundBeginAccess)
+  }
+
   /// Computes the enclosing access scope of this address value.
-  var accessScope: EnclosingScope {
-    var apWalker = AccessPathWalker()
-    return apWalker.getAccessScope(of: self)
+  var enclosingAccessScope: EnclosingScope {
+    var walker = AccessPathWalker()
+    walker.walk(startAt: self)
+    if let ba = walker.foundBeginAccess {
+      return .scope(ba)
+    }
+    return .base(walker.result.base)
   }
 }
 
-/// A ValueUseDef walker that identifies which values a reference of an access path might
-/// originate from.
-protocol AccessStoragePathWalker : ValueUseDefWalker where Path == SmallProjectionPath {
-  mutating func visit(access: AccessStoragePath)
-}
-
-extension AccessStoragePathWalker {
+/// A ValueUseDef walker that that visits access storage paths of an address.
+///
+/// An access storage path is the reference (or a value which contains a reference)
+/// an address originates from.
+/// In the following example the `storage` is `contains_ref` with `path` `"s0.c0.s0"`
+/// ```
+///   %ref = struct_extract %contains_ref : $S, #S.l
+///   %base = ref_element_addr %ref : $List, #List.x
+///   %addr = struct_element_addr %base : $X, #X.e
+///   store %v to [trivial] %addr : $*Int
+/// ```
+extension ValueUseDefWalker where Path == SmallProjectionPath {
   /// The main entry point.
   /// Given an `accessPath` where the access base is a reference (class, tail, box), call
   /// the `visit` function for all storage roots with a the corresponding path.
@@ -522,10 +481,5 @@ extension AccessStoragePathWalker {
       case .stack, .global, .argument, .yield, .pointer, .unidentified:
         return false
     }
-  }
-
-  mutating func rootDef(value: Value, path: SmallProjectionPath) -> WalkResult {
-    visit(access: AccessStoragePath(storage: value, path: path))
-    return .continueWalk
   }
 }

@@ -22,6 +22,7 @@ add_swift_host_library(swiftParse STATIC
   ParseRequests.cpp
   ParseStmt.cpp
   ParseType.cpp
+  ParseVersion.cpp
   PersistentParserState.cpp
   SyntaxParsingCache.cpp
   SyntaxParsingContext.cpp)
@@ -43,23 +44,38 @@ if (SWIFT_SWIFT_PARSER)
   #
   #   target_link_libraries(swiftParse
   #     PRIVATE
-  #     SwiftSyntax::SwiftParser
+  #     SwiftSyntax::SwiftCompilerSupport
+  #     ...
   #   )
   target_link_libraries(swiftParse
     PRIVATE
+    $<TARGET_OBJECTS:SwiftSyntax::SwiftBasicFormat>
     $<TARGET_OBJECTS:SwiftSyntax::SwiftParser>
     $<TARGET_OBJECTS:SwiftSyntax::SwiftDiagnostics>
     $<TARGET_OBJECTS:SwiftSyntax::SwiftSyntax>
+    $<TARGET_OBJECTS:SwiftSyntax::SwiftOperators>
+    $<TARGET_OBJECTS:SwiftSyntax::SwiftCompilerSupport>
+    $<TARGET_OBJECTS:swiftASTGen>
+  )
+
+  add_dependencies(swiftParse
+    SwiftSyntax::SwiftBasicFormat
+    SwiftSyntax::SwiftParser
+    SwiftSyntax::SwiftDiagnostics
+    SwiftSyntax::SwiftSyntax
+    SwiftSyntax::SwiftOperators
+    SwiftSyntax::SwiftCompilerSupport
+    swiftASTGen
   )
 
   target_include_directories(swiftParse
     PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../swift-syntax/Sources/SwiftParser
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../swift-syntax/Sources/SwiftCompilerSupport
   )
 
   target_compile_definitions(swiftParse
     PRIVATE
-    SWIFT_SWIFT_PARSER_ROUNDTRIP
+    SWIFT_SWIFT_PARSER
   )
 endif()
 
