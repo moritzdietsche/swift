@@ -1945,14 +1945,10 @@ namespace {
     }
 
     bool recordHasReferenceSemantics(const clang::RecordDecl *decl) {
-      if (auto cxxRecord = dyn_cast<clang::CXXRecordDecl>(decl)) {
-        auto semanticsKind = evaluateOrDefault(
-            Impl.SwiftContext.evaluator,
-            CxxRecordSemantics({cxxRecord, Impl.SwiftContext}), {});
-        return semanticsKind == CxxRecordSemanticsKind::Reference;
-      }
-
-      return false;
+      auto semanticsKind = evaluateOrDefault(
+          Impl.SwiftContext.evaluator,
+          CxxRecordSemantics({decl, Impl.SwiftContext}), {});
+      return semanticsKind == CxxRecordSemanticsKind::Reference;
     }
 
     Decl *VisitRecordDecl(const clang::RecordDecl *decl) {
@@ -3497,6 +3493,13 @@ namespace {
 
       auto structDecl = Impl.createDeclWithClangNode<StructDecl>(
         decl, AccessLevel::Public, loc, name, loc, None, genericParamList, dc);
+
+      auto attr = AvailableAttr::createPlatformAgnostic(
+          Impl.SwiftContext, "Un-specialized class templates are not currently "
+                             "supported. Please use a specialization of this "
+                             "type.");
+      structDecl->getAttrs().add(attr);
+
       return structDecl;
     }
 
@@ -7224,6 +7227,7 @@ SourceFile &ClangImporter::Implementation::getClangSwiftAttrSourceFile(
   auto sourceFile = new (SwiftContext) SourceFile(
       module, SourceFileKind::Library, None);
   ClangSwiftAttrSourceFiles.insert({&module, sourceFile});
+  module.addAuxiliaryFile(*sourceFile);
   return *sourceFile;
 }
 

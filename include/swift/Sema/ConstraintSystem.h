@@ -4906,6 +4906,14 @@ public:
                           ConstraintLocator *locator,
                           OpenedTypeMap *replacements = nullptr);
 
+#if SWIFT_SWIFT_PARSER
+  /// Retrieve the opened type of a macro with the given name.
+  ///
+  /// \returns The opened type of the macro with this name, or the null \c Type
+  /// if no such macro exists.
+  Type getTypeOfMacroReference(StringRef macro, Expr *anchor);
+#endif
+
   /// Retrieve a list of generic parameter types solver has "opened" (replaced
   /// with a type variable) at the given location.
   ArrayRef<OpenedType> getOpenedTypes(ConstraintLocator *locator) const {
@@ -5423,6 +5431,15 @@ private:
                                               FunctionRefKind functionRefKind,
                                               ConstraintLocator *locator);
 
+  /// Attempt to simplify the given superclass constraint.
+  ///
+  /// \param type The type being tested.
+  /// \param classType The class type which the type should be a subclass of.
+  /// \param locator Locator describing where this constraint occurred.
+  SolutionKind simplifySubclassOfConstraint(Type type, Type classType,
+                                            ConstraintLocatorBuilder locator,
+                                            TypeMatchOptions flags);
+
   /// Attempt to simplify the given conformance constraint.
   ///
   /// \param type The type being tested.
@@ -5491,6 +5508,18 @@ private:
   simplifyBindTupleOfFunctionParamsConstraint(Type first, Type second,
                                               TypeMatchOptions flags,
                                               ConstraintLocatorBuilder locator);
+
+  /// Attempt to simplify a PackElementOf constraint.
+  ///
+  /// Solving this constraint is delayed until the element type is fully
+  /// resolved with no type variables. The element type is then mapped out
+  /// of the opened element context and into the context of the surrounding
+  /// function, effecively substituting opened element archetypes with their
+  /// corresponding pack archetypes, and bound to the second type.
+  SolutionKind
+  simplifyPackElementOfConstraint(Type first, Type second,
+                                  TypeMatchOptions flags,
+                                  ConstraintLocatorBuilder locator);
 
   /// Attempt to simplify the ApplicableFunction constraint.
   SolutionKind simplifyApplicableFnConstraint(
@@ -5591,6 +5620,12 @@ private:
   SolutionKind simplifySyntacticElementConstraint(
       ASTNode element, ContextualTypeInfo context, bool isDiscarded,
       TypeMatchOptions flags, ConstraintLocatorBuilder locator);
+
+  /// Simplify a shape constraint by binding the reduced shape of the
+  /// left hand side to the right hand side.
+  SolutionKind simplifyShapeOfConstraint(
+      Type type1, Type type2, TypeMatchOptions flags,
+      ConstraintLocatorBuilder locator);
 
 public: // FIXME: Public for use by static functions.
   /// Simplify a conversion constraint with a fix applied to it.

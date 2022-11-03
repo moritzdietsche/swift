@@ -1,11 +1,34 @@
 if (SWIFT_SWIFT_PARSER)
+  # Ensure that we do not link the _StringProcessing module. But we can
+  # only pass this flag for new-enough compilers that support it.
+  file(WRITE "${CMAKE_BINARY_DIR}/tmp/empty-check-string-processing.swift" "")
+  execute_process(
+    COMMAND
+      "${CMAKE_Swift_COMPILER}"
+      -Xfrontend -disable-implicit-string-processing-module-import
+      -c - -o /dev/null
+    INPUT_FILE
+      "${CMAKE_BINARY_DIR}/tmp/empty-check-string-processing.swift"
+    OUTPUT_QUIET ERROR_QUIET
+    RESULT_VARIABLE
+      SWIFT_SUPPORTS_DISABLE_IMPLICIT_STRING_PROCESSING_MODULE_IMPORT)
+  if (NOT SWIFT_SUPPORTS_DISABLE_IMPLICIT_STRING_PROCESSING_MODULE_IMPORT)
+    add_compile_options(
+      $<$<COMPILE_LANGUAGE:Swift>:-Xfrontend>
+      $<$<COMPILE_LANGUAGE:Swift>:-disable-implicit-string-processing-module-import>)
+  endif()
+
   add_library(swiftASTGen STATIC
     Sources/ASTGen/ASTGen.swift
     Sources/ASTGen/Decls.swift
     Sources/ASTGen/Exprs.swift
+    Sources/ASTGen/Generics.swift
     Sources/ASTGen/Literals.swift
+    Sources/ASTGen/Macros.swift
     Sources/ASTGen/Misc.swift
+    Sources/ASTGen/SourceFile.swift
     Sources/ASTGen/Stmts.swift
+    Sources/ASTGen/Types.swift
   )
 
   # Set the appropriate target triple.
@@ -36,9 +59,12 @@ if (SWIFT_SWIFT_PARSER)
     PRIVATE
     $<TARGET_OBJECTS:SwiftSyntax::SwiftBasicFormat>
     $<TARGET_OBJECTS:SwiftSyntax::SwiftParser>
+    $<TARGET_OBJECTS:SwiftSyntax::SwiftParserDiagnostics>
     $<TARGET_OBJECTS:SwiftSyntax::SwiftDiagnostics>
     $<TARGET_OBJECTS:SwiftSyntax::SwiftSyntax>
     $<TARGET_OBJECTS:SwiftSyntax::SwiftOperators>
+    $<TARGET_OBJECTS:SwiftSyntax::SwiftSyntaxBuilder>
+    $<TARGET_OBJECTS:SwiftSyntax::_SwiftSyntaxMacros>
     $<TARGET_OBJECTS:SwiftSyntax::SwiftCompilerSupport>
 
     swiftAST
@@ -50,9 +76,12 @@ if (SWIFT_SWIFT_PARSER)
   add_dependencies(swiftASTGen
     SwiftSyntax::SwiftBasicFormat
     SwiftSyntax::SwiftParser
+    SwiftSyntax::SwiftParserDiagnostics
     SwiftSyntax::SwiftDiagnostics
     SwiftSyntax::SwiftSyntax
     SwiftSyntax::SwiftOperators
+    SwiftSyntax::SwiftSyntaxBuilder
+    SwiftSyntax::_SwiftSyntaxMacros
     SwiftSyntax::SwiftCompilerSupport
     swiftAST
   )

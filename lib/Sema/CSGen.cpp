@@ -15,8 +15,9 @@
 //===----------------------------------------------------------------------===//
 #include "TypeCheckConcurrency.h"
 #include "TypeCheckDecl.h"
-#include "TypeCheckType.h"
+#include "TypeCheckMacros.h"
 #include "TypeCheckRegex.h"
+#include "TypeCheckType.h"
 #include "TypeChecker.h"
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ASTWalker.h"
@@ -1188,6 +1189,30 @@ namespace {
     }
 
     Type visitMagicIdentifierLiteralExpr(MagicIdentifierLiteralExpr *expr) {
+#ifdef SWIFT_SWIFT_PARSER
+      auto &ctx = CS.getASTContext();
+      if (ctx.LangOpts.hasFeature(Feature::BuiltinMacros)) {
+        auto kind = MagicIdentifierLiteralExpr::getKindString(expr->getKind())
+                        .drop_front();
+
+        auto protocol =
+            TypeChecker::getLiteralProtocol(CS.getASTContext(), expr);
+        if (!protocol)
+          return Type();
+
+        auto openedType = CS.getTypeOfMacroReference(kind, expr);
+        if (!openedType)
+          return Type();
+
+        CS.addConstraint(ConstraintKind::LiteralConformsTo, openedType,
+                         protocol->getDeclaredInterfaceType(),
+                         CS.getConstraintLocator(expr));
+
+        return openedType;
+      }
+      // Fall through to use old implementation.
+#endif
+
       switch (expr->getKind()) {
       // Magic pointer identifiers are of type UnsafeMutableRawPointer.
 #define MAGIC_POINTER_IDENTIFIER(NAME, STRING, SYNTAX_KIND) \
@@ -1770,6 +1795,13 @@ namespace {
     }
 
     virtual Type visitParenExpr(ParenExpr *expr) {
+      // If the ParenExpr contains a pack expansion, generate a tuple
+      // type containing the pack expansion type.
+      if (CS.getType(expr->getSubExpr())->getAs<PackExpansionType>()) {
+        return TupleType::get({CS.getType(expr->getSubExpr())},
+                              CS.getASTContext());
+      }
+
       if (auto favoredTy = CS.getFavoredType(expr->getSubExpr())) {
         CS.setFavoredType(expr, favoredTy);
       }
@@ -2874,7 +2906,32 @@ namespace {
     }
 
     Type visitPackExpansionExpr(PackExpansionExpr *expr) {
-      llvm_unreachable("not implemented for PackExpansionExpr");
+      for (auto *binding : expr->getBindings()) {
+        auto type = visit(binding);
+        CS.setType(binding, type);
+      }
+
+      auto elementResultType = CS.getType(expr->getPatternExpr());
+      auto patternTy = CS.createTypeVariable(CS.getConstraintLocator(expr),
+                                             TVO_CanBindToPack |
+                                             TVO_CanBindToHole);
+      CS.addConstraint(ConstraintKind::PackElementOf, elementResultType,
+                       patternTy, CS.getConstraintLocator(expr));
+
+      // FIXME: Use a ShapeOf constraint here.
+      Type shapeType;
+      auto *binding = expr->getBindings().front();
+      auto type = CS.simplifyType(CS.getType(binding));
+      type.visit([&](Type type) {
+        if (shapeType)
+          return;
+
+        if (auto archetype = type->getAs<PackArchetypeType>()) {
+          shapeType = archetype->getShape();
+        }
+      });
+
+      return PackExpansionType::get(patternTy, shapeType);
     }
 
     Type visitDynamicTypeExpr(DynamicTypeExpr *expr) {
@@ -2887,7 +2944,6 @@ namespace {
     }
 
     Type visitOpaqueValueExpr(OpaqueValueExpr *expr) {
-      assert(expr->isPlaceholder() && "Already type checked");
       return expr->getType();
     }
 
@@ -3570,6 +3626,46 @@ namespace {
 
       CS.addConstraint(ConstraintKind::Equal, resultTy, joinedTy, locator);
       return resultTy;
+    }
+
+    Type visitMacroExpansionExpr(MacroExpansionExpr *expr) {
+#if SWIFT_SWIFT_PARSER
+      auto &ctx = CS.getASTContext();
+      if (ctx.LangOpts.hasFeature(Feature::Macros)) {
+        auto macroIdent = expr->getMacroName().getBaseIdentifier();
+        auto refType = CS.getTypeOfMacroReference(macroIdent.str(), expr);
+        if (!refType) {
+          ctx.Diags.diagnose(expr->getMacroNameLoc(), diag::macro_undefined,
+                             macroIdent)
+              .highlight(expr->getMacroNameLoc().getSourceRange());
+          return Type();
+        }
+        if (expr->getArgs()) {
+          CS.associateArgumentList(CS.getConstraintLocator(expr), expr->getArgs());
+          // FIXME: Do we have object-like vs. function-like macros?
+          if (auto fnType = dyn_cast<FunctionType>(refType.getPointer())) {
+            SmallVector<AnyFunctionType::Param, 8> params;
+            getMatchingParams(expr->getArgs(), params);
+
+            Type resultType = CS.createTypeVariable(
+                CS.getConstraintLocator(expr, ConstraintLocator::FunctionResult),
+                TVO_CanBindToNoEscape);
+
+            CS.addConstraint(
+                ConstraintKind::ApplicableFunction,
+                FunctionType::get(params, resultType),
+                fnType,
+                CS.getConstraintLocator(
+                  expr, ConstraintLocator::ApplyFunction));
+
+            return resultType;
+          }
+        }
+
+        return refType;
+      }
+#endif
+      return Type();
     }
 
     static bool isTriggerFallbackDiagnosticBuiltin(UnresolvedDotExpr *UDE,

@@ -368,9 +368,6 @@ IRGenModule::getLoweredTypeRef(SILType loweredType,
   auto substTy =
     substOpaqueTypesWithUnderlyingTypes(loweredType, genericSig);
   auto type = substTy.getASTType();
-  if (substTy.hasArchetype())
-    type = type->mapTypeOutOfContext()->getCanonicalType();
-
   return getTypeRefImpl(*this, type, genericSig, role);
 }
 
@@ -1324,7 +1321,7 @@ public:
 
     // Now add typerefs of all of the captures.
     for (auto CaptureType : CaptureTypes) {
-      addLoweredTypeRef(CaptureType, sig);
+      addLoweredTypeRef(CaptureType.mapTypeOutOfContext(), sig);
     }
 
     // Add the pairs that make up the generic param -> metadata source map
@@ -1556,6 +1553,11 @@ void IRGenModule::emitFieldDescriptor(const NominalTypeDecl *D) {
   if (auto *SD = dyn_cast<StructDecl>(D)) {
     if (SD->hasClangNode())
       needsOpaqueDescriptor = true;
+  }
+
+  if (auto *CD = dyn_cast<ClassDecl>(D)) {
+    if (CD->getObjCImplementationDecl())
+      needsFieldDescriptor = false;
   }
 
   // If the type has custom @_alignment, emit a fixed record with the

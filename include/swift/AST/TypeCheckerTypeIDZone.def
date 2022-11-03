@@ -260,9 +260,6 @@ SWIFT_REQUEST(TypeChecker, PropertyWrapperMutabilityRequest,
 SWIFT_REQUEST(TypeChecker, PropertyWrapperTypeInfoRequest,
               PropertyWrapperTypeInfo(NominalTypeDecl *), Cached,
               NoLocationInfo)
-SWIFT_REQUEST(TypeChecker, ConstantValueInfoRequest,
-              ConstValueTypeInfo(NominalTypeDecl *), Cached,
-              NoLocationInfo)
 SWIFT_REQUEST(TypeChecker, ProtocolRequiresClassRequest, bool(ProtocolDecl *),
               SeparatelyCached, NoLocationInfo)
 SWIFT_REQUEST(TypeChecker, PrimaryAssociatedTypesRequest,
@@ -431,8 +428,8 @@ SWIFT_REQUEST(TypeChecker, IsPropertyAccessedViaTypeWrapper,
 SWIFT_REQUEST(TypeChecker, SynthesizeTypeWrappedTypeMemberwiseInitializer,
               ConstructorDecl *(NominalTypeDecl *),
               Cached, NoLocationInfo)
-SWIFT_REQUEST(TypeChecker, SynthesizeTypeWrappedTypeMemberwiseInitializerBody,
-              BraceStmt *(ConstructorDecl *),
+SWIFT_REQUEST(TypeChecker, SynthesizeTypeWrappedTypeStorageWrapperInitializer,
+              ConstructorDecl *(NominalTypeDecl *),
               Cached, NoLocationInfo)
 SWIFT_REQUEST(TypeChecker, SynthesizeLocalVariableForTypeWrapperStorage,
               VarDecl *(ConstructorDecl *),
@@ -442,4 +439,7 @@ SWIFT_REQUEST(TypeChecker, GetTypeWrapperInitializer,
               Cached, NoLocationInfo)
 SWIFT_REQUEST(TypeChecker, SynthesizeHasSymbolQueryRequest,
               FuncDecl *(ValueDecl *),
+              Cached, NoLocationInfo)
+SWIFT_REQUEST(TypeChecker, MacroContextRequest,
+              StructDecl *(std::string, ModuleDecl *),
               Cached, NoLocationInfo)

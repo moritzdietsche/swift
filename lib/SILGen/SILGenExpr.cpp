@@ -550,6 +550,7 @@ namespace {
     RValue visitLinearToDifferentiableFunctionExpr(
         LinearToDifferentiableFunctionExpr *E, SGFContext C);
     RValue visitMoveExpr(MoveExpr *E, SGFContext C);
+    RValue visitMacroExpansionExpr(MacroExpansionExpr *E, SGFContext C);
   };
 } // end anonymous namespace
 
@@ -2863,7 +2864,7 @@ static SILFunction *getOrCreateKeyPathGetter(SILGenModule &SGM,
   // entry.
   if (isa<ProtocolDecl>(property->getDeclContext())) {
     auto accessor = getRepresentativeAccessorForKeyPath(property);
-    if (!SILDeclRef::requiresNewWitnessTableEntry(accessor)) {
+    if (!accessor->requiresNewWitnessTableEntry()) {
       // Find the getter that does have a witness table entry.
       auto wtableAccessor =
         cast<AccessorDecl>(SILDeclRef::getOverriddenWitnessTableEntry(accessor));
@@ -3026,7 +3027,7 @@ static SILFunction *getOrCreateKeyPathSetter(SILGenModule &SGM,
   // entry.
   if (isa<ProtocolDecl>(property->getDeclContext())) {
     auto setter = property->getOpaqueAccessor(AccessorKind::Set);
-    if (!SILDeclRef::requiresNewWitnessTableEntry(setter)) {
+    if (!setter->requiresNewWitnessTableEntry()) {
       // Find the setter that does have a witness table entry.
       auto wtableSetter =
         cast<AccessorDecl>(SILDeclRef::getOverriddenWitnessTableEntry(setter));
@@ -5551,8 +5552,14 @@ public:
               unowned->getType().castTo<UnmanagedStorageType>().getReferentType());
     auto owned = SGF.B.createUnmanagedToRef(loc, unowned, strongType);
     auto ownedMV = SGF.emitManagedRetain(loc, owned);
-    
-    // Reassign the +1 storage with it.
+
+    // Then create a mark dependence in between the base and the ownedMV. This
+    // is important to ensure that the destroy of the assign is not hoisted
+    // above the retain. We are doing unmanaged things here so we need to be
+    // extra careful.
+    ownedMV = SGF.B.createMarkDependence(loc, ownedMV, base);
+
+    // Then reassign the mark dependence into the +1 storage.
     ownedMV.assignInto(SGF, loc, base.getUnmanagedValue());
   }
   
@@ -5941,6 +5948,13 @@ RValue RValueEmitter::visitMoveExpr(MoveExpr *E, SGFContext C) {
   SGF.B.createMarkUnresolvedMoveAddr(subExpr, mv.getValue(), toAddr);
   optTemp->finishInitialization(SGF);
   return RValue(SGF, {optTemp->getManagedAddress()}, subType.getASTType());
+}
+
+RValue RValueEmitter::visitMacroExpansionExpr(MacroExpansionExpr *E,
+                                              SGFContext C) {
+  auto *rewritten = E->getRewritten();
+  assert(rewritten && "Macro should have been rewritten by SILGen");
+  return visit(rewritten, C);
 }
 
 RValue SILGenFunction::emitRValue(Expr *E, SGFContext C) {

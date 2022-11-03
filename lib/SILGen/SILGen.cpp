@@ -1487,7 +1487,7 @@ static bool requiresIVarInitialization(SILGenModule &SGM, ClassDecl *cd) {
   if (!cd->requiresStoredPropertyInits())
     return false;
 
-  for (Decl *member : cd->getMembers()) {
+  for (Decl *member : cd->getImplementationContext()->getMembers()) {
     auto pbd = dyn_cast<PatternBindingDecl>(member);
     if (!pbd) continue;
 
@@ -1500,7 +1500,7 @@ static bool requiresIVarInitialization(SILGenModule &SGM, ClassDecl *cd) {
 }
 
 bool SILGenModule::hasNonTrivialIVars(ClassDecl *cd) {
-  for (Decl *member : cd->getMembers()) {
+  for (Decl *member : cd->getImplementationContext()->getMembers()) {
     auto *vd = dyn_cast<VarDecl>(member);
     if (!vd || !vd->hasStorage()) continue;
 
@@ -1767,6 +1767,12 @@ void SILGenModule::visitVarDecl(VarDecl *vd) {
 
 void SILGenModule::visitSubscriptDecl(SubscriptDecl *sd) {
   llvm_unreachable("top-level subscript?");
+}
+
+void SILGenModule::visitMacroExpansionDecl(MacroExpansionDecl *d) {
+  auto *rewritten = d->getRewritten();
+  assert(rewritten && "Macro must have been rewritten in SILGen");
+  visit(rewritten);
 }
 
 bool

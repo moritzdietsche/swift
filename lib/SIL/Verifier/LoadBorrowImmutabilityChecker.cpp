@@ -98,7 +98,6 @@ bool GatherWritesVisitor::visitUse(Operand *op, AccessUseType useTy) {
   case SILInstructionKind::DeallocBoxInst:
   case SILInstructionKind::WitnessMethodInst:
   case SILInstructionKind::ExistentialMetatypeInst:
-  case SILInstructionKind::IsUniqueInst:
   case SILInstructionKind::HopToExecutorInst:
   case SILInstructionKind::ExtractExecutorInst:
   case SILInstructionKind::ValueMetatypeInst:
@@ -115,6 +114,7 @@ bool GatherWritesVisitor::visitUse(Operand *op, AccessUseType useTy) {
   case SILInstructionKind::MarkFunctionEscapeInst:
   case SILInstructionKind::DeallocRefInst:
   case SILInstructionKind::DeallocPartialRefInst:
+  case SILInstructionKind::IsUniqueInst:
     writeAccumulator.push_back(op);
     return true;
 
@@ -324,9 +324,6 @@ bool LoadBorrowImmutabilityAnalysis::isImmutableInScope(
     accessPath.getStorage().print(llvm::errs());
     return false;
   }
-  auto ownershipRoot = accessPath.getStorage().isReference()
-                           ? findOwnershipReferenceRoot(accessPathWithBase.base)
-                           : SILValue();
 
   BorrowedValue borrowedValue(lbi);
   MultiDefPrunedLiveness borrowLiveness(lbi->getFunction());

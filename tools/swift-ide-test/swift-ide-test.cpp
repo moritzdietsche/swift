@@ -38,7 +38,6 @@
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
 #include "swift/IDE/CodeCompletionResultPrinter.h"
 #include "swift/IDE/CommentConversion.h"
-#include "swift/IDE/CompletionInstance.h"
 #include "swift/IDE/ConformingMethodList.h"
 #include "swift/IDE/IDERequests.h"
 #include "swift/IDE/ModuleInterfacePrinting.h"
@@ -47,6 +46,8 @@
 #include "swift/IDE/SyntaxModel.h"
 #include "swift/IDE/TypeContextInfo.h"
 #include "swift/IDE/Utils.h"
+#include "swift/IDETool/CompilerInvocation.h"
+#include "swift/IDETool/CompletionInstance.h"
 #include "swift/Index/Index.h"
 #include "swift/Markup/Markup.h"
 #include "swift/Parse/ParseVersion.h"
@@ -1165,16 +1166,32 @@ static void printCodeCompletionResultsImpl(
   OS << "End completions\n";
 }
 
+static void
+printCodeCompletionLookedupTypeNames(ArrayRef<NullTerminatedStringRef> names,
+                                     llvm::raw_ostream &OS) {
+  if (names.empty())
+    return;
+
+  OS << "LookedupTypeNames: [";
+  llvm::interleave(
+      names.begin(), names.end(), [&](auto name) { OS << "'" << name << "'"; },
+      [&]() { OS << ", "; });
+  OS << "]\n";
+}
+
 static int printCodeCompletionResults(
     CancellableResult<CodeCompleteResult> CancellableResult,
     bool IncludeKeywords, bool IncludeComments, bool IncludeSourceText,
     bool PrintAnnotatedDescription) {
+  llvm::raw_fd_ostream &OS = llvm::outs();
   return printResult<CodeCompleteResult>(
       CancellableResult, [&](CodeCompleteResult &Result) {
         printCodeCompletionResultsImpl(
-            Result.ResultSink.Results, llvm::outs(), IncludeKeywords,
-            IncludeComments, IncludeSourceText, PrintAnnotatedDescription,
+            Result.ResultSink.Results, OS, IncludeKeywords, IncludeComments,
+            IncludeSourceText, PrintAnnotatedDescription,
             Result.Info.compilerInstance->getASTContext());
+        printCodeCompletionLookedupTypeNames(
+            Result.Info.completionContext->LookedupNominalTypeNames, OS);
         return 0;
       });
 }
@@ -1555,6 +1572,8 @@ static int doBatchCodeCompletion(const CompilerInvocation &InitInvok,
                 IncludeComments, IncludeSourceText,
                 CodeCompletionAnnotateResults,
                 Result->Info.compilerInstance->getASTContext());
+            printCodeCompletionLookedupTypeNames(
+                Result->Info.completionContext->LookedupNominalTypeNames, OS);
             break;
           }
           case CancellableResultKind::Failure:

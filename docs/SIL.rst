@@ -2444,10 +2444,10 @@ required.
 Deinit Barriers
 ```````````````
 
-Deinit barriers (see swift::isDeinitBarrier) are instructions which would be
-affected by the side effects of deinitializers.  To maintain the order of
-effects that is visible to the programmer, destroys of lexical values cannot be
-reordered with respect to them.  There are three kinds:
+Deinit barriers (see Instruction.isDeinitBarrier(_:)) are instructions which
+would be affected by the side effects of deinitializers.  To maintain the order
+of effects that is visible to the programmer, destroys of lexical values cannot
+be reordered with respect to them.  There are three kinds:
 
 1. synchronization points (locks, memory barriers, syscalls, etc.)
 2. loads of weak or unowned values
@@ -3949,7 +3949,9 @@ The following types of test arguments are supported:
 - function: @function <-- the current function
             @function[uint] <-- function at index ``uint``
             @function[name] <-- function named ``name``
-- block: @block <-- the first block
+- block: @block <-- the block containing the test_specification instruction
+         @block[+uint] <-- the block ``uint`` blocks after the containing block
+         @block[-uint] <-- the block ``uint`` blocks before the containing block
          @block[uint] <-- the block at index ``uint``
          @{function}.{block} <-- the indicated block in the indicated function
          Example: @function[foo].block[2]
@@ -3957,7 +3959,13 @@ The following types of test arguments are supported:
          @trace[uint] <-- the ``debug_value [trace]`` at index ``uint``
          @{function}.{trace} <-- the indicated trace in the indicated function
          Example: @function[bar].trace
-- instruction: @instruction <-- the first instruction
+- argument: @argument <-_ the first argument of the current block
+            @argument[uint] <-- the argument at index ``uint`` of the current block
+            @{block}.{argument} <-- the indicated argument in the indicated block
+            @{function}.{argument} <-- the indicated argument in the entry block of the indicated function
+- instruction: @instruction <-- the instruction after* the test_specification instruction
+               @instruction[+uint] <-- the instruction ``uint`` instructions after* the test_specification instruction
+               @instruction[-uint] <-- the instruction ``uint`` instructions before* the test_specification instruction
                @instruction[uint] <-- the instruction at index ``uint``
                @{function}.{instruction} <-- the indicated instruction in the indicated function
                Example: @function[baz].instruction[19]
@@ -3968,6 +3976,12 @@ The following types of test arguments are supported:
            @{instruction}.{operand} <-- the indicated operand of the indicated instruction
            Example: @block[19].instruction[2].operand[3]
            Example: @function[2].instruction.operand
+
+* Not counting instructions that are deleted when processing functions for tests.
+  The following instructions currently are deleted:
+
+      test_specification
+      debug_value [trace]
 
 
 Profiling
@@ -4155,7 +4169,7 @@ assign_by_wrapper
 
   sil-instruction ::= 'assign_by_wrapper' sil-operand 'to' mode? sil-operand ',' 'init' sil-operand ',' 'set' sil-operand
 
-  mode ::= '[initialization]' | '[assign]' | '[assign_wrapped_value]'
+  mode ::= '[init]' | '[assign]' | '[assign_wrapped_value]'
 
   assign_by_wrapper %0 : $S to %1 : $*T, init %2 : $F, set %3 : $G
   // $S can be a value or address type
@@ -4272,9 +4286,9 @@ copy_addr
 ::
 
   sil-instruction ::= 'copy_addr' '[take]'? sil-value
-                        'to' '[initialization]'? sil-operand
+                        'to' '[init]'? sil-operand
 
-  copy_addr [take] %0 to [initialization] %1 : $*T
+  copy_addr [take] %0 to [init] %1 : $*T
   // %0 and %1 must be of the same $*T address type
 
 Loads the value at address ``%0`` from memory and assigns a copy of it back into
@@ -4293,11 +4307,11 @@ is equivalent to::
 
 except that ``copy_addr`` may be used even if ``%0`` is of an address-only
 type. The ``copy_addr`` may be given one or both of the ``[take]`` or
-``[initialization]`` attributes:
+``[init]`` attributes:
 
 * ``[take]`` destroys the value at the source address in the course of the
   copy.
-* ``[initialization]`` indicates that the destination address is uninitialized.
+* ``[init]`` indicates that the destination address is uninitialized.
   Without the attribute, the destination address is treated as already
   initialized, and the existing value will be destroyed before the new value
   is stored.
@@ -4315,7 +4329,7 @@ operations::
     store %new to %1 : $*T
 
   // copy-initialization
-    copy_addr %0 to [initialization] %1 : $*T
+    copy_addr %0 to [init] %1 : $*T
   // is equivalent to:
     %new = load %0 : $*T
     strong_retain %new : $T
@@ -4323,7 +4337,7 @@ operations::
     store %new to %1 : $*T
 
   // take-initialization
-    copy_addr [take] %0 to [initialization] %1 : $*T
+    copy_addr [take] %0 to [init] %1 : $*T
   // is equivalent to:
     %new = load %0 : $*T
     // no retain of %new!
@@ -4341,9 +4355,9 @@ explicit_copy_addr
 ::
 
   sil-instruction ::= 'explicit_copy_addr' '[take]'? sil-value
-                        'to' '[initialization]'? sil-operand
+                        'to' '[init]'? sil-operand
 
-  explicit_copy_addr [take] %0 to [initialization] %1 : $*T
+  explicit_copy_addr [take] %0 to [init] %1 : $*T
   // %0 and %1 must be of the same $*T address type
 
 This instruction is exactly the same as `copy_addr`_ except that it has special
@@ -4775,14 +4789,14 @@ store_weak
 
 ::
 
-  sil-instruction ::= 'store_weak' sil-value 'to' '[initialization]'? sil-operand
+  sil-instruction ::= 'store_weak' sil-value 'to' '[init]'? sil-operand
 
-  store_weak %0 to [initialization] %1 : $*@sil_weak Optional<T>
+  store_weak %0 to [init] %1 : $*@sil_weak Optional<T>
   // $T must be an optional wrapping a reference type
 
 Initializes or reassigns a weak reference.  The operand may be ``nil``.
 
-If ``[initialization]`` is given, the weak reference must currently either be
+If ``[init]`` is given, the weak reference must currently either be
 uninitialized or destroyed.  If it is not given, the weak reference must
 currently be initialized. After the evaluation:
 
@@ -6005,7 +6019,7 @@ an `inject_enum_addr`_ instruction::
   entry(%0 : $*AddressOnlyEnum, %1 : $*AddressOnlyType):
     // Store the data argument for the case.
     %2 = init_enum_data_addr %0 : $*AddressOnlyEnum, #AddressOnlyEnum.HasData!enumelt
-    copy_addr [take] %2 to [initialization] %1 : $*AddressOnlyType
+    copy_addr [take] %2 to [init] %1 : $*AddressOnlyType
     // Inject the tag.
     inject_enum_addr %0 : $*AddressOnlyEnum, #AddressOnlyEnum.HasData!enumelt
     return

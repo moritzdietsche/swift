@@ -2733,6 +2733,10 @@ static bool usesFeatureActors(Decl *decl) {
   return false;
 }
 
+static bool usesFeatureMacros(Decl *decl) {
+  return isa<MacroExpansionDecl>(decl);
+}
+
 static bool usesFeatureConcurrentFunctions(Decl *decl) {
   return false;
 }
@@ -3091,6 +3095,10 @@ static bool usesFeatureAdditiveArithmeticDerivedConformances(Decl *decl) {
 }
 
 static bool usesFeatureParserASTGen(Decl *decl) {
+  return false;
+}
+
+static bool usesFeatureBuiltinMacros(Decl *decl) {
   return false;
 }
 
@@ -4429,6 +4437,24 @@ void PrintAST::visitMissingMemberDecl(MissingMemberDecl *decl) {
   Printer << " */";
 }
 
+void PrintAST::visitMacroExpansionDecl(MacroExpansionDecl *decl) {
+  Printer << '#' << decl->getMacro();
+  if (decl->getArgs()) {
+    Printer << '(';
+    auto args = decl->getArgs()->getOriginalArgs();
+    bool isFirst = true;
+    // FIXME: handle trailing closures.
+    for (auto arg : *args) {
+      if (!isFirst) {
+        Printer << ", ";
+      }
+      printArgument(arg);
+      isFirst = false;
+    }
+    Printer << ')';
+  }
+}
+
 void PrintAST::visitIntegerLiteralExpr(IntegerLiteralExpr *expr) {
   Printer << expr->getDigitsText();
 }
@@ -4909,6 +4935,9 @@ void PrintAST::visitPropertyWrapperValuePlaceholderExpr(swift::PropertyWrapperVa
 }
 
 void PrintAST::visitDifferentiableFunctionExtractOriginalExpr(swift::DifferentiableFunctionExtractOriginalExpr *expr) {
+}
+
+void PrintAST::visitMacroExpansionExpr(MacroExpansionExpr *expr) {
 }
 
 void PrintAST::visitBraceStmt(BraceStmt *stmt) {
@@ -6370,6 +6399,19 @@ public:
     }
   }
 
+  void visitElementArchetypeType(ElementArchetypeType *T) {
+    if (Options.PrintForSIL) {
+      Printer << "@element(\"" << T->getOpenedElementID() << ") ";
+      visit(T->getGenericEnvironment()->getOpenedExistentialType());
+      Printer << ") ";
+
+      auto interfaceTy = T->getInterfaceType();
+      visit(interfaceTy);
+    } else {
+      visit(T->getInterfaceType());
+    }
+  }
+
   void printDependentMember(DependentMemberType *T) {
     if (auto *const Assoc = T->getAssocType()) {
       if (Options.ProtocolQualifiedDependentMemberTypes) {
@@ -6517,16 +6559,13 @@ public:
 
       // Print based on the type.
       Printer << "some ";
-      if (!decl->getConformingProtocols().empty()) {
-        llvm::interleave(decl->getConformingProtocols(), Printer, [&](ProtocolDecl *proto){
-          if (auto printType = proto->getDeclaredType())
-            printType->print(Printer, Options);
-          else
-            Printer << proto->getNameStr();
-        }, " & ");
-      } else {
-        Printer << "Any";
-      }
+      auto archetypeType = decl->getDeclContext()->mapTypeIntoContext(
+          decl->getDeclaredInterfaceType())->castTo<ArchetypeType>();
+      auto constraintType = archetypeType->getExistentialType();
+      if (auto *existentialType = constraintType->getAs<ExistentialType>())
+        constraintType = existentialType->getConstraintType();
+
+      constraintType->print(Printer, Options);
       return;
     }
 

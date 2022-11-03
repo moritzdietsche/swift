@@ -189,7 +189,8 @@ enum class DescriptiveDeclKind : uint8_t {
   MissingMember,
   Requirement,
   OpaqueResultType,
-  OpaqueVarType
+  OpaqueVarType,
+  MacroExpansion
 };
 
 /// Describes which spelling was used in the source for the 'static' or 'class'
@@ -498,9 +499,8 @@ protected:
   );
 
   SWIFT_INLINE_BITFIELD_EMPTY(TypeDecl, ValueDecl);
-  SWIFT_INLINE_BITFIELD_EMPTY(AbstractTypeParamDecl, TypeDecl);
 
-  SWIFT_INLINE_BITFIELD_FULL(GenericTypeParamDecl, AbstractTypeParamDecl, 16+16+1+1,
+  SWIFT_INLINE_BITFIELD_FULL(GenericTypeParamDecl, TypeDecl, 16+16+1+1,
     : NumPadBits,
 
     Depth : 16,
@@ -616,7 +616,7 @@ protected:
     HasAnyUnavailableValues : 1
   );
 
-  SWIFT_INLINE_BITFIELD(ModuleDecl, TypeDecl, 1+1+1+1+1+1+1+1+1+1+1+1+1,
+  SWIFT_INLINE_BITFIELD(ModuleDecl, TypeDecl, 1+1+1+1+1+1+1+1+1+1+1+1+1+1,
     /// If the module is compiled as static library.
     StaticLibrary : 1,
 
@@ -630,6 +630,10 @@ protected:
     ///
     /// \sa ResilienceStrategy
     RawResilienceStrategy : 1,
+
+    /// Whether the module was rebuilt from a module interface instead of being
+    /// build from the full source.
+    IsBuiltFromInterface : 1,
 
     /// Whether all imports have been resolved. Used to detect circular imports.
     HasResolvedImports : 1,
@@ -723,6 +727,13 @@ protected:
 private:
   llvm::PointerUnion<DeclContext *, ASTContext *> Context;
 
+  /// The imported Clang declaration representing the \c @_objcInterface for
+  /// this declaration (or vice versa), or \c nullptr if there is none.
+  ///
+  /// If \c this (an otherwise nonsensical value), the value has not yet been
+  /// computed.
+  Decl *CachedObjCImplementationDecl;
+
   Decl(const Decl&) = delete;
   void operator=(const Decl&) = delete;
   SourceLoc getLocFromSource() const;
@@ -740,7 +751,7 @@ private:
 protected:
 
   Decl(DeclKind kind, llvm::PointerUnion<DeclContext *, ASTContext *> context)
-    : Context(context) {
+    : Context(context), CachedObjCImplementationDecl(this) {
     Bits.OpaqueBits = 0;
     Bits.Decl.Kind = unsigned(kind);
     Bits.Decl.Invalid = false;
@@ -973,6 +984,32 @@ public:
       return nullptr;
 
     return getClangNodeImpl().getAsMacro();
+  }
+
+  /// If this is the Swift implementation of a declaration imported from ObjC,
+  /// returns the imported declaration. Otherwise return \c nullptr.
+  ///
+  /// \seeAlso ExtensionDecl::isObjCInterface()
+  Decl *getImplementedObjCDecl() const;
+
+  /// If this is the ObjC interface of a declaration implemented in Swift,
+  /// returns the implementating declaration. Otherwise return \c nullptr.
+  ///
+  /// \seeAlso ExtensionDecl::isObjCInterface()
+  Decl *getObjCImplementationDecl() const;
+
+  Optional<Decl *> getCachedObjCImplementationDecl() const {
+    if (CachedObjCImplementationDecl == this)
+      return None;
+    return CachedObjCImplementationDecl;
+  }
+
+  void setCachedObjCImplementationDecl(Decl *decl) {
+    assert((CachedObjCImplementationDecl == this
+              || CachedObjCImplementationDecl == decl)
+               && "can't change CachedObjCInterfaceDecl once it's computed");
+    assert(decl != this && "can't form circular reference");
+    CachedObjCImplementationDecl = decl;
   }
 
   /// Return the GenericContext if the Decl has one.
@@ -1495,6 +1532,16 @@ public:
   /// extension mangling, because an extension method implementation could be
   /// resiliently moved into the original protocol itself.
   bool isEquivalentToExtendedContext() const;
+
+  /// True if this extension provides an implementation for an imported
+  /// Objective-C \c \@interface. This implies various restrictions and special
+  /// behaviors for its members.
+  bool isObjCImplementation() const;
+
+  /// Returns the name of the category specified by the \c \@_objcImplementation
+  /// attribute, or \c None if the name is invalid. Do not call unless
+  /// \c isObjCImplementation() returns \c true.
+  Optional<Identifier> getCategoryNameForObjCImplementation() const;
 
   // Implement isa/cast/dyncast/etc.
   static bool classof(const Decl *D) {
@@ -2335,6 +2382,10 @@ public:
   /// Asserts if this is not a member of a protocol.
   bool isProtocolRequirement() const;
 
+  /// Return true if this is a member implementation for an \c @_objcImplementation
+  /// extension.
+  bool isObjCMemberImplementation() const;
+
   void setUserAccessible(bool Accessible) {
     Bits.ValueDecl.IsUserAccessible = Accessible;
   }
@@ -3130,29 +3181,6 @@ public:
   }
 };
 
-/// Abstract class describing generic type parameters and associated types,
-/// whose common purpose is to anchor the abstract type parameter and specify
-/// requirements for any corresponding type argument.
-class AbstractTypeParamDecl : public TypeDecl {
-protected:
-  AbstractTypeParamDecl(DeclKind kind, DeclContext *dc, Identifier name,
-                        SourceLoc NameLoc)
-    : TypeDecl(kind, dc, name, NameLoc, { }) { }
-
-public:
-  /// Return the superclass of the generic parameter.
-  Type getSuperclass() const;
-
-  /// Retrieve the set of protocols to which this abstract type
-  /// parameter conforms.
-  ArrayRef<ProtocolDecl *> getConformingProtocols() const;
-
-  static bool classof(const Decl *D) {
-    return D->getKind() >= DeclKind::First_AbstractTypeParamDecl &&
-           D->getKind() <= DeclKind::Last_AbstractTypeParamDecl;
-  }
-};
-
 /// A declaration of a generic type parameter.
 ///
 /// A generic type parameter introduces a new, named type parameter along
@@ -3167,7 +3195,7 @@ public:
 /// func min<T : Comparable>(x : T, y : T) -> T { ... }
 /// \endcode
 class GenericTypeParamDecl final
-    : public AbstractTypeParamDecl,
+    : public TypeDecl,
       private llvm::TrailingObjects<GenericTypeParamDecl, TypeRepr *,
                                     SourceLoc> {
   friend TrailingObjects;
@@ -3394,7 +3422,7 @@ public:
 ///   func getNext() -> Element?
 /// }
 /// \endcode
-class AssociatedTypeDecl : public AbstractTypeParamDecl {
+class AssociatedTypeDecl : public TypeDecl {
   /// The location of the initial keyword.
   SourceLoc KeywordLoc;
 
@@ -3458,7 +3486,7 @@ public:
   /// Retrieve the (first) overridden associated type declaration, if any.
   AssociatedTypeDecl *getOverriddenDecl() const {
     return cast_or_null<AssociatedTypeDecl>(
-                                   AbstractTypeParamDecl::getOverriddenDecl());
+        TypeDecl::getOverriddenDecl());
   }
 
   /// Retrieve the set of associated types overridden by this associated
@@ -3882,8 +3910,12 @@ public:
   NominalTypeDecl *getTypeWrapperStorageDecl() const;
 
   /// If this declaration is a type wrapper, retrieve
-  /// its required initializer - `init(storage:)`.
+  /// its required initializer - `init(storageWrapper:)`.
   ConstructorDecl *getTypeWrapperInitializer() const;
+
+  /// Get an initializer that accepts a type wrapper instance to
+  /// initialize the wrapped type.
+  ConstructorDecl *getTypeWrappedTypeStorageInitializer() const;
 
   /// Get a memberwise initializer that could be used to instantiate a
   /// type wrapped type.
@@ -4459,6 +4491,12 @@ public:
   /// Retrieve the name to use for this class when interoperating with
   /// the Objective-C runtime.
   StringRef getObjCRuntimeName(llvm::SmallVectorImpl<char> &buffer) const;
+
+  /// Return the imported declaration for the category with the given name; this
+  /// will always be an Objective-C-backed \c ExtensionDecl or, if \p name is
+  /// empty, \c ClassDecl. Returns \c nullptr if the class was not imported from
+  /// Objective-C or does not have an imported category by that name.
+  IterableDeclContext *getImportedObjCCategory(Identifier name) const;
 
   // Implement isa/cast/dyncast/etc.
   static bool classof(const Decl *D) {
@@ -5815,6 +5853,11 @@ public:
   /// backing property will be treated as the member-initialized property.
   bool isMemberwiseInitialized(bool preferDeclaredProperties) const;
 
+  /// Check whether this variable presents a local storage synthesized
+  /// by the compiler in a user-defined designated initializer to
+  /// support initialization of type wrapper managed properties.
+  bool isTypeWrapperLocalStorageForInitializer() const;
+
   /// Return the range of semantics attributes attached to this VarDecl.
   auto getSemanticsAttrs() const
       -> decltype(getAttrs().getAttributes<SemanticsAttr>()) {
@@ -6852,6 +6895,11 @@ public:
   /// For a method of a class, checks whether it will require a new entry in the
   /// vtable.
   bool needsNewVTableEntry() const;
+
+  /// True if the decl is a method which introduces a new witness table entry.
+  bool requiresNewWitnessTableEntry() const {
+    return getOverriddenDecls().empty();
+  }
 
 public:
   /// Retrieve the source range of the function body.
@@ -8201,6 +8249,33 @@ public:
 
   static bool classof(const Decl *D) {
     return D->getKind() == DeclKind::MissingMember;
+  }
+};
+
+class MacroExpansionDecl : public Decl {
+  SourceLoc PoundLoc;
+  DeclNameRef Macro;
+  DeclNameLoc MacroLoc;
+  ArgumentList *ArgList;
+  Decl *Rewritten;
+
+public:
+  MacroExpansionDecl(DeclContext *dc, SourceLoc poundLoc, DeclNameRef macro,
+                     DeclNameLoc macroLoc, ArgumentList *args)
+      : Decl(DeclKind::MacroExpansion, dc), PoundLoc(poundLoc),
+        Macro(macro), MacroLoc(macroLoc), ArgList(args), Rewritten(nullptr) {}
+
+  SourceRange getSourceRange() const;
+  SourceLoc getLocFromSource() const { return PoundLoc; }
+  SourceLoc getPoundLoc() const { return PoundLoc; }
+  DeclNameLoc getMacroLoc() const { return MacroLoc; }
+  DeclNameRef getMacro() const { return Macro; }
+  ArgumentList *getArgs() const { return ArgList; }
+  Decl *getRewritten() const { return Rewritten; }
+  void setRewritten(Decl *rewritten) { Rewritten = rewritten; }
+
+  static bool classof(const Decl *D) {
+    return D->getKind() == DeclKind::MacroExpansion;
   }
 };
 
