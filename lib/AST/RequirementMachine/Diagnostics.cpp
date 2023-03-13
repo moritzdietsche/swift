@@ -209,6 +209,15 @@ bool swift::rewriting::diagnoseRequirementErrors(
 
       break;
     }
+
+    case RequirementError::Kind::UnsupportedSameElement: {
+      if (error.requirement.hasError())
+        break;
+
+      ctx.Diags.diagnose(loc, diag::unsupported_same_element);
+      diagnosedError = true;
+      break;
+    }
     }
   }
 
@@ -282,7 +291,7 @@ void RewriteSystem::computeRedundantRequirementDiagnostics(
 
     auto requirementID = rule.getRequirementID();
 
-    if (!requirementID.hasValue()) {
+    if (!requirementID.has_value()) {
       if (!rule.isRedundant())
         nonExplicitNonRedundantRules.insert(ruleID);
 

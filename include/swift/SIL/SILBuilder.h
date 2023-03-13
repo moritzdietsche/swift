@@ -263,7 +263,10 @@ public:
   bool hasValidInsertionPoint() const { return BB != nullptr; }
   SILBasicBlock *getInsertionBB() const { return BB; }
   SILBasicBlock::iterator getInsertionPoint() const { return InsertPt; }
-  SILLocation getInsertionPointLoc() const { return InsertPt->getLoc(); }
+  SILLocation getInsertionPointLoc() const {
+    assert(!insertingAtEndOfBlock());
+    return InsertPt->getLoc();
+  }
 
   /// insertingAtEndOfBlock - Return true if the insertion point is at the end
   /// of the current basic block.  False if we're inserting before an existing
@@ -406,6 +409,11 @@ public:
         wasMoved));
   }
 
+  AllocPackInst *createAllocPack(SILLocation loc, SILType packType) {
+    return insert(AllocPackInst::create(getSILDebugLocation(loc), packType,
+                                        getFunction()));
+  }
+
   AllocRefInst *createAllocRef(SILLocation Loc, SILType ObjectType,
                                bool objc, bool canAllocOnStack,
                                ArrayRef<SILType> ElementTypes,
@@ -429,6 +437,16 @@ public:
     return insert(AllocRefDynamicInst::create(
         getSILDebugLocation(Loc), *F, operand, type, objc, canAllocOnStack,
         ElementTypes, ElementCountOperands));
+  }
+
+  /// Helper function that calls \p createAllocBox after constructing a
+  /// SILBoxType for \p fieldType.
+  AllocBoxInst *createAllocBox(SILLocation loc, SILType fieldType,
+                               Optional<SILDebugVariable> Var = None,
+                               bool hasDynamicLifetime = false,
+                               bool reflection = false) {
+    return createAllocBox(loc, SILBoxType::get(fieldType.getASTType()), Var,
+                          hasDynamicLifetime, reflection);
   }
 
   AllocBoxInst *createAllocBox(SILLocation Loc, CanSILBoxType BoxType,
@@ -745,6 +763,7 @@ public:
 
   BeginBorrowInst *createBeginBorrow(SILLocation Loc, SILValue LV,
                                      bool isLexical = false) {
+    assert(getFunction().hasOwnership());
     assert(!LV->getType().isAddress());
     return insert(new (getModule())
                       BeginBorrowInst(getSILDebugLocation(Loc), LV, isLexical));
@@ -831,12 +850,8 @@ public:
   }
 
   EndBorrowInst *createEndBorrow(SILLocation loc, SILValue borrowedValue) {
-    if (auto *arg = dyn_cast<SILPhiArgument>(borrowedValue)) {
-      if (auto *ti = arg->getSingleTerminator()) {
-        assert(!ti->isTransformationTerminator() &&
-               "Transforming terminators do not have end_borrow");
-      }
-    }
+    assert(!SILArgument::isTerminatorResult(borrowedValue) &&
+               "terminator results do not have end_borrow");
     return insert(new (getModule())
                       EndBorrowInst(getSILDebugLocation(loc), borrowedValue));
   }
@@ -883,30 +898,13 @@ public:
                                  Qualifier));
   }
 
-  AssignByWrapperInst *
-  createAssignByPropertyWrapper(SILLocation Loc, SILValue Src, SILValue Dest,
-                                SILValue Initializer, SILValue Setter,
-                                AssignByWrapperInst::Mode mode) {
-    return createAssignByWrapper(
-        Loc, AssignByWrapperInst::Originator::PropertyWrapper, Src, Dest,
-        Initializer, Setter, mode);
-  }
-
-  AssignByWrapperInst *
-  createAssignByTypeWrapper(SILLocation Loc, SILValue Src, SILValue Dest,
-                            SILValue Setter, AssignByWrapperInst::Mode mode) {
-    return createAssignByWrapper(
-        Loc, AssignByWrapperInst::Originator::TypeWrapper, Src, Dest,
-        SILUndef::get(Dest->getType(), getModule()), Setter, mode);
-  }
-
-  AssignByWrapperInst *
-  createAssignByWrapper(SILLocation Loc, AssignByWrapperInst::Originator origin,
-                        SILValue Src, SILValue Dest, SILValue Initializer,
-                        SILValue Setter, AssignByWrapperInst::Mode mode) {
-    return insert(new (getModule())
-                      AssignByWrapperInst(getSILDebugLocation(Loc), origin, Src,
-                                          Dest, Initializer, Setter, mode));
+  AssignByWrapperInst *createAssignByWrapper(SILLocation Loc, SILValue Src,
+                                             SILValue Dest,
+                                             SILValue Initializer,
+                                             SILValue Setter,
+                                             AssignByWrapperInst::Mode mode) {
+    return insert(new (getModule()) AssignByWrapperInst(
+        getSILDebugLocation(Loc), Src, Dest, Initializer, Setter, mode));
   }
 
   StoreBorrowInst *createStoreBorrow(SILLocation Loc, SILValue Src,
@@ -979,6 +977,10 @@ public:
                                        SILDebugVariable Var,
                                        bool wasMoved = false,
                                        bool trace = false);
+
+  DebugStepInst *createDebugStep(SILLocation Loc) {
+    return insert(new (getModule()) DebugStepInst(getSILDebugLocation(Loc)));
+  }
 
   /// Create a debug_value according to the type of \p src
   SILInstruction *emitDebugDescription(SILLocation Loc, SILValue src,
@@ -1276,6 +1278,7 @@ public:
   }
 
   CopyValueInst *createCopyValue(SILLocation Loc, SILValue operand) {
+    assert(getFunction().hasOwnership());
     assert(!operand->getType().isTrivial(getFunction()) &&
            "Should not be passing trivial values to this api. Use instead "
            "emitCopyValueOperation");
@@ -1294,6 +1297,7 @@ public:
 
   DestroyValueInst *createDestroyValue(SILLocation Loc, SILValue operand,
                                        bool poisonRefs = false) {
+    assert(getFunction().hasOwnership());
     assert(isLoadableOrOpaque(operand->getType()));
     assert(!operand->getType().isTrivial(getFunction()) &&
            "Should not be passing trivial values to this api. Use instead "
@@ -1304,6 +1308,7 @@ public:
 
   MoveValueInst *createMoveValue(SILLocation loc, SILValue operand,
                                  bool isLexical = false) {
+    assert(getFunction().hasOwnership());
     assert(!operand->getType().isTrivial(getFunction()) &&
            "Should not be passing trivial values to this api. Use instead "
            "emitMoveValueOperation");
@@ -1323,6 +1328,13 @@ public:
                           MarkMustCheckInst::CheckKind kind) {
     return insert(new (getModule())
                       MarkMustCheckInst(getSILDebugLocation(loc), src, kind));
+  }
+
+  MarkUnresolvedReferenceBindingInst *createMarkUnresolvedReferenceBindingInst(
+      SILLocation loc, SILValue src,
+      MarkUnresolvedReferenceBindingInst::Kind kind) {
+    return insert(new (getModule()) MarkUnresolvedReferenceBindingInst(
+        getSILDebugLocation(loc), src, kind));
   }
 
   CopyableToMoveOnlyWrapperValueInst *
@@ -1663,6 +1675,9 @@ public:
                                                SILValue Operand,
                                                unsigned FieldNo,
                                                SILType ResultTy) {
+    assert(!Operand->getType().castTo<TupleType>().containsPackExpansionType()
+           && "tuples with pack expansions must be indexed with "
+              "tuple_pack_element_addr");
     return insert(new (getModule()) TupleElementAddrInst(
         getSILDebugLocation(Loc), Operand, FieldNo, ResultTy));
   }
@@ -1784,6 +1799,24 @@ public:
 
   void emitDestructureAddressOperation(SILLocation loc, SILValue operand,
                                        SmallVectorImpl<SILValue> &result);
+
+  void emitDestructureAddressOperation(
+      SILLocation loc, SILValue operand,
+      function_ref<void(unsigned, SILValue)> result);
+
+  void emitDestructureOperation(SILLocation loc, SILValue operand,
+                                SmallVectorImpl<SILValue> &result) {
+    if (operand->getType().isAddress())
+      return emitDestructureAddressOperation(loc, operand, result);
+    return emitDestructureValueOperation(loc, operand, result);
+  }
+
+  void emitDestructureOperation(SILLocation loc, SILValue operand,
+                                function_ref<void(unsigned, SILValue)> result) {
+    if (operand->getType().isAddress())
+      return emitDestructureAddressOperation(loc, operand, result);
+    return emitDestructureValueOperation(loc, operand, result);
+  }
 
   ClassMethodInst *createClassMethod(SILLocation Loc, SILValue Operand,
                                      SILDeclRef Member, SILType MethodTy) {
@@ -1936,6 +1969,71 @@ public:
         getSILDebugLocation(Loc), Existential));
   }
 
+  PackLengthInst *
+  createPackLength(SILLocation loc, CanPackType packType) {
+    return insert(PackLengthInst::create(getFunction(),
+                              getSILDebugLocation(loc),
+                              packType));
+  }
+
+  DynamicPackIndexInst *
+  createDynamicPackIndex(SILLocation loc, SILValue indexValue,
+                         CanPackType indexedPackType) {
+    return insert(DynamicPackIndexInst::create(getFunction(),
+                              getSILDebugLocation(loc),
+                              indexValue, indexedPackType));
+  }
+
+  PackPackIndexInst *
+  createPackPackIndex(SILLocation loc, unsigned sliceStartIndex,
+                      SILValue indexWithinSlice,
+                      CanPackType indexedPackType) {
+    return insert(PackPackIndexInst::create(getFunction(),
+                              getSILDebugLocation(loc),
+                              sliceStartIndex, indexWithinSlice,
+                              indexedPackType));
+  }
+
+  ScalarPackIndexInst *
+  createScalarPackIndex(SILLocation loc, unsigned componentIndex,
+                        CanPackType indexedPackType) {
+    return insert(ScalarPackIndexInst::create(getFunction(),
+                              getSILDebugLocation(loc),
+                              componentIndex, indexedPackType));
+  }
+
+  OpenPackElementInst *
+  createOpenPackElement(SILLocation loc, SILValue packIndex,
+                        GenericEnvironment *openedElementEnvironment) {
+    return insert(OpenPackElementInst::create(getFunction(),
+                              getSILDebugLocation(loc),
+                              packIndex, openedElementEnvironment));
+  }
+
+  PackElementGetInst *
+  createPackElementGet(SILLocation loc, SILValue packIndex,
+                       SILValue pack, SILType elementType) {
+    return insert(PackElementGetInst::create(getFunction(),
+                              getSILDebugLocation(loc),
+                              packIndex, pack, elementType));
+  }
+
+  PackElementSetInst *
+  createPackElementSet(SILLocation loc, SILValue elementValue,
+                       SILValue packIndex, SILValue pack) {
+    return insert(new (getModule()) PackElementSetInst(
+                              getSILDebugLocation(loc),
+                              elementValue, packIndex, pack));
+  }
+
+  TuplePackElementAddrInst *
+  createTuplePackElementAddr(SILLocation loc, SILValue packIndex,
+                             SILValue tupleAddr, SILType elementType) {
+    return insert(TuplePackElementAddrInst::create(getFunction(),
+                              getSILDebugLocation(loc),
+                              packIndex, tupleAddr, elementType));
+  }
+
   ProjectBlockStorageInst *createProjectBlockStorage(SILLocation Loc,
                                                      SILValue Storage) {
     auto CaptureTy = Storage->getType()
@@ -2073,6 +2171,10 @@ public:
   DeallocStackInst *createDeallocStack(SILLocation Loc, SILValue operand) {
     return insert(new (getModule())
                       DeallocStackInst(getSILDebugLocation(Loc), operand));
+  }
+  DeallocPackInst *createDeallocPack(SILLocation loc, SILValue operand) {
+    return insert(new (getModule())
+                      DeallocPackInst(getSILDebugLocation(loc), operand));
   }
   DeallocStackRefInst *createDeallocStackRef(SILLocation Loc,
                                                      SILValue operand) {
@@ -2625,7 +2727,7 @@ public:
       IndexSubset *ResultIndices, SILValue OriginalFunction,
       Optional<std::pair<SILValue, SILValue>> JVPAndVJPFunctions = None) {
     SILValue jvpAndVJPArray[2];
-    if (JVPAndVJPFunctions.hasValue()) {
+    if (JVPAndVJPFunctions.has_value()) {
       jvpAndVJPArray[0] = JVPAndVJPFunctions->first;
       jvpAndVJPArray[1] = JVPAndVJPFunctions->second;
     }
@@ -2635,7 +2737,7 @@ public:
         JVPAndVJPFunctions,
         hasOwnership()
             ? DifferentiableFunctionInst::getMergedOwnershipKind(
-                  OriginalFunction, JVPAndVJPFunctions.hasValue()
+                  OriginalFunction, JVPAndVJPFunctions.has_value()
                                         ? ArrayRef<SILValue>(jvpAndVJPArray, 2)
                                         : ArrayRef<SILValue>())
             : ValueOwnershipKind(OwnershipKind::None));
@@ -2681,7 +2783,7 @@ public:
       SILLocation Loc, NormalDifferentiableFunctionTypeComponent Extractee,
       SILValue Function, Optional<SILType> ExtracteeType = None) {
     return createDifferentiableFunctionExtract(
-        Loc, Extractee, Function, Function->getOwnershipKind(), ExtracteeType);
+        Loc, Extractee, Function, OwnershipKind::Guaranteed, ExtracteeType);
   }
 
   DifferentiableFunctionExtractInst *createDifferentiableFunctionExtract(
@@ -2723,6 +2825,14 @@ public:
     return insert(new (getModule()) DifferentiabilityWitnessFunctionInst(
         getModule(), getSILDebugLocation(Loc), WitnessKind, Witness,
         FunctionType));
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Weak linking support
+  //===--------------------------------------------------------------------===//
+  HasSymbolInst *createHasSymbol(SILLocation Loc, ValueDecl *Decl) {
+    return insert(new (getModule()) HasSymbolInst(
+        getModule(), getSILDebugLocation(Loc), Decl));
   }
 
   //===--------------------------------------------------------------------===//
@@ -2797,7 +2907,7 @@ private:
   }
 };
 
-/// An wrapper on top of SILBuilder's constructor that automatically sets the
+/// A wrapper on top of SILBuilder's constructor that automatically sets the
 /// current SILDebugScope based on the specified insertion point. This is useful
 /// for situations where a single SIL instruction is lowered into a sequence of
 /// SIL instructions.

@@ -1,4 +1,6 @@
-// RUN: %target-typecheck-verify-swift -enable-experimental-variadic-generics
+// RUN: %target-typecheck-verify-swift -enable-experimental-feature VariadicGenerics
+
+// REQUIRES: asserts
 
 // Test instantiation of constraint solver constraints from generic requirements
 // involving type pack parameters
@@ -7,7 +9,7 @@
 
 protocol P {}
 
-func takesP<T...: P>(_: T...) {}  // expected-note {{where 'T' = 'DoesNotConformToP'}}
+func takesP<each T: P>(_: repeat each T) {}  // expected-note {{where 'T' = 'DoesNotConformToP'}}
 
 struct ConformsToP: P {}
 struct DoesNotConformToP {}
@@ -24,7 +26,7 @@ class C {}
 class SubclassOfC: C {}
 class NotSubclassOfC {}
 
-func takesC<T...: C>(_: T...) {}  // expected-note {{where 'T' = 'NotSubclassOfC'}}
+func takesC<each T: C>(_: repeat each T) {}  // expected-note {{where 'T' = 'NotSubclassOfC'}}
 
 takesC()  // ok
 takesC(SubclassOfC(), SubclassOfC(), SubclassOfC())  // ok
@@ -35,7 +37,7 @@ takesC(SubclassOfC(), NotSubclassOfC(), SubclassOfC())  // expected-error {{glob
 
 struct S {}
 
-func takesAnyObject<T...: AnyObject>(_: T...) {}
+func takesAnyObject<each T: AnyObject>(_: repeat each T) {}
 
 takesAnyObject()
 takesAnyObject(C(), C(), C())
@@ -45,7 +47,7 @@ takesAnyObject(C(), S(), C())  // expected-error {{type of expression is ambiguo
 
 // Same-type requirements
 
-func takesParallelSequences<T..., U...>(t: T..., u: U...) where T: Sequence, U: Sequence, T.Element == U.Element {}
+func takesParallelSequences<each T, each U>(t: repeat each T, u: repeat each U) where each T: Sequence, each U: Sequence, each T.Element == each U.Element {}
 // expected-note@-1 {{where 'T.Element' = 'String', 'U.Element' = 'Int'}}
 
 takesParallelSequences()  // ok
@@ -55,8 +57,7 @@ takesParallelSequences(t: Array<String>(), Set<Int>(), u: Array<Int>(), Set<Stri
 
 // Same-shape requirements
 
-func zip<T..., U...>(t: T..., u: U...) -> ((T, U)...) {}
-// expected-note@-1 {{where 'T' = 'T', 'U' = 'U'}}
+func zip<each T, each U>(t: repeat each T, u: repeat each U) -> (repeat (each T, each U)) {}
 
 let _ = zip()  // ok
 let _ = zip(t: 1, u: "hi")  // ok
@@ -66,11 +67,11 @@ let _ = zip(t: 1, 2, 3, u: "hi", "hello", "greetings")  // ok
 // FIXME: Bad diagnostic
 let _ = zip(t: 1, u: "hi", "hello", "greetings")  // expected-error {{type of expression is ambiguous without more context}}
 
-func goodCallToZip<T..., U...>(t: T..., u: U...) where ((T, U)...): Any {
-  _ = zip(t: t..., u: u...)
+func goodCallToZip<each T, each U>(t: repeat each T, u: repeat each U) where (repeat (each T, each U)): Any {
+  _ = zip(t: repeat each t, u: repeat each u)
 }
 
-func badCallToZip<T..., U...>(t: T..., u: U...) {
-  _ = zip(t: t..., u: u...)
-  // expected-error@-1 {{global function 'zip(t:u:)' requires the type packs 'T' and 'U' have the same shape}}
+func badCallToZip<each T, each U>(t: repeat each T, u: repeat each U) {
+  _ = zip(t: repeat each t, u: repeat each u)
+  // expected-error@-1 {{global function 'zip(t:u:)' requires the type packs 'U' and 'T' have the same shape}}
 }

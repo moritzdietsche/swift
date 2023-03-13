@@ -41,6 +41,7 @@ namespace swift {
   class Decl;
   class DeclAttribute;
   class DiagnosticEngine;
+  class GeneratedSourceInfo;
   class SourceManager;
   class ValueDecl;
   class SourceFile;
@@ -51,6 +52,7 @@ namespace swift {
   enum class StaticSpellingKind : uint8_t;
   enum class DescriptiveDeclKind : uint8_t;
   enum DeclAttrKind : unsigned;
+  enum class StmtKind;
 
   /// Enumeration describing all of possible diagnostics.
   ///
@@ -116,6 +118,7 @@ namespace swift {
     ReferenceOwnership,
     StaticSpellingKind,
     DescriptiveDeclKind,
+    DescriptiveStmtKind,
     DeclAttribute,
     VersionTuple,
     LayoutConstraint,
@@ -149,6 +152,7 @@ namespace swift {
       ReferenceOwnership ReferenceOwnershipVal;
       StaticSpellingKind StaticSpellingKindVal;
       DescriptiveDeclKind DescriptiveDeclKindVal;
+      StmtKind DescriptiveStmtKindVal;
       const DeclAttribute *DeclAttributeVal;
       llvm::VersionTuple VersionVal;
       LayoutConstraint LayoutConstraintVal;
@@ -234,6 +238,10 @@ namespace swift {
     DiagnosticArgument(DescriptiveDeclKind DDK)
         : Kind(DiagnosticArgumentKind::DescriptiveDeclKind),
           DescriptiveDeclKindVal(DDK) {}
+
+    DiagnosticArgument(StmtKind SK)
+        : Kind(DiagnosticArgumentKind::DescriptiveStmtKind),
+          DescriptiveStmtKindVal(SK) {}
 
     DiagnosticArgument(const DeclAttribute *attr)
         : Kind(DiagnosticArgumentKind::DeclAttribute),
@@ -339,6 +347,11 @@ namespace swift {
     DescriptiveDeclKind getAsDescriptiveDeclKind() const {
       assert(Kind == DiagnosticArgumentKind::DescriptiveDeclKind);
       return DescriptiveDeclKindVal;
+    }
+
+    StmtKind getAsDescriptiveStmtKind() const {
+      assert(Kind == DiagnosticArgumentKind::DescriptiveStmtKind);
+      return DescriptiveStmtKindVal;
     }
 
     const DeclAttribute *getAsDeclAttribute() const {
@@ -490,6 +503,7 @@ namespace swift {
     }
 
     void addChildNote(Diagnostic &&D);
+    void insertChildNote(unsigned beforeIndex, Diagnostic &&D);
   };
   
   /// Describes an in-flight diagnostic, which is currently active
@@ -1152,6 +1166,11 @@ namespace swift {
     /// Send \c diag to all diagnostic consumers.
     void emitDiagnostic(const Diagnostic &diag);
 
+    /// Retrieve the set of child notes that describe how the generated
+    /// source buffer was derived, e.g., a macro expansion backtrace.
+    std::vector<Diagnostic> getGeneratedSourceBufferNotes(
+        SourceLoc loc, Optional<unsigned> &lastBufferID);
+
     /// Handle a new diagnostic, which will either be emitted, or added to an
     /// active transaction.
     void handleDiagnostic(Diagnostic &&diag);
@@ -1459,6 +1478,10 @@ namespace swift {
 /// This is correlated with diag::availability_deprecated and others.
 std::pair<unsigned, DeclName>
 getAccessorKindAndNameForDiagnostics(const ValueDecl *D);
+
+/// Retrieve the macro name for a generated source info that represents
+/// a macro expansion.
+DeclName getGeneratedSourceInfoMacroName(const GeneratedSourceInfo &info);
 
 } // end namespace swift
 

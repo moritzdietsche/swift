@@ -270,9 +270,9 @@ void DerivedConformance::diagnoseIfSynthesisUnsupportedForDecl(
 
   if (shouldDiagnose) {
     auto &ctx = nominal->getASTContext();
-    ctx.Diags.diagnose(nominal->getLoc(),
-                       diag::automatic_protocol_synthesis_unsupported,
-                       protocol->getName().str(), isa<StructDecl>(nominal));
+    ctx.Diags.diagnose(
+        nominal->getLoc(), diag::automatic_protocol_synthesis_unsupported,
+        protocol->getName().str(), nominal->getDescriptiveKind());
   }
 }
 
@@ -692,7 +692,7 @@ GuardStmt *DerivedConformance::returnComparisonIfNotEqualGuard(ASTContext &C,
 static IntegerLiteralExpr *buildIntegerLiteral(ASTContext &C, unsigned index) {
   Type intType = C.getIntType();
 
-  auto literal = IntegerLiteralExpr::createFromUnsigned(C, index);
+  auto literal = IntegerLiteralExpr::createFromUnsigned(C, index, SourceLoc());
   literal->setType(intType);
   literal->setBuiltinInitializer(C.getIntBuiltinInitDecl(C.getIntDecl()));
 
@@ -737,7 +737,8 @@ DeclRefExpr *DerivedConformance::convertEnumToIndex(SmallVectorImpl<ASTNode> &st
     // generate: case .<Case>:
     auto pat = new (C)
         EnumElementPattern(TypeExpr::createImplicit(enumType, C), SourceLoc(),
-                           DeclNameLoc(), DeclNameRef(), elt, nullptr);
+                           DeclNameLoc(), DeclNameRef(), elt, nullptr,
+                           /*DC*/ funcDecl);
     pat->setImplicit();
     pat->setType(enumType);
 
@@ -854,8 +855,8 @@ Pattern *DerivedConformance::enumElementPayloadSubpattern(
 
       auto namedPattern = new (C) NamedPattern(payloadVar);
       namedPattern->setImplicit();
-      auto letPattern =
-          BindingPattern::createImplicit(C, /*isLet*/ true, namedPattern);
+      auto letPattern = BindingPattern::createImplicit(
+          C, VarDecl::Introducer::Let, namedPattern);
       elementPatterns.push_back(TuplePatternElt(tupleElement.getName(),
                                                 SourceLoc(), letPattern));
     }
@@ -874,8 +875,8 @@ Pattern *DerivedConformance::enumElementPayloadSubpattern(
 
   auto namedPattern = new (C) NamedPattern(payloadVar);
   namedPattern->setImplicit();
-  auto letPattern =
-      new (C) BindingPattern(SourceLoc(), /*isLet*/ true, namedPattern);
+  auto letPattern = new (C)
+      BindingPattern(SourceLoc(), VarDecl::Introducer::Let, namedPattern);
   return ParenPattern::createImplicit(C, letPattern);
 }
 

@@ -35,9 +35,13 @@ class ArchetypeType;
 class ASTContext;
 class GenericTypeParamType;
 class OpaqueTypeDecl;
+class ElementArchetypeType;
 class OpenedArchetypeType;
+class PackArchetypeType;
+class PackExpansionType;
 class SILModule;
 class SILType;
+template <class> class CanTypeWrapper;
 
 /// Query function suitable for use as a \c TypeSubstitutionFn that queries
 /// the mapping of interface types to archetypes.
@@ -64,9 +68,11 @@ struct OpenedExistentialEnvironmentData {
   UUID uuid;
 };
 
-/// Extra data in a generic environment for an opened element.
+/// Extra data in a generic environment for an opened pack element.
 struct OpenedElementEnvironmentData {
   UUID uuid;
+  CanType shapeClass;
+  SubstitutionMap outerSubstitutions;
 };
 
 /// Describes the mapping between archetypes and interface types for the
@@ -139,7 +145,9 @@ private:
       Type existential, GenericSignature parentSig, UUID uuid);
 
   /// Private constructor for opened element environments.
-  explicit GenericEnvironment(GenericSignature signature, UUID uuid);
+  explicit GenericEnvironment(GenericSignature signature,
+                              UUID uuid, CanType shapeClass,
+                              SubstitutionMap outerSubs);
 
   friend ArchetypeType;
   friend QueryInterfaceTypeSubstitutions;
@@ -181,8 +189,32 @@ public:
   /// create a generic environment.
   SubstitutionMap getOpaqueSubstitutions() const;
 
+  /// Retrieve the substitutions for the outer generic parameters of an
+  /// opened pack element generic environment.
+  SubstitutionMap getPackElementContextSubstitutions() const;
+
+  /// Retrieve the shape equivalence class for an opened element environment.
+  CanType getOpenedElementShapeClass() const;
+
   /// Retrieve the UUID for an opened element environment.
   UUID getOpenedElementUUID() const;
+
+  void forEachPackElementArchetype(
+          llvm::function_ref<void(ElementArchetypeType*)> function) const;
+
+  void forEachPackElementGenericTypeParam(
+      llvm::function_ref<void(GenericTypeParamType *)> function) const;
+
+  using PackElementBindingCallback =
+    llvm::function_ref<void(ElementArchetypeType *elementType,
+                            PackType *packSubstitution)>;
+
+  /// Given that this is an opened element environment, iterate the
+  /// opened pack element bindings: the pack archetype that's been opened
+  /// (which may not be meaningful in the surrounding context), the element
+  /// archetype that it has been opened as, and the pack type whose elements
+  /// are opened.
+  void forEachPackElementBinding(PackElementBindingCallback function) const;
 
   /// Create a new, primary generic environment.
   static GenericEnvironment *forPrimary(GenericSignature signature);
@@ -206,8 +238,13 @@ public:
   /// signature of the context whose element type is being opened, but with
   /// the pack parameter bit erased from one or more generic parameters
   /// \param uuid The unique identifier for this opened element
+  /// \param shapeClass The shape equivalence class for the originating packs.
+  /// \param outerSubs The substitution map containing archetypes from the
+  /// outer generic context.
   static GenericEnvironment *
-  forOpenedElement(GenericSignature signature, UUID uuid);
+  forOpenedElement(GenericSignature signature,
+                   UUID uuid, CanType shapeClass,
+                   SubstitutionMap outerSubs);
 
   /// Make vanilla new/delete illegal.
   void *operator new(size_t Bytes) = delete;
@@ -219,8 +256,9 @@ public:
     return Mem; 
   }
 
-  /// For an opaque archetype environment, apply the substitutions.
-  Type maybeApplyOpaqueTypeSubstitutions(Type type) const;
+  /// For an opaque or pack element archetype environment, apply the
+  /// substitutions.
+  Type maybeApplyOuterContextSubstitutions(Type type) const;
 
   /// Compute the canonical interface type within this environment.
   Type getCanonicalInterfaceType(Type interfaceType);
@@ -239,9 +277,17 @@ public:
   /// Map a generic parameter type to a contextual type.
   Type mapTypeIntoContext(GenericTypeParamType *type) const;
 
-  /// Map a type containing parameter packs to a contextual type
-  /// in the opened element generic context.
+  /// Map an interface type containing parameter packs to a contextual
+  /// type in the opened element generic context.
   Type mapPackTypeIntoElementContext(Type type) const;
+
+  /// Map a contextual type containing parameter packs to a contextual
+  /// type in the opened element generic context.
+  Type mapContextualPackTypeIntoElementContext(Type type) const;
+
+  /// Map a contextual type containing parameter packs to a contextual
+  /// type in the opened element generic context.
+  CanType mapContextualPackTypeIntoElementContext(CanType type) const;
 
   /// Map a type containing pack element type parameters to a contextual
   /// type in the pack generic context.
@@ -273,6 +319,23 @@ public:
   void dump(raw_ostream &os) const;
 
   SWIFT_DEBUG_DUMP;
+};
+
+/// A pair of an opened-element generic signature and an opened-element
+/// generic environment.
+struct OpenedElementContext {
+  /// The opened-element environment for this expansion.
+  GenericEnvironment *environment;
+
+  /// The opened-element signature for this expansion.
+  CanGenericSignature signature;
+
+  /// Create a fresh opened element context from a contextual pack
+  /// expansion type.  This is useful when writing code that needs to
+  /// break down the components of a pack expansion.
+  static OpenedElementContext
+  createForContextualExpansion(ASTContext &ctx,
+                   CanTypeWrapper<PackExpansionType> expansionType);
 };
   
 } // end namespace swift

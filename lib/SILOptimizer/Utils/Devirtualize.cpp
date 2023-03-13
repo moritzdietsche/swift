@@ -156,6 +156,7 @@ static bool isKnownFinalClass(ClassDecl *cd, SILModule &module,
   case AccessLevel::Open:
     return false;
   case AccessLevel::Public:
+  case AccessLevel::Package:
   case AccessLevel::Internal:
     if (!module.isWholeModule())
       return false;
@@ -177,6 +178,7 @@ static bool isKnownFinalClass(ClassDecl *cd, SILModule &module,
       case AccessLevel::Open:
         return false;
       case AccessLevel::Public:
+      case AccessLevel::Package:
       case AccessLevel::Internal:
         if (!module.isWholeModule())
           return false;
@@ -557,7 +559,7 @@ replaceBeginApplyInst(SILBuilder &builder, SILLocation loc,
     auto newYield = newYields[i];
     // Insert any end_borrow if the yielded value before the token's uses.
     SmallVector<SILInstruction *, 4> users(
-      makeUserIteratorRange(oldBAI->getTokenResult()->getUses()));
+      makeUserIteratorRange(oldYield->getUses()));
     auto yieldCastRes = castValueToABICompatibleType(
       &builder, loc, newYield, newYield->getType(), oldYield->getType(),
       users);
@@ -1122,6 +1124,24 @@ devirtualizeWitnessMethod(ApplySite applySite, SILFunction *f,
   return {newApplySite, changedCFG};
 }
 
+static bool isNonGenericThunkOfGenericExternalFunction(SILFunction *thunk) {
+  if (!thunk->isThunk())
+    return false;
+  if (thunk->getGenericSignature())
+    return false;
+  for (SILBasicBlock &block : *thunk) {
+    for (SILInstruction &inst : block) {
+      if (FullApplySite fas = FullApplySite::isa(&inst)) {
+        if (SILFunction *calledFunc = fas.getReferencedFunctionOrNull()) {
+          if (fas.hasSubstitutions() && !calledFunc->isDefinition())
+            return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 static bool canDevirtualizeWitnessMethod(ApplySite applySite) {
   SILFunction *f;
   SILWitnessTable *wt;
@@ -1147,6 +1167,25 @@ static bool canDevirtualizeWitnessMethod(ApplySite applySite) {
       && isa<TryApplyInst>(applySite.getInstruction())) {
     LLVM_DEBUG(llvm::dbgs() << "        FAIL: Trying to devirtualize a "
           "try_apply but wtable entry has no error result.\n");
+    return false;
+  }
+
+  // The following check is for performance reasons: if `f` is a non-generic thunk
+  // which calls a (not inlinable) generic function in the defining module, it's
+  // more efficient to not devirtualize, but call the non-generic thunk - even though
+  // it's done through the witness table.
+  // Example:
+  // ```
+  //   protocol P {
+  //     func f(x: [Int])   // not generic
+  //   }
+  //   struct S: P {
+  //     func f(x: some RandomAccessCollection<Int>) { ... } // generic
+  //   }
+  // ```
+  // In the defining module, the generic conformance can be specialized (which is not
+  // possible in the client module, because it's not inlinable).
+  if (isNonGenericThunkOfGenericExternalFunction(f)) {
     return false;
   }
 

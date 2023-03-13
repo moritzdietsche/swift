@@ -272,7 +272,7 @@ bb2(%16 : @owned $Error):
 // CHECK:   destroy_value %5 : $@callee_owned (Builtin.Int32) -> (Builtin.Int32, @error any Error)
 // CHECK:   [[CALL:%.*]] = apply [[COPY]]
 // CHECK:   br bb3([[CALL]] : $Builtin.Int32)
-// CHECK: bb2:                                              // Preds: bb0
+// CHECK: bb2:
 // CHECK:   destroy_value [[COPY]] : $@callee_owned (Builtin.Int32) -> Builtin.Int32
 // CHECK:   destroy_value [[CVT]] : $@callee_owned (Builtin.Int32) -> (Builtin.Int32, @error any Error)
 // CHECK:   br bb3(
@@ -333,6 +333,7 @@ bb2(%e : $Error):
 	br bb3(%r1 : $Builtin.Int32)
 
 bb3(%res : $Builtin.Int32):
+  destroy_value %ne : $@noescape @callee_guaranteed (Builtin.Int32) -> (Builtin.Int32, @error Error)
   destroy_value %conv : $@callee_guaranteed (Builtin.Int32) -> (Builtin.Int32, @error Error)
   return  %res : $Builtin.Int32
 }

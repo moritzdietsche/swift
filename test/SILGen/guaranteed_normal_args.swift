@@ -123,7 +123,7 @@ class KlassWithBuffer {
 
   // This test makes sure that we:
   //
-  // 1. Are able to propagate a +0 value value buffer.k into a +0 value and that
+  // 1. Are able to propagate a +0 value buffer.k into a +0 value and that
   // we then copy that +0 value into a +1 value, before we begin the epilog and
   // then return that value.
   // CHECK-LABEL: sil hidden [ossa] @$ss15KlassWithBufferC03getC14AsNativeObjectBoyF : $@convention(method) (@guaranteed KlassWithBuffer) -> @owned Builtin.NativeObject {
@@ -148,7 +148,7 @@ struct StructContainingBridgeObject {
 
   // CHECK-LABEL: sil hidden [ossa] @$ss28StructContainingBridgeObjectV8swiftObjAByXl_tcfC : $@convention(method) (@owned AnyObject, @thin StructContainingBridgeObject.Type) -> @owned StructContainingBridgeObject {
   // CHECK: bb0([[ARG:%.*]] : @owned $AnyObject,
-  // CHECK:   [[BORROWED_ARG:%.*]] = begin_borrow [lexical] [[ARG]]
+  // CHECK:   [[BORROWED_ARG:%.*]] = begin_borrow [[ARG]]
   // CHECK:   [[COPIED_ARG:%.*]] = copy_value [[BORROWED_ARG]]
   // CHECK:   [[CASTED_ARG:%.*]] = unchecked_ref_cast [[COPIED_ARG]] : $AnyObject to $Builtin.BridgeObject
   // CHECK:   assign [[CASTED_ARG]] to

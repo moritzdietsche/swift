@@ -224,11 +224,6 @@ protected:
       llvm::function_ref<void(GenericTypeParamType *, Type)> substitution =
           [](GenericTypeParamType *, Type) {});
 
-  bool isArrayType(Type type) const {
-    auto &cs = getConstraintSystem();
-    return bool(cs.isArrayType(type));
-  }
-
   bool conformsToKnownProtocol(Type type, KnownProtocolKind protocol) const;
 };
 
@@ -468,6 +463,17 @@ protected:
   DiagAsNote getDiagnosticAsNote() const override {
     return diag::candidate_types_same_shape_requirement;
   }
+};
+
+class SameShapeExpansionFailure final : public FailureDiagnostic {
+  Type lhs, rhs;
+
+public:
+  SameShapeExpansionFailure(const Solution &solution, Type lhs, Type rhs,
+                            ConstraintLocator *locator)
+      : FailureDiagnostic(solution, locator), lhs(lhs), rhs(rhs) {}
+
+  bool diagnoseAsError() override;
 };
 
 /// Diagnose failures related to superclass generic requirements, e.g.
@@ -1244,7 +1250,18 @@ private:
   /// overload to be present, but a class marked as `@dynamicCallable`
   /// defines only `dynamicallyCall(withArguments:)` variant.
   bool diagnoseForDynamicCallable() const;
-  
+
+  /// Diagnose methods that return unsafe projections and suggest fixits.
+  /// For example, if Swift cannot find "vector::data" because it is unsafe, try
+  /// to diagnose this and tell the user why we did not import "vector::data".
+  ///
+  /// Provides fixits for:
+  /// at -> subscript
+  /// begin, end -> makeIterator
+  /// front, back -> first, last
+  void diagnoseUnsafeCxxMethod(SourceLoc loc, ASTNode anchor, Type baseType,
+                               DeclName name) const;
+
   /// Tailored diagnostics for collection literal with unresolved member expression
   /// that defaults the element type. e.g. _ = [.e]
   bool diagnoseInLiteralCollectionContext() const;
@@ -1808,6 +1825,28 @@ class NotCompileTimeConstFailure final : public FailureDiagnostic {
 public:
   NotCompileTimeConstFailure(const Solution &solution, ConstraintLocator *locator)
       : FailureDiagnostic(solution, locator) {}
+
+  bool diagnoseAsError() override;
+};
+
+class NotCopyableFailure final : public FailureDiagnostic {
+  Type noncopyableTy;
+public:
+  NotCopyableFailure(const Solution &solution, Type noncopyableTy, ConstraintLocator *locator)
+      : FailureDiagnostic(solution, locator), noncopyableTy(noncopyableTy) {}
+
+  bool diagnoseAsError() override;
+};
+
+/// Diagnose \c each applied to an expression that is not a pack type.
+class InvalidPackElement final : public FailureDiagnostic {
+  Type packElementType;
+
+public:
+  InvalidPackElement(const Solution &solution, Type packElementType,
+                     ConstraintLocator *locator)
+      : FailureDiagnostic(solution, locator),
+        packElementType(packElementType) {}
 
   bool diagnoseAsError() override;
 };
@@ -2841,6 +2880,44 @@ public:
   }
 
   bool diagnoseAsError() override;
+};
+
+/// Diagnose situations where we end up type checking a reference to a macro
+/// that was not indicated as a missing # in the source.:
+///
+/// \code
+/// func print(_ value: Any)
+/// @expression macro print<Value...>(_ value: Value...)
+///
+/// func test(e: E) {
+///   print(a, b, c) // missing # to use the macro
+/// }
+/// \endcode
+class AddMissingMacroPound final : public FailureDiagnostic {
+  MacroDecl *macro;
+
+public:
+  AddMissingMacroPound(const Solution &solution, MacroDecl *macro,
+                       ConstraintLocator *locator)
+    : FailureDiagnostic(solution, locator),
+      macro(macro) { }
+
+  bool diagnoseAsError() override;
+};
+
+/// Diagnose function types global actor mismatches
+/// e.g.  `@MainActor () -> Void` vs.`@OtherActor () -> Void`
+class GlobalActorFunctionMismatchFailure final : public ContextualFailure {
+public:
+  GlobalActorFunctionMismatchFailure(const Solution &solution, Type fromType,
+                                     Type toType, ConstraintLocator *locator)
+      : ContextualFailure(solution, fromType, toType, locator) {}
+
+  bool diagnoseAsError() override;
+
+private:
+  Diag<Type, Type> getDiagnosticMessage() const;
+  bool diagnoseTupleElement();
 };
 
 } // end namespace constraints

@@ -265,7 +265,7 @@ public:
 
   void setResultType(SILType type) { resultType = type; }
 
-  bool hasResultType() const { return resultType.hasValue(); }
+  bool hasResultType() const { return resultType.has_value(); }
 
   const llvm::MapVector<unsigned, CanType> &getIndirectResultTypes() const {
     return indirectResultTypes;
@@ -893,9 +893,11 @@ void ReabstractionInfo::createSubstitutedAndSpecializedTypes() {
         hasConvertedResilientParams = true;
       }
       break;
-    case ParameterConvention::Indirect_In_Constant:
     case ParameterConvention::Indirect_Inout:
     case ParameterConvention::Indirect_InoutAliasable:
+    case ParameterConvention::Pack_Inout:
+    case ParameterConvention::Pack_Owned:
+    case ParameterConvention::Pack_Guaranteed:
       break;
       
     case ParameterConvention::Direct_Owned:
@@ -2266,9 +2268,17 @@ prepareCallArguments(ApplySite AI, SILBuilder &Builder,
 
     // An argument is converted from indirect to direct. Instead of the
     // address we pass the loaded value.
-    auto argConv = substConv.getSILArgumentConvention(ArgIdx);
+    SILArgumentConvention argConv(SILArgumentConvention::Direct_Unowned);
+    if (auto pai = dyn_cast<PartialApplyInst>(AI)) {
+      // On-stack partial applications borrow their captures, whereas heap
+      // partial applications take ownership.
+      argConv = pai->isOnStack() ? SILArgumentConvention::Direct_Guaranteed
+                                 : SILArgumentConvention::Direct_Owned;
+    } else {
+      argConv = substConv.getSILArgumentConvention(ArgIdx);
+    }
     SILValue Val;
-    if (!argConv.isGuaranteedConvention() || isa<PartialApplyInst>(AI)) {
+    if (!argConv.isGuaranteedConvention()) {
       Val = Builder.emitLoadValueOperation(Loc, InputValue,
                                            LoadOwnershipQualifier::Take);
     } else {
@@ -2337,7 +2347,7 @@ replaceWithSpecializedCallee(ApplySite applySite, SILValue callee,
     SILBasicBlock *resultBlock = tai->getNormalBB();
     assert(resultBlock->getSinglePredecessorBlock() == tai->getParent());
     // First insert the cleanups for our arguments int he appropriate spot.
-    FullApplySite(tai).insertAfterFullEvaluation(
+    FullApplySite(tai).insertAfterApplication(
         [&](SILBuilder &argBuilder) {
           cleanupCallArguments(argBuilder, loc, arguments,
                                argsNeedingEndBorrow);
@@ -2363,7 +2373,7 @@ replaceWithSpecializedCallee(ApplySite applySite, SILValue callee,
   }
   case ApplySiteKind::ApplyInst: {
     auto *ai = cast<ApplyInst>(applySite);
-    FullApplySite(ai).insertAfterFullEvaluation(
+    FullApplySite(ai).insertAfterApplication(
         [&](SILBuilder &argBuilder) {
           cleanupCallArguments(argBuilder, loc, arguments,
                                argsNeedingEndBorrow);
@@ -2400,7 +2410,7 @@ replaceWithSpecializedCallee(ApplySite applySite, SILValue callee,
   case ApplySiteKind::BeginApplyInst: {
     auto *bai = cast<BeginApplyInst>(applySite);
     assert(!resultOut);
-    FullApplySite(bai).insertAfterFullEvaluation(
+    FullApplySite(bai).insertAfterApplication(
         [&](SILBuilder &argBuilder) {
           cleanupCallArguments(argBuilder, loc, arguments,
                                argsNeedingEndBorrow);
@@ -2430,15 +2440,19 @@ replaceWithSpecializedCallee(ApplySite applySite, SILValue callee,
   }
   case ApplySiteKind::PartialApplyInst: {
     auto *pai = cast<PartialApplyInst>(applySite);
+    // Let go of borrows introduced for stack closures.
+    if (pai->isOnStack() && pai->getFunction()->hasOwnership()) {
+      pai->visitOnStackLifetimeEnds([&](Operand *op) -> bool {
+        SILBuilderWithScope argBuilder(op->getUser()->getNextInstruction());
+        cleanupCallArguments(argBuilder, loc, arguments, argsNeedingEndBorrow);
+        return true;
+      });
+    }
     auto *newPAI = builder.createPartialApply(
         loc, callee, subs, arguments,
         pai->getType().getAs<SILFunctionType>()->getCalleeConvention(),
         pai->isOnStack());
-    // When we have a partial apply, we should always perform a load [take].
     pai->replaceAllUsesWith(newPAI);
-    assert(llvm::none_of(arguments,
-                         [](SILValue v) { return isa<LoadBorrowInst>(v); }) &&
-           "Partial apply consumes all of its parameters?!");
     return newPAI;
   }
   }
@@ -2520,7 +2534,7 @@ SILFunction *ReabstractionThunkGenerator::createThunk() {
   SILFunction *Thunk = FunctionBuilder.getOrCreateSharedFunction(
       Loc, ThunkName, ReInfo.getSubstitutedType(), IsBare, IsTransparent,
       ReInfo.isSerialized(), ProfileCounter(), IsThunk, IsNotDynamic,
-      IsNotDistributed);
+      IsNotDistributed, IsNotRuntimeAccessible);
   // Re-use an existing thunk.
   if (!Thunk->empty())
     return Thunk;
@@ -2546,10 +2560,7 @@ SILFunction *ReabstractionThunkGenerator::createThunk() {
     for (auto SpecArg : SpecializedFunc->getArguments()) {
       auto *NewArg = EntryBB->createFunctionArgument(SpecArg->getType(),
                                                      SpecArg->getDecl());
-      NewArg->setNoImplicitCopy(
-          cast<SILFunctionArgument>(SpecArg)->isNoImplicitCopy());
-      NewArg->setLifetimeAnnotation(
-          cast<SILFunctionArgument>(SpecArg)->getLifetimeAnnotation());
+      NewArg->copyFlags(cast<SILFunctionArgument>(SpecArg));
       Arguments.push_back(NewArg);
     }
     FullApplySite ApplySite = createReabstractionThunkApply(Builder);
@@ -2582,7 +2593,7 @@ SILFunction *ReabstractionThunkGenerator::createThunk() {
 
   // Now that we have finished constructing our CFG (note the return above),
   // insert any compensating end borrows that we need.
-  ApplySite.insertAfterFullEvaluation([&](SILBuilder &argBuilder) {
+  ApplySite.insertAfterApplication([&](SILBuilder &argBuilder) {
     cleanupCallArguments(argBuilder, Loc, Arguments, ArgsThatNeedEndBorrow);
   });
 
@@ -2652,6 +2663,8 @@ SILArgument *ReabstractionThunkGenerator::convertReabstractionThunkArguments(
         cast<SILFunctionArgument>(SpecArg)->isNoImplicitCopy());
     NewArg->setLifetimeAnnotation(
         cast<SILFunctionArgument>(SpecArg)->getLifetimeAnnotation());
+    NewArg->setClosureCapture(
+        cast<SILFunctionArgument>(SpecArg)->isClosureCapture());
     Arguments.push_back(NewArg);
   };
   // ReInfo.NumIndirectResults corresponds to SubstTy's formal indirect
@@ -2697,6 +2710,8 @@ SILArgument *ReabstractionThunkGenerator::convertReabstractionThunkArguments(
           cast<SILFunctionArgument>(SpecArg)->isNoImplicitCopy());
       NewArg->setLifetimeAnnotation(
           cast<SILFunctionArgument>(SpecArg)->getLifetimeAnnotation());
+      NewArg->setClosureCapture(
+          cast<SILFunctionArgument>(SpecArg)->isClosureCapture());
       if (!NewArg->getArgumentConvention().isGuaranteedConvention()) {
         SILValue argVal = Builder.emitLoadValueOperation(
             Loc, NewArg, LoadOwnershipQualifier::Take);
@@ -2881,8 +2896,9 @@ bool usePrespecialized(
 
         if (!erased || !layout || !layout->isClass()) {
           newSubs.push_back(entry.value());
-        } else if (!entry.value()->isAnyClassReferenceType()) {
-          // non-reference type can't be applied
+        } else if (!entry.value()->isAnyClassReferenceType() ||
+                   entry.value()->isAnyExistentialType()) {
+          // non-reference or existential type can't be applied
           break;
         } else if (!specializedSig->getRequiredProtocols(genericParam)
                         .empty()) {

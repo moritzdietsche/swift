@@ -84,8 +84,8 @@ static bool isTargetTooNew(const llvm::Triple &moduleTarget,
     moduleTarget.getMacOSXVersion(osVersion);
     // TODO: Add isMacOSXVersionLT(Triple) API (or taking a VersionTuple)
     return ctxTarget.isMacOSXVersionLT(osVersion.getMajor(),
-                                       osVersion.getMinor().getValueOr(0),
-                                       osVersion.getSubminor().getValueOr(0));
+                                       osVersion.getMinor().value_or(0),
+                                       osVersion.getSubminor().value_or(0));
   }
   return ctxTarget.isOSVersionLT(moduleTarget);
 }
@@ -208,6 +208,10 @@ Status ModuleFile::associateWithFileContext(FileUnit *file, SourceLoc diagLoc,
       // available.
       continue;
     }
+
+    if (dependency.isPackageOnly() &&
+        ctx.LangOpts.PackageName != this->getModulePackageName())
+      continue;
 
     ImportPath::Builder builder(ctx, dependency.Core.RawPath,
                                 /*separator=*/'\0');
@@ -356,9 +360,9 @@ ModuleFile::getModuleName(ASTContext &Ctx, StringRef modulePath,
   std::shared_ptr<const ModuleFileSharedCore> loadedModuleFile;
   bool isFramework = false;
   serialization::ValidationInfo loadInfo = ModuleFileSharedCore::load(
-      modulePath.str(), std::move(newBuf), nullptr, nullptr,
-      /*isFramework*/ isFramework, Ctx.SILOpts.EnableOSSAModules, Ctx.LangOpts.SDKName,
-      Ctx.SearchPathOpts.DeserializedPathRecoverer,
+      "", "", std::move(newBuf), nullptr, nullptr,
+      /*isFramework=*/isFramework, Ctx.SILOpts.EnableOSSAModules,
+      Ctx.LangOpts.SDKName, Ctx.SearchPathOpts.DeserializedPathRecoverer,
       loadedModuleFile);
   Name = loadedModuleFile->Name.str();
   return std::move(moduleBuf.get());
@@ -508,7 +512,7 @@ void ModuleFile::getImportDecls(SmallVectorImpl<Decl *> &Results) {
               TopLevelModule, DeclNameRef(ScopeID),
               NL_QualifiedDefault, Decls);
           Optional<ImportKind> FoundKind = ImportDecl::findBestImportKind(Decls);
-          assert(FoundKind.hasValue() &&
+          assert(FoundKind.has_value() &&
                  "deserialized imports should not be ambiguous");
           Kind = *FoundKind;
         }
@@ -711,11 +715,13 @@ ModuleFile::loadNamedMembers(const IterableDeclContext *IDC, DeclBaseName N,
     DeclMembersTables[subTableOffset];
   if (!subTable) {
     BCOffsetRAII restoreOffset(DeclMemberTablesCursor);
-    fatalIfNotSuccess(DeclMemberTablesCursor.JumpToBit(subTableOffset));
+    if (diagnoseFatalIfNotSuccess(
+            DeclMemberTablesCursor.JumpToBit(subTableOffset)))
+      return results;
     llvm::BitstreamEntry entry =
         fatalIfUnexpected(DeclMemberTablesCursor.advance());
     if (entry.Kind != llvm::BitstreamEntry::Record) {
-      fatal();
+      diagnoseAndConsumeFatal();
       return results;
     }
     SmallVector<uint64_t, 64> scratch;
@@ -883,21 +889,14 @@ void ModuleFile::lookupObjCMethods(
   auto found = *known;
   for (const auto &result : found) {
     // Deserialize the method and add it to the list.
-    if (auto func = dyn_cast_or_null<AbstractFunctionDecl>(
-                      getDecl(std::get<2>(result))))
-      results.push_back(func);
-  }
-}
-
-void ModuleFile::lookupImportedSPIGroups(
-                        const ModuleDecl *importedModule,
-                        llvm::SmallSetVector<Identifier, 4> &spiGroups) const {
-  for (auto &dep : Dependencies) {
-    auto depSpis = dep.spiGroups;
-    if (dep.Import.hasValue() && dep.Import->importedModule == importedModule &&
-        !depSpis.empty()) {
-      spiGroups.insert(depSpis.begin(), depSpis.end());
+    auto declOrError = getDeclChecked(std::get<2>(result));
+    if (!declOrError) {
+        consumeError(declOrError.takeError());
+        continue;
     }
+
+    if (auto func = dyn_cast_or_null<AbstractFunctionDecl>(declOrError.get()))
+      results.push_back(func);
   }
 }
 
@@ -1079,8 +1078,8 @@ void ModuleFile::collectBasicSourceFileInfo(
       abort();
     }
     callback(BasicSourceFileInfo(filePath,
-                                 fingerprintIncludingTypeMembers.getValue(),
-                                 fingerprintExcludingTypeMembers.getValue(),
+                                 fingerprintIncludingTypeMembers.value(),
+                                 fingerprintExcludingTypeMembers.value(),
                                  llvm::sys::TimePoint<>(std::chrono::nanoseconds(timestamp)),
                                  fileSize));
   }
@@ -1205,29 +1204,29 @@ Optional<StringRef> ModuleFile::getSourceFileNameById(unsigned Id) const {
 
 Optional<StringRef> ModuleFile::getGroupNameForDecl(const Decl *D) const {
   auto Triple = getCommentForDecl(D);
-  if (!Triple.hasValue()) {
+  if (!Triple.has_value()) {
     return None;
   }
-  return getGroupNameById(Triple.getValue().Group);
+  return getGroupNameById(Triple.value().Group);
 }
 
 
 Optional<StringRef>
 ModuleFile::getSourceFileNameForDecl(const Decl *D) const {
   auto Triple = getCommentForDecl(D);
-  if (!Triple.hasValue()) {
+  if (!Triple.has_value()) {
     return None;
   }
-  return getSourceFileNameById(Triple.getValue().Group);
+  return getSourceFileNameById(Triple.value().Group);
 }
 
 Optional<unsigned>
 ModuleFile::getSourceOrderForDecl(const Decl *D) const {
   auto Triple = getCommentForDecl(D);
-  if (!Triple.hasValue()) {
+  if (!Triple.has_value()) {
     return None;
   }
-  return Triple.getValue().SourceOrder;
+  return Triple.value().SourceOrder;
 }
 
 void ModuleFile::collectAllGroups(SmallVectorImpl<StringRef> &Names) const {
@@ -1276,7 +1275,7 @@ ModuleFile::getCommentForDeclByUSR(StringRef USR) const {
 Optional<StringRef>
 ModuleFile::getGroupNameByUSR(StringRef USR) const {
   if (auto Comment = getCommentForDeclByUSR(USR)) {
-    return getGroupNameById(Comment.getValue().Group);
+    return getGroupNameById(Comment.value().Group);
   }
   return None;
 }
@@ -1328,4 +1327,11 @@ StringRef SerializedASTFile::getModuleDefiningPath() const {
     return parentDir;
 
   return moduleFilename;
+}
+
+StringRef SerializedASTFile::getExportedModuleName() const {
+  auto name = File.getModuleExportAsName();
+  if (!name.empty())
+    return name;
+  return FileUnit::getExportedModuleName();
 }

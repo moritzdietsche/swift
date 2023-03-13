@@ -23,8 +23,8 @@
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/Basic/Platform.h"
 #include "swift/IRGen/Linking.h"
-#include "swift/Reflection/MetadataSourceBuilder.h"
-#include "swift/Reflection/Records.h"
+#include "swift/RemoteInspection/MetadataSourceBuilder.h"
+#include "swift/RemoteInspection/Records.h"
 #include "swift/SIL/SILModule.h"
 
 #include "ConstantBuilder.h"
@@ -1166,7 +1166,7 @@ public:
 
   /// Give up if we captured an opened existential type. Eventually we
   /// should figure out how to represent this.
-  static bool hasOpenedExistential(CanSILFunctionType OrigCalleeType,
+  static bool hasLocalArchetype(CanSILFunctionType OrigCalleeType,
                                    const HeapLayout &Layout) {
     if (!OrigCalleeType->isPolymorphic() ||
         OrigCalleeType->isPseudogeneric())
@@ -1174,11 +1174,13 @@ public:
 
     auto &Bindings = Layout.getBindings();
     for (unsigned i = 0; i < Bindings.size(); ++i) {
-      // Skip protocol requirements (FIXME: for now?)
-      if (Bindings[i].Protocol != nullptr)
+      // Skip protocol requirements and counts.  It shouldn't be possible
+      // to get an opened existential type in a conformance requirement
+      // without having one in the generic arguments.
+      if (!Bindings[i].isAnyMetadata())
         continue;
 
-      if (Bindings[i].TypeParameter->hasOpenedExistential())
+      if (Bindings[i].getTypeParameter()->hasLocalArchetype())
         return true;
     }
 
@@ -1186,7 +1188,7 @@ public:
         Layout.getElementTypes().slice(Layout.getIndexAfterBindings());
     for (auto ElementType : ElementTypes) {
       auto SwiftType = ElementType.getASTType();
-      if (SwiftType->hasOpenedExistential())
+      if (SwiftType->hasLocalArchetype())
         return true;
     }
 
@@ -1219,11 +1221,14 @@ public:
     auto &Bindings = Layout.getBindings();
     for (unsigned i = 0; i < Bindings.size(); ++i) {
       // Skip protocol requirements (FIXME: for now?)
-      if (Bindings[i].Protocol != nullptr)
+      if (Bindings[i].isAnyWitnessTable())
         continue;
 
+      // FIXME: bind pack counts in the source map
+      assert(Bindings[i].isAnyMetadata());
+
       auto Source = SourceBuilder.createClosureBinding(i);
-      auto BindingType = Bindings[i].TypeParameter;
+      auto BindingType = Bindings[i].getTypeParameter();
       auto InterfaceType = BindingType->mapTypeOutOfContext();
       SourceMap.push_back({InterfaceType->getCanonicalType(), Source});
     }
@@ -1445,7 +1450,7 @@ IRGenModule::getAddrOfCaptureDescriptor(SILFunction &Caller,
   if (IRGen.Opts.ReflectionMetadata != ReflectionMetadataMode::Runtime)
     return llvm::Constant::getNullValue(CaptureDescriptorPtrTy);
 
-  if (CaptureDescriptorBuilder::hasOpenedExistential(OrigCalleeType, Layout))
+  if (CaptureDescriptorBuilder::hasLocalArchetype(OrigCalleeType, Layout))
     return llvm::Constant::getNullValue(CaptureDescriptorPtrTy);
 
   CaptureDescriptorBuilder builder(*this,

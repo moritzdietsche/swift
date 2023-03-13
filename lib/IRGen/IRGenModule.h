@@ -96,7 +96,7 @@ namespace swift {
   class BraceStmt;
   class CanType;
   class GeneratedModule;
-  struct GenericRequirement;
+  class GenericRequirement;
   class LinkLibrary;
   class SILFunction;
   class IRGenOptions;
@@ -104,6 +104,7 @@ namespace swift {
   class ProtocolConformance;
   class ProtocolCompositionType;
   class RootProtocolConformance;
+  class SILCoverageMap;
   struct SILDeclRef;
   class SILDefaultWitnessTable;
   class SILDifferentiabilityWitness;
@@ -350,11 +351,7 @@ public:
   void addGenModule(SourceFile *SF, IRGenModule *IGM);
   
   /// Get an IRGenModule for a source file.
-  IRGenModule *getGenModule(SourceFile *SF) {
-    IRGenModule *IGM = GenModules[SF];
-    assert(IGM);
-    return IGM;
-  }
+  IRGenModule *getGenModule(SourceFile *SF);
 
   SourceFile *getSourceFile(IRGenModule *module) {
     for (auto pair : GenModules) {
@@ -698,7 +695,9 @@ public:
   llvm::StructType *FullBoxMetadataStructTy; /// %swift.full_boxmetadata = type { ... }
   llvm::PointerType *FullBoxMetadataPtrTy;/// %swift.full_boxmetadata*
   llvm::StructType *FullTypeMetadataStructTy; /// %swift.full_type = type { ... }
+  llvm::StructType *FullExistentialTypeMetadataStructTy; /// %swift.full_existential_type = type { ... }
   llvm::PointerType *FullTypeMetadataPtrTy;/// %swift.full_type*
+  llvm::StructType *FullForeignTypeMetadataStructTy; /// %swift.full_foreign_type = type { ... }
   llvm::StructType *ProtocolDescriptorStructTy; /// %swift.protocol = type { ... }
   llvm::PointerType *ProtocolDescriptorPtrTy; /// %swift.protocol*
   llvm::StructType *ProtocolRequirementStructTy; /// %swift.protocol_requirement
@@ -773,6 +772,8 @@ public:
   llvm::PointerType *ContinuationAsyncContextPtrTy;
   llvm::StructType *ClassMetadataBaseOffsetTy;
   llvm::StructType *DifferentiabilityWitnessTy; // { i8*, i8* }
+
+  llvm::StructType *RuntimeDiscoverableAttributeTy; // { i32, i32*, i32 }
 
   llvm::GlobalVariable *TheTrivialPropertyDescriptor = nullptr;
 
@@ -956,9 +957,17 @@ private:
   // emitted.
   llvm::DenseMap<llvm::GlobalVariable*, llvm::CallInst*> AsyncCoroIDsForPadding;
 
+  /// The personality function used for foreign exception handling in this
+  /// module.
+  llvm::Function *foreignExceptionHandlingPersonalityFunc = nullptr;
+
+public:
+  /// The set of emitted foreign function thunks that trap on exception in the
+  /// underlying call that the thunk dispatches.
+  llvm::SmallPtrSet<llvm::Function *, 4>
+      emittedForeignFunctionThunksWithExceptionTraps;
 
 //--- Types -----------------------------------------------------------------
-public:
   const ProtocolInfo &getProtocolInfo(ProtocolDecl *D, ProtocolInfoKind kind);
 
   // Not strictly a type operation, but similar.
@@ -1005,7 +1014,8 @@ public:
   clang::CanQual<clang::Type> getClangType(SILParameterInfo param,
                                            CanSILFunctionType funcTy);
 
-  const TypeLayoutEntry &getTypeLayoutEntry(SILType T);
+  const TypeLayoutEntry
+  &getTypeLayoutEntry(SILType T, bool useStructLayouts);
 
   const clang::ASTContext &getClangASTContext() {
     assert(ClangASTContext &&
@@ -1233,8 +1243,12 @@ private:
   SmallVector<ProtocolDecl *, 4> SwiftProtocols;
   /// List of protocol conformances to generate descriptors for.
   std::vector<ConformanceDescription> ProtocolConformances;
-  /// List of types to generate runtime-resolvable metadata records for.
+  /// List of types to generate runtime-resolvable metadata records for that
+  /// are consumable for any Swift runtime.
   SmallVector<GenericTypeDecl *, 4> RuntimeResolvableTypes;
+  /// List of types to generate runtime-resolvable metadata records for that
+  /// are consumable for any Swift runtime aware of noncopyable types.
+  SmallVector<GenericTypeDecl *, 4> RuntimeResolvableTypes2;
   /// List of ExtensionDecls corresponding to the generated
   /// categories.
   SmallVector<ExtensionDecl*, 4> ObjCCategoryDecls;
@@ -1481,7 +1495,7 @@ public:
   void maybeEmitOpaqueTypeDecl(OpaqueTypeDecl *D);
 
   void emitSILGlobalVariable(SILGlobalVariable *gv);
-  void emitCoverageMapping();
+  void emitCoverageMaps(ArrayRef<const SILCoverageMap *> Mappings);
   void emitSILFunction(SILFunction *f);
   void emitSILWitnessTable(SILWitnessTable *wt);
   void emitSILProperty(SILProperty *prop);
@@ -1491,12 +1505,18 @@ public:
   void emitProtocolConformance(const ConformanceDescription &record);
   void emitNestedTypeDecls(DeclRange members);
   void emitClangDecl(const clang::Decl *decl);
+  /// Emit runtime discoverable attribute metadata section for the given set
+  /// of source files.
+  void
+  emitRuntimeDiscoverableAttributes(TinyPtrVector<FileUnit *> &filesToEmit);
+
   void finalizeClangCodeGen();
   void finishEmitAfterTopLevel();
 
   Signature getSignature(CanSILFunctionType fnType);
   Signature getSignature(CanSILFunctionType fnType,
-                         FunctionPointerKind kind);
+                         FunctionPointerKind kind,
+                         bool forStaticCall = false);
   llvm::FunctionType *getFunctionType(CanSILFunctionType type,
                                       llvm::AttributeList &attrs,
                                       ForeignFunctionInfo *foreignInfo=nullptr);
@@ -1571,6 +1591,9 @@ public:
                                       llvm::Constant *dependsOn);
   void appendLLVMUsedConditionalEntry(llvm::GlobalVariable *var,
                                       const ProtocolConformance *conformance);
+
+  void setColocateMetadataSection(llvm::Function *f);
+  void setColocateTypeDescriptorSection(llvm::GlobalVariable *v);
 
   llvm::Constant *
   getAddrOfTypeMetadata(CanType concreteType,
@@ -1726,6 +1749,8 @@ public:
 
   void emitDistributedTargetAccessor(SILFunction *method);
 
+  llvm::Constant *getAddrOfAccessibleFunctionRecord(SILFunction *accessibleFn);
+
   /// Retrieve the generic signature for the current generic context, or null if no
   /// generic environment is active.
   CanGenericSignature getCurGenericContext();
@@ -1737,6 +1762,14 @@ public:
 
   ConstantReference
   getAddrOfLLVMVariableOrGOTEquivalent(LinkEntity entity);
+
+  llvm::Constant *getAddrOfLLVMVariable(LinkEntity entity,
+                                        ConstantInit definition,
+                                        DebugTypeInfo debugType,
+                                        llvm::Type *overrideDeclType = nullptr);
+  llvm::Constant *getAddrOfLLVMVariable(LinkEntity entity,
+                                        ForDefinition_t forDefinition,
+                                        DebugTypeInfo debugType);
 
   llvm::Constant *emitRelativeReference(ConstantReference target,
                                         llvm::GlobalValue *base,
@@ -1785,19 +1818,16 @@ public:
   /// run on the SIL module that owns this function.
   void lowerSILFunction(SILFunction *f);
 
+  llvm::Function *getForeignExceptionHandlingPersonalityFunc();
+
+  bool isForeignExceptionHandlingEnabled() const;
+
 private:
   llvm::Constant *
   getAddrOfSharedContextDescriptor(LinkEntity entity,
                                    ConstantInit definition,
                                    llvm::function_ref<void()> emit);
-  
-  llvm::Constant *getAddrOfLLVMVariable(LinkEntity entity,
-                                        ConstantInit definition,
-                                        DebugTypeInfo debugType,
-                                        llvm::Type *overrideDeclType = nullptr);
-  llvm::Constant *getAddrOfLLVMVariable(LinkEntity entity,
-                                        ForDefinition_t forDefinition,
-                                        DebugTypeInfo debugType);
+
   ConstantReference getAddrOfLLVMVariable(LinkEntity entity,
                                         ConstantInit definition,
                                         DebugTypeInfo debugType,
@@ -1826,6 +1856,7 @@ public:
   void emitRuntimeRegistration();
   void emitVTableStubs();
   void emitTypeVerifier();
+  llvm::Function *emitHasSymbolFunction(ValueDecl *decl);
 
   /// Create llvm metadata which encodes the branch weights given by
   /// \p TrueCount and \p FalseCount.

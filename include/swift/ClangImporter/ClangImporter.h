@@ -17,6 +17,7 @@
 #define SWIFT_CLANG_IMPORTER_H
 
 #include "swift/AST/ClangModuleLoader.h"
+#include "llvm/Support/VirtualFileSystem.h"
 
 /// The maximum number of SIMD vector elements we currently try to import.
 #define SWIFT_MAX_IMPORTED_SIMD_ELEMENTS 4
@@ -50,7 +51,8 @@ namespace clang {
   class CompilerInvocation;
 namespace tooling {
 namespace dependencies {
-  struct FullDependenciesResult;
+  struct ModuleDeps;
+  using ModuleDepsGraph = std::vector<ModuleDeps>;
 }
 }
 }
@@ -275,6 +277,8 @@ public:
   ConcreteDeclRef getCXXFunctionTemplateSpecialization(
           SubstitutionMap subst, ValueDecl *decl) override;
 
+  FuncDecl *getCXXSynthesizedOperatorFunc(FuncDecl *decl);
+
   /// Just like Decl::getClangNode() except we look through to the 'Code'
   /// enum of an error wrapper struct.
   ClangNode getEffectiveClangNode(const Decl *decl) const;
@@ -419,9 +423,9 @@ public:
 
   void recordModuleDependencies(
       ModuleDependenciesCache &cache,
-      const clang::tooling::dependencies::FullDependenciesResult &clangDependencies);
+      const clang::tooling::dependencies::ModuleDepsGraph &clangDependencies);
 
-  Optional<ModuleDependencies> getModuleDependencies(
+  Optional<const ModuleDependencyInfo*> getModuleDependencies(
       StringRef moduleName, ModuleDependenciesCache &cache,
       InterfaceSubContextDelegate &delegate) override;
 
@@ -437,7 +441,7 @@ public:
   /// \returns \c true if an error occurred, \c false otherwise
   bool addBridgingHeaderDependencies(
       StringRef moduleName,
-      ModuleDependenciesKind moduleKind,
+      ModuleDependencyKind moduleKind,
       ModuleDependenciesCache &cache);
 
   clang::TargetInfo &getTargetInfo() const override;
@@ -553,6 +557,9 @@ public:
   /// Emit diagnostics for declarations named name that are members
   /// of the provided baseType.
   void diagnoseMemberValue(const DeclName &name, const Type &baseType) override;
+
+  /// Enable the symbolic import experimental feature for the given callback.
+  void withSymbolicFeatureEnabled(llvm::function_ref<void(void)> callback);
 };
 
 ImportDecl *createImportDecl(ASTContext &Ctx, DeclContext *DC, ClangNode ClangN,
@@ -566,6 +573,25 @@ getModuleCachePathFromClang(const clang::CompilerInstance &Instance);
 
 /// Whether the given parameter name identifies a completion handler.
 bool isCompletionHandlerParamName(StringRef paramName);
+
+namespace importer {
+
+/// Returns true if the given module has a 'cplusplus' requirement.
+bool requiresCPlusPlus(const clang::Module *module);
+
+} // namespace importer
+
+struct ClangInvocationFileMapping {
+  SmallVector<std::pair<std::string, std::string>, 2> redirectedFiles;
+  SmallVector<std::pair<std::string, std::string>, 1> overridenFiles;
+};
+
+/// On Linux, some platform libraries (glibc, libstdc++) are not modularized.
+/// We inject modulemaps for those libraries into their include directories
+/// to allow using them from Swift.
+ClangInvocationFileMapping getClangInvocationFileMapping(
+    ASTContext &ctx,
+    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> vfs = nullptr);
 
 } // end namespace swift
 

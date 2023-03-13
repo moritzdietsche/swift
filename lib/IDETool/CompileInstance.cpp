@@ -189,7 +189,17 @@ void retypeCheckFunctionBody(AbstractFunctionDecl *func,
   SourceRange newRange{rangeStartLoc, rangeEndLoc};
 
   // Reset the body range of the function decl, and re-typecheck it.
-  origSM.setReplacedRange(func->getOriginalBodySourceRange(), newRange);
+  origSM.setGeneratedSourceInfo(
+      sliceBufferID,
+      GeneratedSourceInfo{
+        GeneratedSourceInfo::ReplacedFunctionBody,
+        Lexer::getCharSourceRangeFromSourceRange(
+          origSM, func->getOriginalBodySourceRange()),
+        Lexer::getCharSourceRangeFromSourceRange(origSM, newRange),
+        func,
+        nullptr
+      }
+  );
   func->setBodyToBeReparsed(newRange);
   (void)func->getTypecheckedBody();
 }

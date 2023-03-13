@@ -3,11 +3,13 @@
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTNode.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/DiagnosticsCommon.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/GenericParamList.h"
 #include "swift/AST/Identifier.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/Pattern.h"
+#include "swift/AST/PluginRegistry.h"
 #include "swift/AST/Stmt.h"
 #include "swift/AST/TypeRepr.h"
 
@@ -18,9 +20,99 @@ inline llvm::ArrayRef<T> getArrayRef(BridgedArrayRef bridged) {
   return {static_cast<const T *>(bridged.data), size_t(bridged.numElements)};
 }
 
-static SourceLoc getSourceLocFromPointer(void *loc) {
+static SourceLoc getSourceLocFromPointer(const void *loc) {
   auto smLoc = llvm::SMLoc::getFromPointer((const char *)loc);
   return SourceLoc(smLoc);
+}
+
+namespace {
+  struct BridgedDiagnosticImpl {
+    InFlightDiagnostic inFlight;
+    std::vector<StringRef> textBlobs;
+
+    BridgedDiagnosticImpl(const BridgedDiagnosticImpl&) = delete;
+    BridgedDiagnosticImpl(BridgedDiagnosticImpl &&) = delete;
+    BridgedDiagnosticImpl &operator=(const BridgedDiagnosticImpl&) = delete;
+    BridgedDiagnosticImpl &operator=(BridgedDiagnosticImpl &&) = delete;
+
+    ~BridgedDiagnosticImpl() {
+      inFlight.flush();
+      for (auto text: textBlobs) {
+        free((void*)text.data());
+      }
+    }
+  };
+}
+
+BridgedDiagnostic SwiftDiagnostic_create(
+    void *diagnosticEngine, BridgedDiagnosticSeverity severity,
+    const void *sourceLocPtr,
+    const uint8_t *textPtr, long textLen
+) {
+  StringRef origText{
+    reinterpret_cast<const char *>(textPtr), size_t(textLen)};
+  llvm::MallocAllocator mallocAlloc;
+  StringRef text = origText.copy(mallocAlloc);
+
+  SourceLoc loc = getSourceLocFromPointer(sourceLocPtr);
+
+  Diag<StringRef> diagID;
+  switch (severity) {
+  case BridgedDiagnosticSeverity::BridgedError:
+    diagID = diag::bridged_error;
+    break;
+  case BridgedDiagnosticSeverity::BridgedFatalError:
+    diagID = diag::bridged_fatal_error;
+    break;
+  case BridgedDiagnosticSeverity::BridgedNote:
+    diagID = diag::bridged_note;
+    break;
+  case BridgedDiagnosticSeverity::BridgedRemark:
+    diagID = diag::bridged_remark;
+    break;
+  case BridgedDiagnosticSeverity::BridgedWarning:
+    diagID = diag::bridged_warning;
+    break;
+  }
+
+  DiagnosticEngine &diags = *static_cast<DiagnosticEngine *>(diagnosticEngine);
+  return new BridgedDiagnosticImpl{diags.diagnose(loc, diagID, text), {text}};
+}
+
+/// Highlight a source range as part of the diagnostic.
+void SwiftDiagnostic_highlight(
+    BridgedDiagnostic diagPtr, const void *startLocPtr, const void *endLocPtr
+) {
+  SourceLoc startLoc = getSourceLocFromPointer(startLocPtr);
+  SourceLoc endLoc = getSourceLocFromPointer(endLocPtr);
+
+  BridgedDiagnosticImpl *impl = static_cast<BridgedDiagnosticImpl *>(diagPtr);
+  impl->inFlight.highlightChars(startLoc, endLoc);
+}
+
+/// Add a Fix-It to replace a source range as part of the diagnostic.
+void SwiftDiagnostic_fixItReplace(
+    BridgedDiagnostic diagPtr,
+    const void *replaceStartLocPtr, const void *replaceEndLocPtr,
+    const uint8_t *newTextPtr, long newTextLen) {
+
+  SourceLoc startLoc = getSourceLocFromPointer(replaceStartLocPtr);
+  SourceLoc endLoc = getSourceLocFromPointer(replaceEndLocPtr);
+
+  StringRef origReplaceText{
+    reinterpret_cast<const char *>(newTextPtr), size_t(newTextLen)};
+  llvm::MallocAllocator mallocAlloc;
+  StringRef replaceText = origReplaceText.copy(mallocAlloc);
+
+  BridgedDiagnosticImpl *impl = static_cast<BridgedDiagnosticImpl *>(diagPtr);
+  impl->textBlobs.push_back(replaceText);
+  impl->inFlight.fixItReplaceChars(startLoc, endLoc, replaceText);
+}
+
+/// Finish the given diagnostic and emit it.
+void SwiftDiagnostic_finish(BridgedDiagnostic diagPtr) {
+  BridgedDiagnosticImpl *impl = static_cast<BridgedDiagnosticImpl *>(diagPtr);
+  delete impl;
 }
 
 BridgedIdentifier SwiftASTContext_getIdentifier(void *ctx,
@@ -87,10 +179,14 @@ void *SwiftSequenceExpr_create(void *ctx, BridgedArrayRef exprs) {
 }
 
 void *SwiftTupleExpr_create(void *ctx, void *lparen, BridgedArrayRef subs,
+                            BridgedArrayRef names,
+                            BridgedArrayRef nameLocs,
                             void *rparen) {
+  auto &Context = *static_cast<ASTContext *>(ctx);
   return TupleExpr::create(
-      *static_cast<ASTContext *>(ctx), getSourceLocFromPointer(lparen),
-      getArrayRef<Expr *>(subs), {}, {}, getSourceLocFromPointer(rparen),
+      Context, getSourceLocFromPointer(lparen),
+      getArrayRef<Expr *>(subs), getArrayRef<Identifier>(names),
+      getArrayRef<SourceLoc>(nameLocs), getSourceLocFromPointer(rparen),
       /*Implicit*/ false);
 }
 
@@ -165,6 +261,13 @@ void *SwiftVarDecl_create(void *ctx, BridgedIdentifier _Nullable nameId,
       isStatic ? StaticSpellingKind::KeywordStatic : StaticSpellingKind::None,
       sourceLoc, pattern, sourceLoc, (Expr *)initExpr,
       reinterpret_cast<DeclContext *>(dc));
+}
+
+void *SingleValueStmtExpr_createWithWrappedBranches(void *_ctx, void *S,
+                                                    void *DC, bool mustBeExpr) {
+  auto &ctx = *static_cast<ASTContext *>(_ctx);
+  return SingleValueStmtExpr::createWithWrappedBranches(
+      ctx, (Stmt *)S, (DeclContext *)DC, mustBeExpr);
 }
 
 void *IfStmt_create(void *ctx, void *ifLoc, void *cond, void *_Nullable then,
@@ -291,7 +394,7 @@ void *ClosureExpr_create(void *ctx, void *body, void *dc) {
 
   auto *out = new (Context)
       ClosureExpr(attributes, bracketRange, nullptr, nullptr, asyncLoc,
-                  throwsLoc, arrowLoc, inLoc, nullptr, 0, (DeclContext *)dc);
+                  throwsLoc, arrowLoc, inLoc, nullptr, (DeclContext *)dc);
   out->setBody((BraceStmt *)body, true);
   out->setParameterList(params);
   return (Expr *)out;
@@ -372,10 +475,10 @@ void *ProtocolTypeRepr_create(void *ctx, void *baseType, void *protoLoc) {
   return new (Context) ProtocolTypeRepr((TypeRepr *)baseType, protocolLoc);
 }
 
-void *PackExpansionTypeRepr_create(void *ctx, void *base, void *ellipsisLoc) {
+void *PackExpansionTypeRepr_create(void *ctx, void *base, void *repeatLoc) {
   ASTContext &Context = *static_cast<ASTContext *>(ctx);
   return new (Context) PackExpansionTypeRepr(
-      (TypeRepr *)base, getSourceLocFromPointer(ellipsisLoc));
+      getSourceLocFromPointer(repeatLoc), (TypeRepr *)base);
 }
 
 void *TupleTypeRepr_create(void *ctx, BridgedArrayRef elements, void *lParenLoc,
@@ -403,10 +506,13 @@ void *TupleTypeRepr_create(void *ctx, BridgedArrayRef elements, void *lParenLoc,
                                SourceRange{lParen, rParen});
 }
 
-void *IdentTypeRepr_create(void *ctx, BridgedArrayRef components) {
+void *MemberTypeRepr_create(void *ctx, void *baseComponent,
+                            BridgedArrayRef bridgedMemberComponents) {
   ASTContext &Context = *static_cast<ASTContext *>(ctx);
-  return IdentTypeRepr::create(
-      Context, getArrayRef<ComponentIdentTypeRepr *>(components));
+  auto memberComponents = getArrayRef<IdentTypeRepr *>(bridgedMemberComponents);
+
+  return MemberTypeRepr::create(Context, (TypeRepr *)baseComponent,
+                                memberComponents);
 }
 
 void *CompositionTypeRepr_create(void *ctx, BridgedArrayRef types,
@@ -473,12 +579,12 @@ void *GenericParamList_create(void *ctx, void *lAngleLoc,
 
 void *GenericTypeParamDecl_create(void *ctx, void *declContext,
                                   BridgedIdentifier name, void *nameLoc,
-                                  void *_Nullable ellipsisLoc, long index,
+                                  void *_Nullable eachLoc, long index,
                                   bool isParameterPack) {
   return GenericTypeParamDecl::createParsed(
       static_cast<DeclContext *>(declContext),
       Identifier::getFromOpaquePointer(name), getSourceLocFromPointer(nameLoc),
-      getSourceLocFromPointer(ellipsisLoc),
+      getSourceLocFromPointer(eachLoc),
       /*index*/ index, isParameterPack);
 }
 
@@ -505,6 +611,9 @@ void TypeAliasDecl_setUnderlyingTypeRepr(void *decl, void *underlyingType) {
   ((TypeAliasDecl *)decl)->setUnderlyingTypeRepr((TypeRepr *)underlyingType);
 }
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
 void TopLevelCodeDecl_dump(void *decl) {
   ((TopLevelCodeDecl *)decl)->dump(llvm::errs());
 }
@@ -513,3 +622,63 @@ void Expr_dump(void *expr) { ((Expr *)expr)->dump(llvm::errs()); }
 void Decl_dump(void *expr) { ((Decl *)expr)->dump(llvm::errs()); }
 void Stmt_dump(void *expr) { ((Stmt *)expr)->dump(llvm::errs()); }
 void Type_dump(void *expr) { ((TypeRepr *)expr)->dump(); }
+
+#pragma clang diagnostic pop
+
+//===----------------------------------------------------------------------===//
+// Plugins
+//===----------------------------------------------------------------------===//
+
+PluginCapabilityPtr Plugin_getCapability(PluginHandle handle) {
+  auto *plugin = static_cast<LoadedExecutablePlugin *>(handle);
+  return plugin->getCapability();
+}
+
+void Plugin_setCapability(PluginHandle handle, PluginCapabilityPtr data) {
+  auto *plugin = static_cast<LoadedExecutablePlugin *>(handle);
+  plugin->setCapability(data);
+}
+
+void Plugin_lock(PluginHandle handle) {
+  auto *plugin = static_cast<LoadedExecutablePlugin *>(handle);
+  plugin->lock();
+}
+
+void Plugin_unlock(PluginHandle handle) {
+  auto *plugin = static_cast<LoadedExecutablePlugin *>(handle);
+  plugin->unlock();
+}
+
+bool Plugin_sendMessage(PluginHandle handle, const BridgedData data) {
+  auto *plugin = static_cast<LoadedExecutablePlugin *>(handle);
+  StringRef message(data.baseAddress, data.size);
+  auto error = plugin->sendMessage(message);
+  if (error) {
+    // FIXME: Pass the error message back to the caller.
+    llvm::consumeError(std::move(error));
+//    llvm::handleAllErrors(std::move(error), [](const llvm::ErrorInfoBase &err) {
+//      llvm::errs() << err.message() << "\n";
+//    });
+    return true;
+  }
+  return false;
+}
+
+bool Plugin_waitForNextMessage(PluginHandle handle, BridgedData *out) {
+  auto *plugin = static_cast<LoadedExecutablePlugin *>(handle);
+  auto result = plugin->waitForNextMessage();
+  if (!result) {
+    // FIXME: Pass the error message back to the caller.
+    llvm::consumeError(result.takeError());
+//    llvm::handleAllErrors(result.takeError(), [](const llvm::ErrorInfoBase &err) {
+//      llvm::errs() << err.message() << "\n";
+//    });
+    return true;
+  }
+  auto &message = result.get();
+  auto size = message.size();
+  auto outPtr = malloc(size);
+  memcpy(outPtr, message.data(), size);
+  *out = BridgedData{(const char *)outPtr, size};
+  return false;
+}

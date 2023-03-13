@@ -66,6 +66,7 @@ namespace swift {
   class SourceFile;
   class Type;
   class ModuleDecl;
+  class PackageUnit;
   class GenericTypeDecl;
   class NominalTypeDecl;
   class PrecedenceGroupLookupResult;
@@ -94,8 +95,9 @@ enum class DeclContextKind : unsigned {
   EnumElementDecl,
   AbstractFunctionDecl,
   SerializedLocal,
-  Last_LocalDeclContextKind = SerializedLocal,
-
+  MacroDecl,
+  Last_LocalDeclContextKind = MacroDecl,
+  Package,
   Module,
   FileUnit,
   GenericTypeDecl,
@@ -233,6 +235,7 @@ class alignas(1 << DeclContextAlignInBits) DeclContext
     Decl,
     Expr,
     FileUnit,
+    Package,
     Initializer,
     SerializedLocal,
     // If you add a new AST hierarchies, then update the static_assert() below.
@@ -251,7 +254,7 @@ class alignas(1 << DeclContextAlignInBits) DeclContext
   friend class AbstractClosureExpr; // uses setParent
   
   template<class A, class B, class C>
-  friend struct ::llvm::cast_convert_val;
+  friend struct ::llvm::CastInfo;
   
   // See swift/AST/Decl.h
   static DeclContext *castDeclToDeclContext(const Decl *D);
@@ -270,6 +273,8 @@ class alignas(1 << DeclContextAlignInBits) DeclContext
       return ASTHierarchy::SerializedLocal;
     case DeclContextKind::FileUnit:
       return ASTHierarchy::FileUnit;
+    case DeclContextKind::Package:
+      return ASTHierarchy::Package;
     case DeclContextKind::Module:
     case DeclContextKind::TopLevelCodeDecl:
     case DeclContextKind::AbstractFunctionDecl:
@@ -277,6 +282,7 @@ class alignas(1 << DeclContextAlignInBits) DeclContext
     case DeclContextKind::EnumElementDecl:
     case DeclContextKind::GenericTypeDecl:
     case DeclContextKind::ExtensionDecl:
+    case DeclContextKind::MacroDecl:
       return ASTHierarchy::Decl;
     }
     llvm_unreachable("Unhandled DeclContextKind");
@@ -294,7 +300,8 @@ public:
 
   DeclContext(DeclContextKind Kind, DeclContext *Parent)
       : ParentAndKind(Parent, getASTHierarchyFromKind(Kind)) {
-    if (Kind != DeclContextKind::Module)
+    // if Module kind, it may (or may not) have Package as its parent
+    if (Kind != DeclContextKind::Package && Kind != DeclContextKind::Module)
       assert(Parent != nullptr && "DeclContext must have a parent context");
   }
 
@@ -317,6 +324,14 @@ public:
     return getContextKind() <= DeclContextKind::Last_LocalDeclContextKind;
   }
   
+  /// \returns true if this is a context with package-wide scope, e.g. a package,
+  /// a module, or a source file.
+  LLVM_READONLY
+  bool isPackageScopeContext() const; // see swift/AST/Module.h
+
+  LLVM_READONLY
+  bool isPackageContext() const; // see swift/AST/Module.h
+
   /// isModuleContext - Return true if this is a subclass of Module.
   LLVM_READONLY
   bool isModuleContext() const; // see swift/AST/Module.h
@@ -497,6 +512,10 @@ public:
     return false;
   }
 
+  /// Returns the package context of the parent module.
+  LLVM_READONLY
+  PackageUnit *getParentModulePackage() const;
+
   /// Returns the module context that contains this context.
   LLVM_READONLY
   ModuleDecl *getParentModule() const;
@@ -516,6 +535,12 @@ public:
   /// is not within a source file.
   LLVM_READONLY
   SourceFile *getParentSourceFile() const;
+
+  /// Returns the "outermost" source file that contains this context,
+  /// looking through any source files for generated code, such as
+  /// macro expansions.
+  LLVM_READONLY
+  SourceFile *getOutermostParentSourceFile() const;
 
   /// Determine whether this declaration context is generic, meaning that it or
   /// any of its parents have generic parameters.
@@ -762,7 +787,7 @@ class IterableDeclContext {
   unsigned HasNestedClassDeclarations : 1;
 
   template<class A, class B, class C>
-  friend struct ::llvm::cast_convert_val;
+  friend struct ::llvm::CastInfo;
 
   static IterableDeclContext *castDeclToIterableDeclContext(const Decl *D);
 
@@ -952,16 +977,26 @@ SourceLoc extractNearestSourceLoc(const IterableDeclContext *idc);
 
 namespace llvm {
   template<class FromTy>
-  struct cast_convert_val< ::swift::DeclContext, FromTy, FromTy> {
-    static ::swift::DeclContext *doit(const FromTy &Val) {
-      return ::swift::DeclContext::castDeclToDeclContext(Val);
+  struct CastInfo<::swift::DeclContext, FromTy, std::enable_if_t<is_simple_type<FromTy>::value>>
+      : public CastIsPossible<::swift::DeclContext, FromTy>,
+        public DefaultDoCastIfPossible<::swift::DeclContext *, FromTy,
+                                       CastInfo<::swift::DeclContext, FromTy>> {
+    static inline ::swift::DeclContext *castFailed() { return nullptr; }
+
+    static inline ::swift::DeclContext *doCast(const FromTy &val) {
+      return ::swift::DeclContext::castDeclToDeclContext(val);
     }
   };
 
   template<class FromTy>
-  struct cast_convert_val< ::swift::IterableDeclContext, FromTy, FromTy> {
-    static ::swift::IterableDeclContext *doit(const FromTy &Val) {
-      return ::swift::IterableDeclContext::castDeclToIterableDeclContext(Val);
+  struct CastInfo<::swift::IterableDeclContext, FromTy, std::enable_if_t<is_simple_type<FromTy>::value>>
+      : public CastIsPossible<::swift::IterableDeclContext, FromTy>,
+        public DefaultDoCastIfPossible<::swift::IterableDeclContext *, FromTy,
+                                       CastInfo<::swift::IterableDeclContext, FromTy>> {
+    static inline ::swift::IterableDeclContext *castFailed() { return nullptr; }
+
+    static inline ::swift::IterableDeclContext *doCast(const FromTy &val) {
+      return ::swift::IterableDeclContext::castDeclToIterableDeclContext(val);
     }
   };
 }

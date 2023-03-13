@@ -33,10 +33,13 @@
 #include "clang/CodeGen/SwiftCallingConv.h"
 
 #include "BitPatternBuilder.h"
+#include "CallEmission.h"
 #include "EnumPayload.h"
 #include "LegacyLayoutFormat.h"
 #include "LoadableTypeInfo.h"
+#include "GenCall.h"
 #include "GenMeta.h"
+#include "GenPoly.h"
 #include "GenProto.h"
 #include "GenType.h"
 #include "IRGenFunction.h"
@@ -173,7 +176,7 @@ void LoadableTypeInfo::initializeWithCopy(IRGenFunction &IGF, Address destAddr,
                                           Address srcAddr, SILType T,
                                           bool isOutlined) const {
   // Use memcpy if that's legal.
-  if (isPOD(ResilienceExpansion::Maximal)) {
+  if (isTriviallyDestroyable(ResilienceExpansion::Maximal)) {
     return initializeWithTake(IGF, destAddr, srcAddr, T, isOutlined);
   }
 
@@ -225,9 +228,9 @@ llvm::Constant *FixedTypeInfo::getStaticAlignmentMask(IRGenModule &IGM) const {
 llvm::Value *FixedTypeInfo::getStride(IRGenFunction &IGF, SILType T) const {
   return FixedTypeInfo::getStaticStride(IGF.IGM);
 }
-llvm::Value *FixedTypeInfo::getIsPOD(IRGenFunction &IGF, SILType T) const {
+llvm::Value *FixedTypeInfo::getIsTriviallyDestroyable(IRGenFunction &IGF, SILType T) const {
   return llvm::ConstantInt::get(IGF.IGM.Int1Ty,
-                                isPOD(ResilienceExpansion::Maximal) == IsPOD);
+                                isTriviallyDestroyable(ResilienceExpansion::Maximal) == IsTriviallyDestroyable);
 }
 llvm::Value *FixedTypeInfo::getIsBitwiseTakable(IRGenFunction &IGF, SILType T) const {
   return llvm::ConstantInt::get(IGF.IGM.Int1Ty,
@@ -962,7 +965,9 @@ namespace {
   /// A TypeInfo implementation for empty types.
   struct EmptyTypeInfo : ScalarTypeInfo<EmptyTypeInfo, LoadableTypeInfo> {
     EmptyTypeInfo(llvm::Type *ty)
-      : ScalarTypeInfo(ty, Size(0), SpareBitVector{}, Alignment(1), IsPOD,
+      : ScalarTypeInfo(ty, Size(0), SpareBitVector{}, Alignment(1),
+                       IsTriviallyDestroyable,
+                       IsCopyable,
                        IsFixedSize) {}
     unsigned getExplosionSize() const override { return 0; }
     void getSchema(ExplosionSchema &schema) const override {}
@@ -973,13 +978,13 @@ namespace {
     void loadAsTake(IRGenFunction &IGF, Address addr,
                     Explosion &e) const override {}
     void assign(IRGenFunction &IGF, Explosion &e, Address addr,
-                bool isOutlined) const override {}
+                bool isOutlined, SILType T) const override {}
     void initialize(IRGenFunction &IGF, Explosion &e, Address addr,
                     bool isOutlined) const override {}
     void copy(IRGenFunction &IGF, Explosion &src,
               Explosion &dest, Atomicity atomicity) const override {}
     void consume(IRGenFunction &IGF, Explosion &src,
-                 Atomicity atomicity) const override {}
+                 Atomicity atomicity, SILType T) const override {}
     void fixLifetime(IRGenFunction &IGF, Explosion &src) const override {}
     void destroy(IRGenFunction &IGF, Address addr, SILType T,
                  bool isOutlined) const override {}
@@ -990,8 +995,10 @@ namespace {
                                Explosion &dest,
                                unsigned offset) const override {}
 
-    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
-                                          SILType) const override {
+    TypeLayoutEntry
+    *buildTypeLayoutEntry(IRGenModule &IGM,
+                          SILType,
+                          bool useStructLayouts) const override {
       return IGM.typeLayoutCache.getEmptyEntry();
     }
   };
@@ -1125,7 +1132,9 @@ namespace {
                           Size size,
                           SpareBitVector &&spareBits,
                           Alignment align)
-      : ScalarTypeInfo(storage, size, std::move(spareBits), align, IsPOD,
+      : ScalarTypeInfo(storage, size, std::move(spareBits), align,
+                       IsTriviallyDestroyable,
+                       IsCopyable,
                        IsFixedSize),
         ScalarTypes(std::move(scalarTypes))
     {}
@@ -1134,9 +1143,15 @@ namespace {
       return cast<llvm::ArrayType>(ScalarTypeInfo::getStorageType());
     }
 
-    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
-                                          SILType T) const override {
-      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
+    TypeLayoutEntry
+    *buildTypeLayoutEntry(IRGenModule &IGM,
+                          SILType T,
+                          bool useStructLayouts) const override {
+      if (!useStructLayouts) {
+        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
+      }
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T,
+                                            ScalarKind::TriviallyDestroyable);
     }
 
     unsigned getExplosionSize() const override {
@@ -1165,7 +1180,7 @@ namespace {
     }
 
     void assign(IRGenFunction &IGF, Explosion &explosion, Address addr,
-                bool isOutlined) const override {
+                bool isOutlined, SILType T) const override {
       initialize(IGF, explosion, addr, isOutlined);
     }
 
@@ -1199,7 +1214,7 @@ namespace {
     }
 
     void consume(IRGenFunction &IGF, Explosion &explosion,
-                 Atomicity atomicity) const override {
+                 Atomicity atomicity, SILType T) const override {
       for (auto scalarTy: ScalarTypes) {
         (void)scalarTy;
         (void)explosion.claimNext();
@@ -1251,19 +1266,22 @@ namespace {
     }
   };
 
-  /// A TypeInfo implementation for address-only types which can never
-  /// be copied.
-  class ImmovableTypeInfo :
-    public IndirectTypeInfo<ImmovableTypeInfo, FixedTypeInfo> {
+  template <class Impl, class Base>
+  class ImmovableTypeInfoBase : public IndirectTypeInfo<Impl, Base> {
   public:
-    ImmovableTypeInfo(llvm::Type *storage, Size size,
-                      SpareBitVector &&spareBits,
-                      Alignment align)
-      : IndirectTypeInfo(storage, size, std::move(spareBits), align,
-                         IsNotPOD, IsNotBitwiseTakable, IsFixedSize) {}
-    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
-                                          SILType T) const override {
-      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
+    template <class... Args>
+    ImmovableTypeInfoBase(Args &&...args)
+      : IndirectTypeInfo<Impl, Base>(std::forward<Args>(args)...) {}
+
+    TypeLayoutEntry
+    *buildTypeLayoutEntry(IRGenModule &IGM,
+                          SILType T,
+                          bool useStructLayouts) const override {
+      if (!useStructLayouts) {
+        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
+      }
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T,
+                                                        ScalarKind::Immovable);
     }
 
     void assignWithCopy(IRGenFunction &IGF, Address dest, Address src,
@@ -1291,6 +1309,99 @@ namespace {
     void destroy(IRGenFunction &IGF, Address address, SILType T,
                  bool isOutlined) const override {
       llvm_unreachable("cannot opaquely manipulate immovable types!");
+    }
+  };
+
+  /// A TypeInfo implementation for address-only types which can never
+  /// be copied.
+  class ImmovableTypeInfo :
+    public ImmovableTypeInfoBase<ImmovableTypeInfo, FixedTypeInfo> {
+  public:
+    ImmovableTypeInfo(llvm::Type *storage, Size size,
+                      SpareBitVector &&spareBits,
+                      Alignment align)
+      : ImmovableTypeInfoBase(storage, size, std::move(spareBits), align,
+                              IsNotTriviallyDestroyable,
+                              IsNotBitwiseTakable,
+                              IsNotCopyable,
+                              IsFixedSize) {}
+  };
+
+  /// A TypeInfo implementation for address-only types which can never
+  /// be copied and whose layouts are not even dynamically knowable.
+  class OpaqueImmovableTypeInfo :
+    public ImmovableTypeInfoBase<OpaqueImmovableTypeInfo, TypeInfo> {
+  public:
+    OpaqueImmovableTypeInfo(llvm::Type *storage, Alignment minAlign)
+      : ImmovableTypeInfoBase(storage, minAlign, IsNotTriviallyDestroyable,
+                              IsNotBitwiseTakable,
+                              IsNotCopyable,
+                              IsNotFixedSize,
+                              IsNotABIAccessible,
+                              SpecialTypeInfoKind::None) {}
+
+    llvm::Value *getSize(IRGenFunction &IGF, SILType T) const override {
+      llvm_unreachable("should not call on an immovable opaque type");
+    }
+    llvm::Value *getAlignmentMask(IRGenFunction &IGF, SILType T) const override {
+      llvm_unreachable("should not call on an immovable opaque type");
+    }
+    llvm::Value *getStride(IRGenFunction &IGF, SILType T) const override {
+      llvm_unreachable("should not call on an immovable opaque type");
+    }
+    llvm::Value *getIsTriviallyDestroyable(IRGenFunction &IGF, SILType T) const override {
+      llvm_unreachable("should not call on an immovable opaque type");
+    }
+    llvm::Value *getIsBitwiseTakable(IRGenFunction &IGF, SILType T) const override {
+      llvm_unreachable("should not call on an immovable opaque type");
+    }
+    llvm::Value *isDynamicallyPackedInline(IRGenFunction &IGF,
+                                          SILType T) const override {
+      llvm_unreachable("should not call on an immovable opaque type");
+    }
+    llvm::Constant *getStaticSize(IRGenModule &IGM) const override {
+      return nullptr;
+    }
+    llvm::Constant *getStaticAlignmentMask(IRGenModule &IGM) const override {
+      return nullptr;
+    }
+    llvm::Constant *getStaticStride(IRGenModule &IGM) const override {
+      return nullptr;
+    }
+    StackAddress allocateStack(IRGenFunction &IGF, SILType T,
+                               const llvm::Twine &name) const override {
+      llvm_unreachable("should not call on an immovable opaque type");
+    }
+    void deallocateStack(IRGenFunction &IGF, StackAddress addr,
+                         SILType T) const override {
+      llvm_unreachable("should not call on an immovable opaque type");
+    }
+    void destroyStack(IRGenFunction &IGF, StackAddress addr, SILType T,
+                      bool isOutlined) const override {
+      llvm_unreachable("should not call on an immovable opaque type");
+    }
+    void initializeFromParams(IRGenFunction &IGF, Explosion &params,
+                              Address src, SILType T,
+                              bool isOutlined) const override {
+      llvm_unreachable("should not call on an immovable opaque type");
+    }
+    bool mayHaveExtraInhabitants(IRGenModule &IGM) const override {
+      llvm_unreachable("should not call on an immovable opaque type");
+    }
+    llvm::Value *getEnumTagSinglePayload(IRGenFunction &IGF,
+                                         llvm::Value *numEmptyCases,
+                                         Address enumAddr,
+                                         SILType T,
+                                         bool isOutlined) const override {
+      llvm_unreachable("should not call on an immovable opaque type");
+    }
+    void storeEnumTagSinglePayload(IRGenFunction &IGF,
+                                   llvm::Value *whichCase,
+                                   llvm::Value *numEmptyCases,
+                                   Address enumAddr,
+                                   SILType T,
+                                   bool isOutlined) const override {
+      llvm_unreachable("should not call on an immovable opaque type");
     }
   };
 } // end anonymous namespace
@@ -1328,6 +1439,11 @@ const FixedTypeInfo *
 TypeConverter::createImmovable(llvm::Type *type, Size size, Alignment align) {
   auto spareBits = SpareBitVector::getConstant(size.getValueInBits(), false);
   return new ImmovableTypeInfo(type, size, std::move(spareBits), align);
+}
+
+const TypeInfo *
+TypeConverter::createOpaqueImmovable(llvm::Type *type, Alignment align) {
+  return new OpaqueImmovableTypeInfo(type, align);
 }
 
 static TypeInfo *invalidTypeInfo() { return (TypeInfo*) 1; }
@@ -1709,11 +1825,21 @@ const LoadableTypeInfo &TypeConverter::getEmptyTypeInfo() {
 }
 
 const TypeInfo &
-TypeConverter::getResilientStructTypeInfo(IsABIAccessible_t isAccessible) {
-  auto &cache = isAccessible ? AccessibleResilientStructTI
-                             : InaccessibleResilientStructTI;
+TypeConverter::getDynamicTupleTypeInfo(IsCopyable_t isCopyable) {
+  auto &cache = DynamicTupleTI[(unsigned)isCopyable];
   if (cache) return *cache;
-  cache = convertResilientStruct(isAccessible);
+  cache = convertDynamicTupleType(isCopyable);
+  cache->NextConverted = FirstType;
+  FirstType = cache;
+  return *cache;
+}
+
+const TypeInfo &
+TypeConverter::getResilientStructTypeInfo(IsCopyable_t isCopyable,
+                                          IsABIAccessible_t isAccessible) {
+  auto &cache = ResilientStructTI[(unsigned)isCopyable][(unsigned)isAccessible];
+  if (cache) return *cache;
+  cache = convertResilientStruct(isCopyable, isAccessible);
   cache->NextConverted = FirstType;
   FirstType = cache;
   return *cache;
@@ -1886,7 +2012,8 @@ CanType TypeConverter::getExemplarType(CanType contextTy) {
     return CanType(exemplified);
   }
 }
-const TypeLayoutEntry &TypeConverter::getTypeLayoutEntry(SILType T) {
+const TypeLayoutEntry
+&TypeConverter::getTypeLayoutEntry(SILType T, bool useStructLayouts) {
   auto astTy = T.getASTType();
   auto cache =
       Types.getTypeLayoutCacheFor(astTy->hasTypeParameter(), LoweringMode);
@@ -1895,7 +2022,7 @@ const TypeLayoutEntry &TypeConverter::getTypeLayoutEntry(SILType T) {
     return *it->second;
   }
   auto *ti = getTypeEntry(T.getASTType());
-  auto *entry = ti->buildTypeLayoutEntry(IGM, T);
+  auto *entry = ti->buildTypeLayoutEntry(IGM, T, useStructLayouts);
   cache[astTy.getPointer()] = entry;
   return *entry;
 }
@@ -2091,7 +2218,7 @@ const TypeInfo *TypeConverter::convertType(CanType ty) {
   case TypeKind::Error: {
     // We might see error types if type checking has failed.
     // Try to do something graceful and return an zero sized type.
-    auto &ctx = ty->getASTContext();
+    auto &ctx = IGM.Context;
     return convertTupleType(cast<TupleType>(ctx.TheEmptyTupleType));
   }
 #define UNCHECKED_TYPE(id, parent) \
@@ -2136,6 +2263,9 @@ const TypeInfo *TypeConverter::convertType(CanType ty) {
     return &getExecutorTypeInfo();
   case TypeKind::BuiltinIntegerLiteral:
     return &getIntegerLiteralTypeInfo();
+  case TypeKind::BuiltinPackIndex:
+    return createPrimitive(IGM.SizeTy, IGM.getPointerSize(),
+                           IGM.getCappedAlignment(IGM.getPointerAlignment()));
   case TypeKind::BuiltinFloat:
   case TypeKind::BuiltinInteger:
   case TypeKind::BuiltinVector: {
@@ -2164,7 +2294,6 @@ const TypeInfo *TypeConverter::convertType(CanType ty) {
   case TypeKind::PrimaryArchetype:
   case TypeKind::OpenedArchetype:
   case TypeKind::OpaqueTypeArchetype:
-  case TypeKind::PackArchetype:
   case TypeKind::ElementArchetype:
     return convertArchetypeType(cast<ArchetypeType>(ty));
   case TypeKind::Class:
@@ -2205,11 +2334,16 @@ const TypeInfo *TypeConverter::convertType(CanType ty) {
     return convertBlockStorageType(cast<SILBlockStorageType>(ty));
   case TypeKind::SILBox:
     return convertBoxType(cast<SILBoxType>(ty));
+  case TypeKind::Pack:
+    llvm_unreachable("AST pack types should be lowered by SILGen");
+  case TypeKind::SILPack:
+    return convertPackType(cast<SILPackType>(ty));
+  case TypeKind::PackArchetype:
+  case TypeKind::PackExpansion:
+    llvm_unreachable("pack archetypes and expansions should not be seen in "
+                     " arbitrary type positions");
   case TypeKind::SILToken:
     llvm_unreachable("should not be asking for representation of a SILToken");
-  case TypeKind::Pack:
-  case TypeKind::PackExpansion:
-    llvm_unreachable("Unimplemented!");
   }
   }
   llvm_unreachable("bad type kind");
@@ -2223,6 +2357,12 @@ const TypeInfo *TypeConverter::convertInOutType(InOutType *T) {
   // Just use the reference type as a primitive pointer.
   return createPrimitive(referenceType, IGM.getPointerSize(),
                          IGM.getPointerAlignment());
+}
+
+const TypeInfo *TypeConverter::convertPackType(SILPackType *pack) {
+  if (pack->isElementAddress())
+    return createOpaqueImmovable(IGM.OpaquePtrTy, IGM.getPointerAlignment());
+  return createOpaqueImmovable(IGM.OpaqueTy, Alignment(1));
 }
 
 /// Convert a reference storage type. The implementation here depends on the
@@ -2364,14 +2504,17 @@ public:
                     Size(node.Size),
                     spareBits,
                     Alignment(node.Alignment),
-                    IsNotPOD, /* irrelevant */
+                    IsNotTriviallyDestroyable, /* irrelevant */
                     IsNotBitwiseTakable, /* irrelevant */
+                    IsCopyable, /* irrelevant */
                     IsFixedSize /* irrelevant */),
       NumExtraInhabitants(node.NumExtraInhabitants) {}
 
-  TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
-                                        SILType T) const override {
-    return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
+  TypeLayoutEntry
+  *buildTypeLayoutEntry(IRGenModule &IGM,
+                        SILType T,
+                        bool useStructLayouts) const override {
+    llvm_unreachable("Cannot construct type layout for legacy types");
   }
 
   virtual unsigned getFixedExtraInhabitantCount(IRGenModule &IGM) const override {
@@ -2721,4 +2864,133 @@ void TypeInfo::verify(IRGenTypeVerifierFunction &IGF,
                       llvm::Value *typeMetadata,
                       SILType T) const {
   // By default, no type-specific verifier behavior.
+}
+
+static bool tryEmitDeinitCall(IRGenFunction &IGF,
+                          SILType T,
+                          llvm::function_ref<void (Explosion &)> direct,
+                          llvm::function_ref<Address ()> indirect,
+                          llvm::function_ref<void ()> indirectCleanup) {
+  auto ty = T.getASTType();
+  auto nominal = ty->getAnyNominal();
+  // We are only concerned with move-only type deinits here.
+  if (!nominal || !nominal->getValueTypeDestructor()) {
+    return false;
+  }
+  
+  auto deinit = IGF.getSILModule().lookUpMoveOnlyDeinit(nominal);
+  assert(deinit && "type has a deinit declared in AST but SIL deinit record is not present!");
+    
+  // The deinit should take a single value parameter of the nominal type, either
+  // by @owned or indirect @in convention.
+  auto deinitFn = IGF.IGM.getAddrOfSILFunction(deinit->getImplementation(),
+                                               NotForDefinition);
+  auto deinitTy = deinit->getImplementation()->getLoweredFunctionType();
+  auto deinitFP = FunctionPointer::forDirect(IGF.IGM, deinitFn,
+                                             nullptr, deinitTy);
+  assert(deinitTy->getNumParameters() == 1
+         && deinitTy->getNumResults() == 0
+         && !deinitTy->hasError()
+         && "deinit should have only one parameter");
+
+  auto substitutions = ty->getContextSubstitutionMap(IGF.getSwiftModule(),
+                                                     nominal);
+                                                     
+  CalleeInfo info(deinitTy,
+                  deinitTy->substGenericArgs(IGF.getSILModule(),
+                                     substitutions,
+                                     IGF.IGM.getMaximalTypeExpansionContext()),
+                  substitutions);
+                  
+  bool isIndirect;
+  Address indirectArg;
+  Explosion directArg;
+  switch (deinitTy->getParameters()[0].getConvention()) {
+  case ParameterConvention::Direct_Owned:
+    isIndirect = false;
+    direct(directArg);
+    break;
+  case ParameterConvention::Indirect_In:
+    isIndirect = true;
+    indirectArg = indirect();
+    break;
+  default:
+    llvm_unreachable("move-only deinit should only have consuming parameter convention");
+  }
+                  
+  // If the deinit's convention has a special `self` parameter, then the
+  // (pointer to) the value being destroyed is that parameter.
+  llvm::Value *self = nullptr;
+  if (hasSelfContextParameter(deinitTy)) {
+    self = isIndirect ? indirectArg.getAddress() : directArg.claimNext();
+    assert(directArg.empty()
+           && "direct param (if any) should be a single pointer if "
+              "it's the swiftself param");
+  }
+   
+  GenericContextScope scope(IGF.IGM,
+                        nominal->getGenericSignature().getCanonicalSignature());
+
+  Callee deinitCallee(std::move(info), deinitFP, self);
+  auto callEmission = getCallEmission(IGF, self, std::move(deinitCallee));
+  callEmission->begin();
+  // Pass the parameter if it wasn't already the by-convention self parameter.
+  if (!self) {
+    if (isIndirect) {
+      directArg.add(indirectArg.getAddress());
+    }
+  }
+  if (hasPolymorphicParameters(deinitTy)) {
+    emitPolymorphicArguments(IGF, deinitTy, substitutions, nullptr,
+                             directArg);
+  }
+  callEmission->setArgs(directArg, /*outlined*/ false, /*witness*/nullptr);
+  Explosion nothing;
+  callEmission->emitToExplosion(nothing, /*isOutlined*/ false);
+  callEmission->end();
+  if (isIndirect) {
+    indirectCleanup();
+  }
+  return true;
+}
+
+bool irgen::tryEmitConsumeUsingDeinit(IRGenFunction &IGF, Explosion &explosion,
+                                      SILType T) {
+  const LoadableTypeInfo *ti = cast<LoadableTypeInfo>(&IGF.getTypeInfo(T));
+  StackAddress temporary;
+  return tryEmitDeinitCall(IGF, T,
+    // Direct parameter case
+    [&](Explosion &arg) {
+      ti->reexplode(IGF, explosion, arg);
+    },
+    // Indirect parameter setup
+    [&]() -> Address {
+      // Allocate stack space to store the indirect argument, and forward our
+      // value into it. The deinit will consume the value in memory.
+      temporary = ti->allocateStack(IGF, T, "deinit.arg");
+      ti->initialize(IGF, explosion, temporary.getAddress(), /*outlined*/false);
+      return temporary.getAddress();
+    },
+    // Indirect parameter teardown
+    [&]{
+      // End the lifetime of the stack allocation.
+      ti->deallocateStack(IGF, temporary, T);
+    });
+}
+
+bool irgen::tryEmitDestroyUsingDeinit(IRGenFunction &IGF, Address address,
+                                      SILType T) {
+  return tryEmitDeinitCall(IGF, T,
+    // Direct parameter case
+    [&](Explosion &arg) {
+      // Load the value from the address.
+      auto *ti = cast<LoadableTypeInfo>(&IGF.getTypeInfo(T));
+      ti->loadAsTake(IGF, address, arg);
+    },
+    // Indirect parameter setup
+    [&]() -> Address {
+      return address;
+    },
+    // Indirect parameter teardown
+    [&]{ /* nothing to do */ });
 }

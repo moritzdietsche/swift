@@ -121,13 +121,13 @@ AbstractionPattern::EncodedForeignInfo::encode(
                          const Optional<ForeignErrorConvention> &foreignError,
                          const Optional<ForeignAsyncConvention> &foreignAsync) {
   // Foreign async convention takes precedence.
-  if (foreignAsync.hasValue()) {
+  if (foreignAsync.has_value()) {
     return EncodedForeignInfo(EncodedForeignInfo::Async,
                               foreignAsync->completionHandlerParamIndex(),
                               foreignAsync->completionHandlerErrorParamIndex(),
                               foreignAsync->completionHandlerFlagParamIndex(),
                               foreignAsync->completionHandlerFlagIsErrorOnZero());
-  } else if (foreignError.hasValue()) {
+  } else if (foreignError.has_value()) {
     return EncodedForeignInfo(EncodedForeignInfo::Error,
                               foreignError->getErrorParameterIndex(),
                               foreignError->isErrorParameterReplacedWithVoid(),
@@ -193,16 +193,20 @@ AbstractionPattern::getOptional(AbstractionPattern object) {
   case Kind::Opaque:
     return AbstractionPattern::getOpaque();
   case Kind::ClangType:
-    return AbstractionPattern(object.getGenericSignature(),
+    return AbstractionPattern(object.getGenericSubstitutions(),
+                              object.getGenericSignature(),
                               OptionalType::get(object.getType())
                                 ->getCanonicalType(),
                               object.getClangType());
   case Kind::Type:
-    return AbstractionPattern(object.getGenericSignature(),
+    return AbstractionPattern(object.getGenericSubstitutions(),
+                              object.getGenericSignature(),
                               OptionalType::get(object.getType())
                                 ->getCanonicalType());
   case Kind::Discard:
-    return AbstractionPattern::getDiscard(object.getGenericSignature(),
+    return AbstractionPattern::getDiscard(
+                              object.getGenericSubstitutions(),
+                              object.getGenericSignature(),
                               OptionalType::get(object.getType())
                                 ->getCanonicalType());
   }
@@ -291,18 +295,40 @@ bool AbstractionPattern::matchesTuple(CanTupleType substType) {
     return false;
   case Kind::Opaque:
     return true;
-  case Kind::Tuple:
-    return getNumTupleElements_Stored() == substType->getNumElements();
   case Kind::ObjCCompletionHandlerArgumentsType:
   case Kind::ClangType:
   case Kind::Type:
-  case Kind::Discard: {
+  case Kind::Discard:
     if (isTypeParameterOrOpaqueArchetype())
       return true;
-    auto type = getType();
-    if (auto tuple = dyn_cast<TupleType>(type))
-      return (tuple->getNumElements() == substType->getNumElements());
-    return false;
+    if (!isa<TupleType>(getType()))
+      return false;
+    LLVM_FALLTHROUGH;
+  case Kind::Tuple: {
+    size_t nextSubstIndex = 0;
+    auto nextComponentIsAcceptable =
+        [&](AbstractionPattern origComponentType) -> bool {
+      if (nextSubstIndex == substType->getNumElements())
+        return false;
+      auto substComponentType = substType.getElementType(nextSubstIndex++);
+      return (origComponentType.isPackExpansion() ==
+              isa<PackExpansionType>(substComponentType));
+    };
+    for (size_t i = 0, n = getNumTupleElements(); i != n; ++i) {
+      auto elt = getTupleElementType(i);
+      if (elt.isPackExpansion()) {
+        bool fail = false;
+        elt.forEachPackExpandedComponent([&](AbstractionPattern component) {
+          if (!nextComponentIsAcceptable(component))
+            fail = true;
+        });
+        if (fail) return false;
+      } else {
+        if (!nextComponentIsAcceptable(elt))
+          return false;
+      }
+    }
+    return nextSubstIndex == substType->getNumElements();
   }
   }
   llvm_unreachable("bad kind");
@@ -368,7 +394,8 @@ AbstractionPattern::getTupleElementType(unsigned index) const {
     assert(index < getNumTupleElements_Stored());
     return OrigTupleElements[index];
   case Kind::ClangType:
-    return AbstractionPattern(getGenericSignature(),
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignature(),
                               getCanTupleElementType(getType(), index),
                               getClangArrayElementType(getClangType(), index));
   case Kind::Discard:
@@ -376,7 +403,8 @@ AbstractionPattern::getTupleElementType(unsigned index) const {
   case Kind::Type:
     if (isTypeParameterOrOpaqueArchetype())
       return AbstractionPattern::getOpaque();
-    return AbstractionPattern(getGenericSignature(),
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignature(),
                               getCanTupleElementType(getType(), index));
       
   case Kind::ObjCCompletionHandlerArgumentsType: {
@@ -392,11 +420,247 @@ AbstractionPattern::getTupleElementType(unsigned index) const {
       ++paramIndex;
     if (flagIndex && paramIndex >= *flagIndex)
       ++paramIndex;
-    return AbstractionPattern(getGenericSignature(),
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignature(),
                               getCanTupleElementType(getType(), index),
                               callback->getParamType(paramIndex).getTypePtr());
   }
     
+  }
+  llvm_unreachable("bad kind");
+}
+
+bool AbstractionPattern::doesTupleContainPackExpansionType() const {
+  switch (getKind()) {
+  case Kind::Invalid:
+    llvm_unreachable("querying invalid abstraction pattern!");
+  case Kind::Opaque:
+  case Kind::PartialCurriedObjCMethodType:
+  case Kind::CurriedObjCMethodType:
+  case Kind::CFunctionAsMethodType:
+  case Kind::CurriedCFunctionAsMethodType:
+  case Kind::PartialCurriedCFunctionAsMethodType:
+  case Kind::ObjCMethodType:
+  case Kind::CXXMethodType:
+  case Kind::CurriedCXXMethodType:
+  case Kind::PartialCurriedCXXMethodType:
+  case Kind::OpaqueFunction:
+  case Kind::OpaqueDerivativeFunction:
+    llvm_unreachable("pattern is not a tuple");
+  case Kind::Tuple: {
+    for (auto &elt : llvm::makeArrayRef(OrigTupleElements,
+                                        getNumTupleElements_Stored())) {
+      if (elt.isPackExpansion())
+        return true;
+    }
+    return true;
+  }
+  case Kind::ObjCCompletionHandlerArgumentsType:
+  case Kind::Type:
+  case Kind::Discard:
+  case Kind::ClangType:
+    return cast<TupleType>(getType()).containsPackExpansionType();
+  }
+  llvm_unreachable("bad kind");
+}
+
+static CanType getCanPackElementType(CanType type, unsigned index) {
+  return cast<PackType>(type).getElementType(index);
+}
+
+AbstractionPattern
+AbstractionPattern::getPackElementType(unsigned index) const {
+  switch (getKind()) {
+  case Kind::Invalid:
+    llvm_unreachable("querying invalid abstraction pattern!");
+  case Kind::PartialCurriedObjCMethodType:
+  case Kind::CurriedObjCMethodType:
+  case Kind::PartialCurriedCFunctionAsMethodType:
+  case Kind::CurriedCFunctionAsMethodType:
+  case Kind::CFunctionAsMethodType:
+  case Kind::ObjCMethodType:
+  case Kind::CXXMethodType:
+  case Kind::CurriedCXXMethodType:
+  case Kind::PartialCurriedCXXMethodType:
+  case Kind::OpaqueFunction:
+  case Kind::OpaqueDerivativeFunction:
+  case Kind::ClangType:
+  case Kind::Tuple:
+  case Kind::ObjCCompletionHandlerArgumentsType:
+    llvm_unreachable("not a pack type");
+  case Kind::Opaque:
+    return *this;
+  case Kind::Discard:
+    llvm_unreachable("operation not needed on discarded abstractions yet");
+  case Kind::Type:
+    if (isTypeParameterOrOpaqueArchetype())
+      return AbstractionPattern::getOpaque();
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignature(),
+                              getCanPackElementType(getType(), index)); 
+  }
+  llvm_unreachable("bad kind");
+}
+
+bool AbstractionPattern::matchesPack(CanPackType substType) {
+  switch (getKind()) {
+  case Kind::Invalid:
+    llvm_unreachable("querying invalid abstraction pattern!");
+  case Kind::PartialCurriedObjCMethodType:
+  case Kind::CurriedObjCMethodType:
+  case Kind::PartialCurriedCFunctionAsMethodType:
+  case Kind::CurriedCFunctionAsMethodType:
+  case Kind::CFunctionAsMethodType:
+  case Kind::ObjCMethodType:
+  case Kind::CXXMethodType:
+  case Kind::CurriedCXXMethodType:
+  case Kind::PartialCurriedCXXMethodType:
+  case Kind::OpaqueFunction:
+  case Kind::OpaqueDerivativeFunction:
+  case Kind::Tuple:
+  case Kind::ObjCCompletionHandlerArgumentsType:
+  case Kind::ClangType:
+    return false;
+  case Kind::Opaque:
+    return true;
+  case Kind::Type:
+  case Kind::Discard: {
+    if (isTypeParameterOrOpaqueArchetype())
+      return true;
+    auto type = getType();
+    if (auto pack = dyn_cast<PackType>(type))
+      return (pack->getNumElements() == substType->getNumElements());
+    return false;
+  }
+  }
+  llvm_unreachable("bad kind");
+}
+
+static CanType getPackExpansionPatternType(CanType type) {
+  return cast<PackExpansionType>(type).getPatternType();
+}
+
+AbstractionPattern AbstractionPattern::getPackExpansionPatternType() const {
+  switch (getKind()) {
+  case Kind::Invalid:
+    llvm_unreachable("querying invalid abstraction pattern!");
+  case Kind::ObjCMethodType:
+  case Kind::CurriedObjCMethodType:
+  case Kind::PartialCurriedObjCMethodType:
+  case Kind::CFunctionAsMethodType:
+  case Kind::CurriedCFunctionAsMethodType:
+  case Kind::PartialCurriedCFunctionAsMethodType:
+  case Kind::CXXMethodType:
+  case Kind::CurriedCXXMethodType:
+  case Kind::PartialCurriedCXXMethodType:
+  case Kind::Tuple:
+  case Kind::OpaqueFunction:
+  case Kind::OpaqueDerivativeFunction:
+  case Kind::ObjCCompletionHandlerArgumentsType:
+  case Kind::ClangType:
+    llvm_unreachable("pattern for function or tuple cannot be for "
+                     "pack expansion type");
+
+  case Kind::Opaque:
+    return *this;
+
+  case Kind::Type:
+    if (isTypeParameterOrOpaqueArchetype())
+      return AbstractionPattern::getOpaque();
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignature(),
+                              ::getPackExpansionPatternType(getType()));
+
+  case Kind::Discard:
+    return AbstractionPattern::getDiscard(
+        getGenericSubstitutions(), getGenericSignature(),
+        ::getPackExpansionPatternType(getType()));
+  }
+  llvm_unreachable("bad kind");
+}
+
+static CanType getPackExpansionCountType(CanType type) {
+  return cast<PackExpansionType>(type).getCountType();
+}
+
+AbstractionPattern AbstractionPattern::getPackExpansionCountType() const {
+  switch (getKind()) {
+  case Kind::Invalid:
+    llvm_unreachable("querying invalid abstraction pattern!");
+  case Kind::ObjCMethodType:
+  case Kind::CurriedObjCMethodType:
+  case Kind::PartialCurriedObjCMethodType:
+  case Kind::CFunctionAsMethodType:
+  case Kind::CurriedCFunctionAsMethodType:
+  case Kind::PartialCurriedCFunctionAsMethodType:
+  case Kind::CXXMethodType:
+  case Kind::CurriedCXXMethodType:
+  case Kind::PartialCurriedCXXMethodType:
+  case Kind::Tuple:
+  case Kind::OpaqueFunction:
+  case Kind::OpaqueDerivativeFunction:
+  case Kind::ObjCCompletionHandlerArgumentsType:
+  case Kind::ClangType:
+    llvm_unreachable("pattern for function or tuple cannot be for "
+                     "pack expansion type");
+
+  case Kind::Opaque:
+    return *this;
+
+  case Kind::Type:
+    if (isTypeParameterOrOpaqueArchetype())
+      return AbstractionPattern::getOpaque();
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignature(),
+                              ::getPackExpansionCountType(getType()));
+
+  case Kind::Discard:
+    return AbstractionPattern::getDiscard(
+        getGenericSubstitutions(), getGenericSignature(),
+        ::getPackExpansionCountType(getType()));
+  }
+  llvm_unreachable("bad kind");
+}
+
+SmallVector<AbstractionPattern, 4>
+AbstractionPattern::getPackExpandedComponents() const {
+  SmallVector<AbstractionPattern, 4> result;
+  forEachPackExpandedComponent([&](AbstractionPattern pattern) {
+    result.push_back(pattern);
+  });
+  return result;
+}
+
+void AbstractionPattern::forEachPackExpandedComponent(
+          llvm::function_ref<void (AbstractionPattern)> fn) const {
+  assert(isPackExpansion());
+
+  switch (getKind()) {
+  case Kind::Type:
+  case Kind::Discard: {
+    // If we don't have generic substitutions, just produce this pattern.
+    if (!GenericSubs) return fn(*this);
+    auto origExpansion = cast<PackExpansionType>(getType());
+
+    // Substitute the expansion shape.
+    auto substShape = cast<PackType>(
+      origExpansion.getCountType().subst(GenericSubs)->getCanonicalType());
+
+    // Call the callback with each component of the substituted shape.
+    for (auto substShapeElt : substShape.getElementTypes()) {
+      CanType origEltType = origExpansion.getPatternType();
+      if (auto substShapeEltExpansion =
+            dyn_cast<PackExpansionType>(substShapeElt)) {
+        origEltType = CanPackExpansionType::get(origEltType,
+                                    substShapeEltExpansion.getCountType());
+      }
+      fn(AbstractionPattern(GenericSubs, GenericSig, origEltType));
+    }
+    return;
+  }
+
+  default:
+    return fn(*this);
   }
   llvm_unreachable("bad kind");
 }
@@ -427,7 +691,8 @@ AbstractionPattern AbstractionPattern::removingMoveOnlyWrapper() const {
   case Kind::Tuple:
   case Kind::Type:
     if (auto mvi = dyn_cast<SILMoveOnlyWrappedType>(getType())) {
-      return AbstractionPattern(getGenericSignature(), mvi->getInnerType());
+      return AbstractionPattern(getGenericSubstitutions(),
+                                getGenericSignature(), mvi->getInnerType());
     }
     return *this;
   }
@@ -462,7 +727,8 @@ AbstractionPattern AbstractionPattern::addingMoveOnlyWrapper() const {
   case Kind::Type:
     if (isa<SILMoveOnlyWrappedType>(getType()))
       return *this;
-    return AbstractionPattern(getGenericSignature(),
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignature(),
                               SILMoveOnlyWrappedType::get(getType()));
   }
 
@@ -479,7 +745,8 @@ AbstractionPattern::getObjCMethodSelfPattern(CanType selfType) const {
   auto clangSelfType =
     getObjCMethod()->getASTContext().getObjCIdType().getTypePtr();
 
-  return AbstractionPattern(getGenericSignatureForFunctionComponent(),
+  return AbstractionPattern(getGenericSubstitutions(),
+                            getGenericSignatureForFunctionComponent(),
                             selfType, clangSelfType);
 }
 
@@ -495,12 +762,14 @@ AbstractionPattern::getCFunctionAsMethodSelfPattern(CanType selfType) const {
     auto clangSelfType =
       getClangFunctionParameterType(getClangType(),memberStatus.getSelfIndex());
 
-    return AbstractionPattern(getGenericSignatureForFunctionComponent(),
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignatureForFunctionComponent(),
                               selfType, clangSelfType);
   }
   // The formal metatype parameter to a C function imported as a static method
   // is dropped on the floor. Leave it untransformed.
   return AbstractionPattern::getDiscard(
+                           getGenericSubstitutions(),
                            getGenericSignatureForFunctionComponent(), selfType);
 }
 
@@ -514,12 +783,14 @@ AbstractionPattern::getCXXMethodSelfPattern(CanType selfType) const {
     // 'self' --- we have the right information to be more exact.
     auto clangSelfType =
         CXXMethod->getThisType().getTypePtr();
-    return AbstractionPattern(getGenericSignatureForFunctionComponent(),
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignatureForFunctionComponent(),
                               selfType, clangSelfType);
   }
   // The formal metatype parameter to a C++ function imported as a static method
   // is dropped on the floor. Leave it untransformed.
   return AbstractionPattern::getDiscard(
+      getGenericSubstitutions(),
       getGenericSignatureForFunctionComponent(), selfType);
 }
 
@@ -539,7 +810,8 @@ AbstractionPattern AbstractionPattern::getFunctionResultType() const {
   case Kind::Type:
     if (isTypeParameterOrOpaqueArchetype())
       return AbstractionPattern::getOpaque();
-    return AbstractionPattern(getGenericSignatureForFunctionComponent(),
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignatureForFunctionComponent(),
                               getResultType(getType()));
   case Kind::Discard:
     llvm_unreachable("don't need to discard function abstractions yet");
@@ -547,29 +819,34 @@ AbstractionPattern AbstractionPattern::getFunctionResultType() const {
   case Kind::CFunctionAsMethodType:
   case Kind::PartialCurriedCFunctionAsMethodType: {
     auto clangFunctionType = getClangFunctionType(getClangType());
-    return AbstractionPattern(getGenericSignatureForFunctionComponent(),
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignatureForFunctionComponent(),
                               getResultType(getType()),
                               clangFunctionType->getReturnType().getTypePtr());    
   }
   case Kind::CXXMethodType:
   case Kind::PartialCurriedCXXMethodType:
-    return AbstractionPattern(getGenericSignatureForFunctionComponent(),
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignatureForFunctionComponent(),
                               getResultType(getType()),
                               getCXXMethod()->getReturnType().getTypePtr());
   case Kind::CurriedObjCMethodType:
     return getPartialCurriedObjCMethod(
+                              getGenericSubstitutions(),
                               getGenericSignatureForFunctionComponent(),
                               getResultType(getType()),
                               getObjCMethod(),
                               getEncodedForeignInfo());
   case Kind::CurriedCFunctionAsMethodType:
     return getPartialCurriedCFunctionAsMethod(
+                                      getGenericSubstitutions(),
                                       getGenericSignatureForFunctionComponent(),
                                       getResultType(getType()),
                                       getClangType(),
                                       getImportAsMemberStatus());
   case Kind::CurriedCXXMethodType:
-    return getPartialCurriedCXXMethod(getGenericSignatureForFunctionComponent(),
+    return getPartialCurriedCXXMethod(getGenericSubstitutions(),
+                                      getGenericSignatureForFunctionComponent(),
                                       getResultType(getType()), getCXXMethod(),
                                       getImportAsMemberStatus());
   case Kind::PartialCurriedObjCMethodType:
@@ -593,15 +870,15 @@ AbstractionPattern AbstractionPattern::getFunctionResultType() const {
                                     .getAsyncCompletionHandlerErrorParamIndex();
       auto callbackErrorFlagIndex = getEncodedForeignInfo()
                                 .getAsyncCompletionHandlerErrorFlagParamIndex();
-      assert((!callbackErrorIndex.hasValue()
+      assert((!callbackErrorIndex.has_value()
               || callbackParamTy->getNumParams() > *callbackErrorIndex)
              && "completion handler has invalid error param index?!");
-      assert((!callbackErrorFlagIndex.hasValue()
+      assert((!callbackErrorFlagIndex.has_value()
               || callbackParamTy->getNumParams() > *callbackErrorFlagIndex)
              && "completion handler has invalid error param index?!");
       unsigned numNonErrorParams
-        = callbackParamTy->getNumParams() - callbackErrorIndex.hasValue()
-                                          - callbackErrorFlagIndex.hasValue();
+        = callbackParamTy->getNumParams() - callbackErrorIndex.has_value()
+                                          - callbackErrorFlagIndex.has_value();
             
       switch (numNonErrorParams) {
       case 0:
@@ -625,7 +902,8 @@ AbstractionPattern AbstractionPattern::getFunctionResultType() const {
           ->getParamType(callbackResultIndex)
           .getTypePtr();
         
-        return AbstractionPattern(getGenericSignatureForFunctionComponent(),
+        return AbstractionPattern(getGenericSubstitutions(),
+                                  getGenericSignatureForFunctionComponent(),
                                   getResultType(getType()), clangResultType);
       }
           
@@ -634,13 +912,15 @@ AbstractionPattern AbstractionPattern::getFunctionResultType() const {
         // form to represent the mapping from block parameters to tuple elements
         // in the return type.
         return AbstractionPattern::getObjCCompletionHandlerArgumentsType(
+                      getGenericSubstitutions(),
                       getGenericSignatureForFunctionComponent(),
                       getResultType(getType()), callbackParamTy,
                       getEncodedForeignInfo());
       }
     }
     
-    return AbstractionPattern(getGenericSignatureForFunctionComponent(),
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignatureForFunctionComponent(),
                               getResultType(getType()),
                               getObjCMethod()->getReturnType().getTypePtr());
   }
@@ -733,7 +1013,8 @@ AbstractionPattern::getFunctionParamType(unsigned index) const {
     if (isTypeParameterOrOpaqueArchetype())
       return AbstractionPattern::getOpaque();
     auto params = cast<AnyFunctionType>(getType()).getParams();
-    return AbstractionPattern(getGenericSignatureForFunctionComponent(),
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignatureForFunctionComponent(),
                               params[index].getParameterType());
   }
   case Kind::CurriedCFunctionAsMethodType: {
@@ -839,13 +1120,15 @@ AbstractionPattern::getFunctionParamType(unsigned index) const {
       }
     }
 
-    return AbstractionPattern(getGenericSignatureForFunctionComponent(),
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignatureForFunctionComponent(),
                               paramType,
                       method->parameters()[paramIndex]->getType().getTypePtr());
   }
   case Kind::ClangType: {
     auto params = cast<AnyFunctionType>(getType()).getParams();
-    return AbstractionPattern(getGenericSignatureForFunctionComponent(),
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignatureForFunctionComponent(),
                               params[index].getParameterType(),
                           getClangFunctionParameterType(getClangType(), index));
   }
@@ -856,6 +1139,12 @@ AbstractionPattern::getFunctionParamType(unsigned index) const {
   default:
     llvm_unreachable("does not have function parameters");
   }
+}
+
+ParameterTypeFlags
+AbstractionPattern::getFunctionParamFlags(unsigned index) const {
+  return cast<AnyFunctionType>(getType()).getParams()[index]
+           .getParameterFlags();
 }
 
 unsigned AbstractionPattern::getNumFunctionParams() const {
@@ -893,16 +1182,19 @@ AbstractionPattern AbstractionPattern::getOptionalObjectType() const {
   case Kind::Type:
     if (isTypeParameterOrOpaqueArchetype())
       return AbstractionPattern::getOpaque();
-    return AbstractionPattern(getGenericSignature(),
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignature(),
                               ::getOptionalObjectType(getType()));
 
   case Kind::Discard:
-    return AbstractionPattern::getDiscard(getGenericSignature(),
+    return AbstractionPattern::getDiscard(getGenericSubstitutions(),
+                                          getGenericSignature(),
                                           ::getOptionalObjectType(getType()));
 
   case Kind::ClangType:
     // This is not reflected in clang types.
-    return AbstractionPattern(getGenericSignature(),
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignature(),
                               ::getOptionalObjectType(getType()),
                               getClangType());
   }
@@ -929,14 +1221,17 @@ AbstractionPattern AbstractionPattern::getReferenceStorageReferentType() const {
   case Kind::ObjCCompletionHandlerArgumentsType:
     return *this;
   case Kind::Type:
-    return AbstractionPattern(getGenericSignature(),
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignature(),
                               getType().getReferenceStorageReferent());
   case Kind::Discard:
-    return AbstractionPattern::getDiscard(getGenericSignature(),
+    return AbstractionPattern::getDiscard(getGenericSubstitutions(),
+                                          getGenericSignature(),
                                        getType().getReferenceStorageReferent());
   case Kind::ClangType:
     // This is not reflected in clang types.
-    return AbstractionPattern(getGenericSignature(),
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignature(),
                               getType().getReferenceStorageReferent(),
                               getClangType());
   }
@@ -976,16 +1271,19 @@ AbstractionPattern AbstractionPattern::getExistentialConstraintType() const {
   case Kind::Type:
     if (isTypeParameterOrOpaqueArchetype())
       return AbstractionPattern::getOpaque();
-    return AbstractionPattern(getGenericSignature(),
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignature(),
                               ::getExistentialConstraintType(getType()));
 
   case Kind::Discard:
     return AbstractionPattern::getDiscard(
-        getGenericSignature(), ::getExistentialConstraintType(getType()));
+        getGenericSubstitutions(), getGenericSignature(),
+        ::getExistentialConstraintType(getType()));
 
   case Kind::ClangType:
     // This is not reflected in clang types.
-    return AbstractionPattern(getGenericSignature(),
+    return AbstractionPattern(getGenericSubstitutions(),
+                              getGenericSignature(),
                               ::getExistentialConstraintType(getType()),
                               getClangType());
   }
@@ -1344,6 +1642,22 @@ AbstractionPattern::getParameterConvention(TypeConverter &TC) const {
   }
 }
 
+bool AbstractionPattern::arePackElementsPassedIndirectly(TypeConverter &TC) const {
+  assert(getKind() == Kind::Type && isa<PackExpansionType>(getType()));
+  // It makes sense to pass classes, metatypes, and similar sorts of
+  // types using direct packs.  At the other end of the spectrum, we
+  // definitely shouldn't pass types directly in packs if it's
+  // address-only and we'd need to do a non-trivial operation to move
+  // the value in and out of the pack.  There's also a size component
+  // to this analysis --- we shouldn't pass packs of enormous address-only
+  // structs directly --- and unfortunately we don't have that
+  // information at this point.
+  //
+  // The simplest thing to do is to just not use direct packs for now,
+  // but we should revisit that before locking down the ABI.
+  return true;
+}
+
 bool
 AbstractionPattern::operator==(const AbstractionPattern &other) const {
   if (TheKind != other.TheKind)
@@ -1431,9 +1745,22 @@ public:
     // If so, let's put a fresh generic parameter in the substituted signature
     // here.
     unsigned paramIndex = substGenericParams.size();
-    auto gp = GenericTypeParamType::get(false, 0, paramIndex, TC.Context);
+
+    bool isParameterPack = false;
+    if (substTy->isParameterPack() || substTy->is<PackArchetypeType>())
+      isParameterPack = true;
+    else if (pattern.isTypeParameterPack())
+      isParameterPack = true;
+
+    auto gp = GenericTypeParamType::get(isParameterPack, 0, paramIndex,
+                                        TC.Context);
     substGenericParams.push_back(gp);
-    substReplacementTypes.push_back(substTy);
+    if (isParameterPack) {
+      substReplacementTypes.push_back(
+          PackType::getSingletonPackExpansion(substTy));
+    } else {
+      substReplacementTypes.push_back(substTy);
+    }
     
     if (auto layout = pattern.getLayoutConstraint()) {
       // Look at the layout constraint on this position in the abstraction pattern
@@ -1584,119 +1911,31 @@ public:
     }
     
     auto decl = orig->getAnyNominal();
-    
-    // Any type parameters we use as arguments to the nominal type must still
-    // satisfy the requirements on the nominal type. So we pull all of the
-    // generic requirements from the nominal type declaration into the
-    // substituted signature, then same-type-constrain those variables to the
-    // types we get by recursively visiting the bound generic arguments.
+
     auto moduleDecl = decl->getParentModule();
-    auto origSubMap = orig->getContextSubstitutionMap(moduleDecl,
-                                                decl,
-                                                decl->getGenericEnvironment());
-    auto substSubMap = subst->getContextSubstitutionMap(moduleDecl, decl,
-                                                decl->getGenericEnvironment());
+    auto origSubMap = orig->getContextSubstitutionMap(moduleDecl, decl);
+    auto substSubMap = subst->getContextSubstitutionMap(moduleDecl, decl);
     
-    auto nomGenericSig = decl->getGenericSignature().getCanonicalSignature();
+    auto nomGenericSig = decl->getGenericSignature();
     
-    llvm::DenseMap<GenericTypeParamType*, GenericTypeParamType*>
-      substGPMapping;
-    
-    // Create parallel generic params for the nominal type's generic params.
-    for (unsigned i = 0; i < nomGenericSig.getGenericParams().size(); ++i) {
-      auto nomTyParam = nomGenericSig.getGenericParams()[i];
-      // If the nominal type same-type constrains away this generic parameter,
-      // we don't need to visit it.
-      if (nomGenericSig->isConcreteType(nomTyParam))
-        continue;
-      
-      unsigned substGPIndex = substGenericParams.size();
-      auto substGP = GenericTypeParamType::get(false, 0,
-                                               substGPIndex, TC.Context);
-      substGenericParams.push_back(substGP);
-      substReplacementTypes.push_back(Type());
-      substGPMapping.insert({nomGenericSig.getGenericParams()[i], substGP});
-    }
-    
-    // Create parallel requirements too, mapping from the generic signature's
-    // params to our parallel params.
-    auto substGPMap = SubstitutionMap::get(nomGenericSig,
-      [&](SubstitutableType *dt) -> Type {
-        auto mapping = substGPMapping.find(cast<GenericTypeParamType>(dt));
-        assert(mapping != substGPMapping.end());
-        return mapping->second;
-      }, [&](CanType dependentType,
-             Type conformingReplacementType,
-             ProtocolDecl *conformedProtocol) -> ProtocolConformanceRef {
-        // We should always be substituting type parameter for type parameter
-        return ProtocolConformanceRef(conformedProtocol);
-      });
-    
-    for (auto reqt : nomGenericSig.getRequirements()) {
-      auto firstTy = reqt.getFirstType().subst(substGPMap);
-      switch (auto kind = reqt.getKind()) {
-      case RequirementKind::SameShape:
-        llvm_unreachable("Same-shape requirement not supported here");
-
-      case RequirementKind::SameType:
-        // Skip same-type constraints that define away primary generic params,
-        // since we didn't duplicate those params.
-        if (reqt.getFirstType()->getAs<GenericTypeParamType>()
-            && nomGenericSig->isConcreteType(reqt.getFirstType()))
-          continue;
-          
-        LLVM_FALLTHROUGH;
-      case RequirementKind::Conformance:
-      case RequirementKind::Superclass: {
-        auto secondTy = reqt.getSecondType().subst(substGPMap);
-        substRequirements.push_back(Requirement(kind, firstTy, secondTy));
-        break;
-      }
-      case RequirementKind::Layout:
-        substRequirements.push_back(Requirement(kind, firstTy,
-                                                reqt.getLayoutConstraint()));
-        break;
-      }
-    }
-    
-    // Now recur into the type arguments, and same-type-constrain the
-    // substituted type arguments to the parallel generic parameter, giving us
-    // the intersection of constraints on the type binding and the nominal type's
-    // requirements.
-    llvm::DenseMap<GenericTypeParamType*, Type>
-      newGPMapping;
-
+    TypeSubstitutionMap replacementTypes;
     for (auto gp : nomGenericSig.getGenericParams()) {
-      if (nomGenericSig->isConcreteType(gp))
-        continue;
-      
       auto origParamTy = Type(gp).subst(origSubMap)
         ->getCanonicalType();
       auto substParamTy = Type(gp).subst(substSubMap)
         ->getCanonicalType();
-      
-      auto newParamTy = visit(substParamTy,
-                              AbstractionPattern(origSig, origParamTy));
-      newGPMapping.insert({gp, newParamTy});
-      auto substGPTy = Type(gp).subst(substGPMap)->castTo<GenericTypeParamType>();
-      substRequirements.push_back(Requirement(RequirementKind::SameType,
-                                              newParamTy,
-                                              substGPTy));
-      assert(!substReplacementTypes[substGPTy->getIndex()]);
-      substReplacementTypes[substGPTy->getIndex()] = substParamTy;
+
+      replacementTypes[gp->getCanonicalType()->castTo<SubstitutableType>()]
+          = visit(substParamTy, AbstractionPattern(origSig, origParamTy));
     }
-    
+
     auto newSubMap = SubstitutionMap::get(nomGenericSig,
-      [&](SubstitutableType *dt) -> Type {
-        auto mapping = newGPMapping.find(cast<GenericTypeParamType>(dt));
-        assert(mapping != newGPMapping.end());
-        return mapping->second;
-      }, [&](CanType dependentType,
-             Type conformingReplacementType,
-             ProtocolDecl *conformedProtocol) -> ProtocolConformanceRef {
-        // We should always be substituting type parameter for type parameter
-        return ProtocolConformanceRef(conformedProtocol);
-      });
+      QueryTypeSubstitutionMap{replacementTypes},
+      LookUpConformanceInModule(moduleDecl));
+    
+    for (auto reqt : nomGenericSig.getRequirements()) {
+      substRequirements.push_back(reqt.subst(newSubMap));
+    }
     
     return decl->getDeclaredInterfaceType().subst(newSubMap)->getCanonicalType();
   }
@@ -1728,11 +1967,30 @@ public:
   }
 
   CanType visitPackType(PackType *pack, AbstractionPattern pattern) {
-    llvm_unreachable("Unimplemented!");
+    if (auto gp = handleTypeParameterInAbstractionPattern(pattern, pack))
+      return gp;
+
+    // Break down the pack.
+    SmallVector<Type, 4> packElts;
+    for (unsigned i = 0; i < pack->getNumElements(); ++i) {
+      packElts.push_back(visit(pack->getElementType(i),
+                               pattern.getPackElementType(i)));
+    }
+
+    return CanType(PackType::get(TC.Context, packElts));
   }
 
-  CanType visitPackExpansionType(PackExpansionType *pack, AbstractionPattern pattern) {
-    llvm_unreachable("Unimplemented!");
+  CanType visitPackExpansionType(PackExpansionType *pack,
+                                 AbstractionPattern pattern) {
+    // Avoid walking into the pattern and count type if we can help it.
+    if (!pack->hasTypeParameter() && !pack->hasArchetype() &&
+        !pack->hasOpaqueArchetype()) {
+      return CanType(pack);
+    }
+
+    return CanType(PackExpansionType::get(
+        visit(pack->getPatternType(), pattern.getPackExpansionPatternType()),
+        visit(pack->getCountType(), pattern.getPackExpansionCountType())));
   }
 
   CanType visitExistentialType(ExistentialType *exist,

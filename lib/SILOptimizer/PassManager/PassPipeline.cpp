@@ -115,8 +115,8 @@ static void addDefiniteInitialization(SILPassPipelinePlan &P) {
 // should be in the -Onone pass pipeline and the prepare optimizations pipeline.
 static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
   P.startPipeline("Mandatory Diagnostic Passes + Enabling Optimization Passes");
-  P.addSILGenCleanup();
   P.addDiagnoseInvalidEscapingCaptures();
+  P.addReferenceBindingTransform();
   P.addDiagnoseStaticExclusivity();
   P.addNestedSemanticFunctionCheck();
   P.addCapturePromotion();
@@ -154,18 +154,16 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
   // resolution of nonescaping closure lifetimes to correctly check the use
   // of move-only values as captures in nonescaping closures as borrows.
 
-  // Check noImplicitCopy and move only types for addresses.
-  P.addMoveOnlyAddressChecker();
-  // Check noImplicitCopy and move only types for objects
-  P.addMoveOnlyObjectChecker();
+  // Check noImplicitCopy and move only types for objects and addresses.
+  P.addMoveOnlyChecker();
   // Convert last destroy_value to deinits.
   P.addMoveOnlyDeinitInsertion();
   // Lower move only wrapped trivial types.
   P.addTrivialMoveOnlyTypeEliminator();
-  // Check no uses after _move of a value in an address.
-  P.addMoveKillsCopyableAddressesChecker();
-  // No uses after _move of copyable value.
-  P.addMoveKillsCopyableValuesChecker();
+  // Check no uses after consume operator of a value in an address.
+  P.addConsumeOperatorCopyableAddressesChecker();
+  // No uses after consume operator of copyable value.
+  P.addConsumeOperatorCopyableValuesChecker();
 
   //
   // End Ownership Optimizations
@@ -237,12 +235,21 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
 }
 
 SILPassPipelinePlan
-SILPassPipelinePlan::getDiagnosticPassPipeline(const SILOptions &Options) {
+SILPassPipelinePlan::getSILGenPassPipeline(const SILOptions &Options) {
   SILPassPipelinePlan P(Options);
+  P.startPipeline("SILGen Passes");
+
+  P.addSILGenCleanup();
 
   if (SILViewSILGenCFG) {
     addCFGPrinterPipeline(P, "SIL View SILGen CFG");
   }
+  return P;
+}
+
+SILPassPipelinePlan
+SILPassPipelinePlan::getDiagnosticPassPipeline(const SILOptions &Options) {
+  SILPassPipelinePlan P(Options);
 
   // If we are asked do debug serialization, instead of running all diagnostic
   // passes, just run mandatory inlining with dead transparent function cleanup
@@ -572,7 +579,7 @@ static void addPrepareOptimizationsPipeline(SILPassPipelinePlan &P) {
 #endif
 
   P.addForEachLoopUnroll();
-  P.addOptimizedMandatoryCombine();
+  P.addSimplification();
   P.addAccessMarkerElimination();
 }
 
@@ -971,7 +978,7 @@ SILPassPipelinePlan::getOnonePassPipeline(const SILOptions &Options) {
   // in the editor.
   P.startPipeline("Non-Diagnostic Mandatory Optimizations");
   P.addForEachLoopUnroll();
-  P.addMandatoryCombine();
+  P.addOnoneSimplification();
 
   // TODO: MandatoryARCOpts should be subsumed by CopyPropagation. There should
   // be no need to run another analysis of copies at -Onone.
@@ -1010,6 +1017,12 @@ SILPassPipelinePlan::getOnonePassPipeline(const SILOptions &Options) {
 
   // In Onone builds, do a function-local analysis in a function pass.
   P.addFunctionStackProtection();
+
+  // This is mainly there to optimize `Builtin.isConcrete`, which must not be
+  // constant folded before any generic specialization.
+  P.addLateOnoneSimplification();
+
+  P.addCleanupDebugSteps();
 
   // Has only an effect if the -sil-based-debuginfo option is specified.
   P.addSILDebugInfoGenerator();

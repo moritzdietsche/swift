@@ -38,15 +38,21 @@ foreach(sdk ${SWIFT_SDKS})
     add_custom_target(cxxshim-${sdk}-${arch} ALL
                       DEPENDS ${outputs}
                       COMMENT "Copying cxxshims to ${module_dir}")
+    list(APPEND libcxxshim_modulemap_target_list cxxshim-${sdk}-${arch})
 
 
     swift_install_in_component(FILES libcxxshim.modulemap libcxxshim.h
                                DESTINATION "lib/swift/${arch_subdir}"
-                               COMPONENT sdk-overlay)
+                               COMPONENT compiler)
     if(SWIFT_BUILD_STATIC_STDLIB)
       swift_install_in_component(FILES libcxxshim.modulemap libcxxshim.h
                                  DESTINATION "lib/swift_static/${arch_subdir}"
-                                 COMPONENT sdk-overlay)
+                                 COMPONENT compiler)
     endif()
   endforeach()
 endforeach()
+
+add_custom_target(libcxxshim_modulemap DEPENDS ${libcxxshim_modulemap_target_list})
+set_property(TARGET libcxxshim_modulemap PROPERTY FOLDER "Miscellaneous")
+add_dependencies(sdk-overlay libcxxshim_modulemap)
+add_dependencies(compiler libcxxshim_modulemap)

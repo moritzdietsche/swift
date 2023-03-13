@@ -135,8 +135,9 @@ SILCombiner::optimizeApplyOfConvertFunctionInst(FullApplySite AI,
   if (auto *TTI = dyn_cast<ThinToThickFunctionInst>(funcOper))
     funcOper = TTI->getOperand();
 
-  auto *FRI = dyn_cast<FunctionRefInst>(funcOper);
-  if (!FRI)
+  if (!isa<FunctionRefInst>(funcOper) &&
+      // Optimizing partial_apply will then enable the partial_apply -> apply peephole.
+      !isa<PartialApplyInst>(funcOper))
     return nullptr;
 
   // Grab our relevant callee types...
@@ -151,8 +152,8 @@ SILCombiner::optimizeApplyOfConvertFunctionInst(FullApplySite AI,
   // relevant types from the ConvertFunction function type and AI.
   Builder.setCurrentDebugScope(AI.getDebugScope());
   OperandValueArrayRef Ops = AI.getArguments();
-  SILFunctionConventions substConventions(SubstCalleeTy, FRI->getModule());
-  SILFunctionConventions convertConventions(ConvertCalleeTy, FRI->getModule());
+  SILFunctionConventions substConventions(SubstCalleeTy, CFI->getModule());
+  SILFunctionConventions convertConventions(ConvertCalleeTy, CFI->getModule());
   auto context = AI.getFunction()->getTypeExpansionContext();
   auto oldOpRetTypes = substConventions.getIndirectSILResultTypes(context);
   auto newOpRetTypes = convertConventions.getIndirectSILResultTypes(context);
@@ -229,7 +230,7 @@ SILCombiner::optimizeApplyOfConvertFunctionInst(FullApplySite AI,
       Builder.createBranch(AI.getLoc(), TAI->getNormalBB(), branchArgs);
     }
     
-    return Builder.createTryApply(AI.getLoc(), FRI, SubstitutionMap(), Args,
+    return Builder.createTryApply(AI.getLoc(), funcOper, SubstitutionMap(), Args,
                                   normalBB, TAI->getErrorBB(),
                                   TAI->getApplyOptions());
   }
@@ -239,9 +240,9 @@ SILCombiner::optimizeApplyOfConvertFunctionInst(FullApplySite AI,
   // otherwise, we would be creating malformed SIL).
   ApplyOptions Options = AI.getApplyOptions();
   Options -= ApplyFlags::DoesNotThrow;
-  if (FRI->getFunctionType()->hasErrorResult())
+  if (funcOper->getType().castTo<SILFunctionType>()->hasErrorResult())
     Options |= ApplyFlags::DoesNotThrow;
-  ApplyInst *NAI = Builder.createApply(AI.getLoc(), FRI, SubstitutionMap(),
+  ApplyInst *NAI = Builder.createApply(AI.getLoc(), funcOper, SubstitutionMap(),
                                        Args, Options);
   SILInstruction *result = NAI;
   
@@ -343,8 +344,11 @@ bool SILCombiner::tryOptimizeKeypathOffsetOf(ApplyInst *AI,
 
   KeyPathPattern *pattern = kp->getPattern();
   SubstitutionMap patternSubs = kp->getSubstitutions();
-  CanType rootTy = pattern->getRootType().subst(patternSubs)->getCanonicalType();
-  CanType parentTy = rootTy;
+  SILFunction *f = AI->getFunction();
+  SILType rootTy = f->getLoweredType(Lowering::AbstractionPattern::getOpaque(),
+      pattern->getRootType().subst(patternSubs)->getCanonicalType());
+
+  SILType parentTy = rootTy;
   
   // First check if _storedInlineOffset would return an offset or nil. Basically
   // only stored struct and tuple elements produce an offset. Everything else
@@ -381,14 +385,15 @@ bool SILCombiner::tryOptimizeKeypathOffsetOf(ApplyInst *AI,
       hasOffset = false;
       break;
     }
-    parentTy = component.getComponentType();
+    parentTy = f->getLoweredType(Lowering::AbstractionPattern::getOpaque(),
+                                 component.getComponentType());
   }
 
   SILLocation loc = AI->getLoc();
   SILValue result;
 
   if (hasOffset) {
-    SILType rootAddrTy = SILType::getPrimitiveAddressType(rootTy);
+    SILType rootAddrTy = rootTy.getAddressType();
     SILValue rootAddr = Builder.createBaseAddrForOffset(loc, rootAddrTy);
 
     auto projector = KeyPathProjector::create(kp, rootAddr, loc, Builder);
@@ -668,8 +673,8 @@ bool SILCombiner::eraseApply(FullApplySite FAS, const UserListTy &Users) {
       auto Arg = FAS.getArgument(i);
       switch (PI.getConvention()) {
         case ParameterConvention::Indirect_In:
-        case ParameterConvention::Indirect_In_Constant:
         case ParameterConvention::Direct_Owned:
+        case ParameterConvention::Pack_Owned:
           Builder.emitDestroyOperation(FAS.getLoc(), Arg);
           break;
         case ParameterConvention::Indirect_In_Guaranteed:
@@ -677,6 +682,8 @@ bool SILCombiner::eraseApply(FullApplySite FAS, const UserListTy &Users) {
         case ParameterConvention::Indirect_InoutAliasable:
         case ParameterConvention::Direct_Unowned:
         case ParameterConvention::Direct_Guaranteed:
+        case ParameterConvention::Pack_Guaranteed:
+        case ParameterConvention::Pack_Inout:
           break;
       }
     }
@@ -855,9 +862,9 @@ void SILCombiner::buildConcreteOpenedExistentialInfos(
 
     auto OptionalCOEI =
         buildConcreteOpenedExistentialInfo(Apply.getArgumentOperands()[ArgIdx]);
-    if (!OptionalCOEI.hasValue())
+    if (!OptionalCOEI.has_value())
       continue;
-    auto COEI = OptionalCOEI.getValue();
+    auto COEI = OptionalCOEI.value();
     assert(COEI.isValid());
     COEIs.try_emplace(ArgIdx, COEI);
   }
@@ -1449,7 +1456,11 @@ SILInstruction *SILCombiner::visitApplyInst(ApplyInst *AI) {
   if (isa<PartialApplyInst>(AI->getCallee()))
     return nullptr;
 
-  if (auto *CFI = dyn_cast<ConvertFunctionInst>(AI->getCallee()))
+  SILValue callee = AI->getCallee();
+  if (auto *cee = dyn_cast<ConvertEscapeToNoEscapeInst>(callee)) {
+    callee = cee->getOperand();
+  }
+  if (auto *CFI = dyn_cast<ConvertFunctionInst>(callee))
     return optimizeApplyOfConvertFunctionInst(AI, CFI);
 
   if (tryOptimizeKeypath(AI))

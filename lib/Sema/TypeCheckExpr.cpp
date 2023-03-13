@@ -647,7 +647,7 @@ Type TypeChecker::getDefaultType(ProtocolDecl *protocol, DeclContext *dc) {
   if (auto knownProtocolKindIfAny = getKnownProtocolKindIfAny(protocol)) {
     return evaluateOrDefault(
         protocol->getASTContext().evaluator,
-        DefaultTypeRequest{knownProtocolKindIfAny.getValue(), dc}, nullptr);
+        DefaultTypeRequest{knownProtocolKindIfAny.value(), dc}, nullptr);
   }
   return Type();
 }
@@ -777,6 +777,10 @@ bool ClosureHasExplicitResultRequest::evaluate(Evaluator &evaluator,
   class FindReturns : public ASTWalker {
     bool FoundResultReturn = false;
     bool FoundNoResultReturn = false;
+
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Expansion;
+    }
 
     PreWalkResult<Expr *> walkToExprPre(Expr *expr) override {
       return Action::SkipChildren(expr);

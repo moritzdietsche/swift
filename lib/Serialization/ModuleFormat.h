@@ -58,7 +58,7 @@ const uint16_t SWIFTMODULE_VERSION_MAJOR = 0;
 /// describe what change you made. The content of this comment isn't important;
 /// it just ensures a conflict if two people change the module format.
 /// Don't worry about adhering to the 80-column limit for this line.
-const uint16_t SWIFTMODULE_VERSION_MINOR = 719;  // isBuiltFromInterface
+const uint16_t SWIFTMODULE_VERSION_MINOR = 752; // mark_unresolved_ref_binding
 
 /// A standard hash seed used for all string hashes in a serialized module.
 ///
@@ -335,18 +335,21 @@ using CtorInitializerKindField = BCFixed<2>;
 enum class ParamDeclSpecifier : uint8_t {
   Default = 0,
   InOut = 1,
-  Shared = 2,
-  Owned = 3,
+  Borrowing = 2,
+  Consuming = 3,
+  LegacyShared = 4,
+  LegacyOwned = 5,
 };
-using ParamDeclSpecifierField = BCFixed<2>;
+using ParamDeclSpecifierField = BCFixed<3>;
 
 // These IDs must \em not be renumbered or reordered without incrementing
 // the module version.
 enum class VarDeclIntroducer : uint8_t {
   Let = 0,
-  Var = 1
+  Var = 1,
+  InOut = 2,
 };
-using VarDeclIntroducerField = BCFixed<1>;
+using VarDeclIntroducerField = BCFixed<2>;
 
 // These IDs must \em not be renumbered or reordered without incrementing
 // the module version.
@@ -359,6 +362,9 @@ enum class ParameterConvention : uint8_t {
   Direct_Guaranteed,
   Indirect_In_Guaranteed,
   Indirect_In_Constant,
+  Pack_Owned,
+  Pack_Inout,
+  Pack_Guaranteed,
 };
 using ParameterConventionField = BCFixed<4>;
 
@@ -377,6 +383,7 @@ enum class ResultConvention : uint8_t {
   Unowned,
   UnownedInnerPointer,
   Autoreleased,
+  Pack,
 };
 using ResultConventionField = BCFixed<3>;
 
@@ -399,9 +406,11 @@ using MetatypeRepresentationField = BCFixed<2>;
 enum class SelfAccessKind : uint8_t {
   NonMutating = 0,
   Mutating,
+  LegacyConsuming,
   Consuming,
+  Borrowing
 };
-using SelfAccessKindField = BCFixed<2>;
+using SelfAccessKindField = BCFixed<3>;
   
 /// Translates an operator decl fixity to a Serialization fixity, whose values
 /// are guaranteed to be stable.
@@ -478,16 +487,6 @@ using ReferenceOwnershipField = BCFixed<2>;
 
 // These IDs must \em not be renumbered or reordered without incrementing
 // the module version.
-enum ValueOwnership : uint8_t {
-  Default = 0,
-  InOut,
-  Shared,
-  Owned
-};
-using ValueOwnershipField = BCFixed<2>;
-
-// These IDs must \em not be renumbered or reordered without incrementing
-// the module version.
 enum class DefaultArgumentKind : uint8_t {
   None = 0,
   Normal,
@@ -521,6 +520,7 @@ enum class AccessLevel : uint8_t {
   Private = 0,
   FilePrivate,
   Internal,
+  Package,
   Public,
   Open,
 };
@@ -584,7 +584,9 @@ enum class ImportControl : uint8_t {
   /// `@_exported import FooKit`
   Exported,
   /// `@_uncheckedImplementationOnly import FooKit`
-  ImplementationOnly
+  ImplementationOnly,
+  /// `package import FooKit`
+  PackageOnly
 };
 using ImportControlField = BCFixed<2>;
 
@@ -604,6 +606,31 @@ enum class GenericEnvironmentKind : uint8_t {
   OpenedExistential,
   OpenedElement
 };
+
+// These IDs must \em not be renumbered or reordered without incrementing
+// the module version.
+enum class MacroRole : uint8_t {
+  Expression,
+  Declaration,
+  Accessor,
+  MemberAttribute,
+  Member,
+  Peer,
+  Conformance,
+};
+using MacroRoleField = BCFixed<3>;
+
+// These IDs must \em not be renumbered or reordered without incrementing
+// the module version.
+enum class MacroIntroducedDeclNameKind : uint8_t {
+  Named = 0,
+  Overloaded,
+  Accessors,
+  Prefixed,
+  Suffixed,
+  Arbitrary,
+};
+using MacroIntroducedDeclNameKindField = BCFixed<4>;
 
 // Encodes a VersionTuple:
 //
@@ -634,13 +661,13 @@ enum class GenericEnvironmentKind : uint8_t {
     unsigned X##_Major = 0, X##_Minor = 0, X##_Subminor = 0,\
              X##_HasMinor = 0, X##_HasSubminor = 0;\
     const auto &X##_Val = X_Expr;\
-    if (X##_Val.hasValue()) {\
-      const auto &Y = X##_Val.getValue();\
+    if (X##_Val.has_value()) {\
+      const auto &Y = X##_Val.value();\
       X##_Major = Y.getMajor();\
-      X##_Minor = Y.getMinor().getValueOr(0);\
-      X##_Subminor = Y.getSubminor().getValueOr(0);\
-      X##_HasMinor = Y.getMinor().hasValue();\
-      X##_HasSubminor = Y.getSubminor().hasValue();\
+      X##_Minor = Y.getMinor().value_or(0);\
+      X##_Subminor = Y.getSubminor().value_or(0);\
+      X##_HasMinor = Y.getMinor().has_value();\
+      X##_HasSubminor = Y.getSubminor().has_value();\
     }
 
 /// The various types of blocks that can occur within a serialized Swift
@@ -769,7 +796,8 @@ namespace control_block {
     TARGET,
     SDK_NAME,
     REVISION,
-    IS_OSSA
+    IS_OSSA,
+    ALLOWABLE_CLIENT_NAME
   };
 
   using MetadataLayout = BCRecordLayout<
@@ -809,6 +837,11 @@ namespace control_block {
     IS_OSSA,
     BCFixed<1>
   >;
+
+  using AllowableClientLayout = BCRecordLayout<
+    ALLOWABLE_CLIENT_NAME,
+    BCBlob
+  >;
 }
 
 /// The record types within the options block (a sub-block of the control
@@ -830,6 +863,8 @@ namespace options_block {
     IS_ALLOW_MODULE_WITH_COMPILER_ERRORS_ENABLED,
     MODULE_ABI_NAME,
     IS_CONCURRENCY_CHECKED,
+    MODULE_PACKAGE_NAME,
+    MODULE_EXPORT_AS_NAME,
   };
 
   using SDKPathLayout = BCRecordLayout<
@@ -887,6 +922,16 @@ namespace options_block {
 
   using IsConcurrencyCheckedLayout = BCRecordLayout<
     IS_CONCURRENCY_CHECKED
+  >;
+
+  using ModulePackageNameLayout = BCRecordLayout<
+    MODULE_PACKAGE_NAME,
+    BCBlob
+  >;
+
+  using ModuleExportAsNameLayout = BCRecordLayout<
+    MODULE_EXPORT_AS_NAME,
+    BCBlob
   >;
 }
 
@@ -1110,7 +1155,7 @@ namespace decls_block {
     BCFixed<1>,          // vararg?
     BCFixed<1>,          // autoclosure?
     BCFixed<1>,          // non-ephemeral?
-    ValueOwnershipField, // inout, shared or owned?
+    ParamDeclSpecifierField, // inout, shared or owned?
     BCFixed<1>,          // isolated
     BCFixed<1>,          // noDerivative?
     BCFixed<1>           // compileTimeConst
@@ -1272,6 +1317,27 @@ namespace decls_block {
     TypeIDField  // parent
   );
 
+  TYPE_LAYOUT(PackExpansionTypeLayout,
+    PACK_EXPANSION_TYPE,
+    TypeIDField, // pattern type
+    TypeIDField  // count type
+  );
+
+  TYPE_LAYOUT(PackTypeLayout,
+    PACK_TYPE
+  );
+
+  using PackTypeEltLayout = BCRecordLayout<
+    PACK_TYPE_ELT,
+    TypeIDField         // type
+  >;
+
+  TYPE_LAYOUT(SILPackTypeLayout,
+    SIL_PACK_TYPE,
+    BCFixed<1>,         // is address
+    BCArray<TypeIDField>// component types
+  );
+
   using TypeAliasLayout = BCRecordLayout<
     TYPE_ALIAS_DECL,
     IdentifierIDField, // name
@@ -1388,6 +1454,7 @@ namespace decls_block {
     CtorInitializerKindField,  // initializer kind
     GenericSignatureIDField, // generic environment
     DeclIDField, // overridden decl
+    BCFixed<1>,   // whether the overridden decl affects ABI
     AccessLevelField, // access level
     BCFixed<1>,   // requires a new vtable slot
     BCFixed<1>,   // 'required' but overridden is not (used for recovery)
@@ -1647,6 +1714,25 @@ namespace decls_block {
     // This record is trailed by its inlinable body text
   >;
 
+  using MacroLayout = BCRecordLayout<
+    MACRO_DECL,
+    DeclContextIDField,  // context decl
+    BCFixed<1>,   // implicit?
+    GenericSignatureIDField, // generic environment
+    BCFixed<1>,   // whether there is a parameter list
+    TypeIDField,  // result interface type
+    AccessLevelField, // access level
+    BCVBR<5>,    // number of parameter name components
+    BCVBR<3>,    // builtin macro definition ID
+    IdentifierIDField, // external module name, for external macros
+    IdentifierIDField,  // external type name, for external macros
+    BCArray<IdentifierIDField> // name components,
+                               // followed by TypeID dependencies
+    // The record is trailed by:
+    // - its generic parameters, if any
+    // - parameter list, if present
+  >;
+
   using InlinableBodyTextLayout = BCRecordLayout<
     INLINABLE_BODY_TEXT,
     BCBlob // body text
@@ -1713,8 +1799,9 @@ namespace decls_block {
   using GenericEnvironmentLayout = BCRecordLayout<
     GENERIC_ENVIRONMENT,
     BCFixed<1>,                  // GenericEnvironmentKind
-    TypeIDField,                 // existential type
-    GenericSignatureIDField      // parent signature
+    TypeIDField,                 // existential type or shape class
+    GenericSignatureIDField,     // parent signature
+    SubstitutionMapIDField       // substitution map
   >;
 
   using SubstitutionMapLayout = BCRecordLayout<
@@ -1760,6 +1847,11 @@ namespace decls_block {
   using FilenameForPrivateLayout = BCRecordLayout<
     FILENAME_FOR_PRIVATE,
     IdentifierIDField  // the file name, as an identifier
+  >;
+
+  using DeserializationSafetyLayout = BCRecordLayout<
+    DESERIALIZATION_SAFETY,
+    IdentifierIDField // name to debug access to unsafe decl
   >;
 
   using NormalProtocolConformanceLayout = BCRecordLayout<
@@ -2121,8 +2213,8 @@ namespace decls_block {
     BCBlob      // Message
   >;
 
-  using BackDeployDeclAttrLayout = BCRecordLayout<
-    BackDeploy_DECL_ATTR,
+  using BackDeployedDeclAttrLayout = BCRecordLayout<
+    BackDeployed_DECL_ATTR,
     BCFixed<1>,     // implicit flag
     BC_AVAIL_TUPLE, // OS version
     BCVBR<5>        // platform
@@ -2139,6 +2231,15 @@ namespace decls_block {
     IdentifierIDField,  // metadata text
     BCFixed<1>,         // has visibility
     AccessLevelField    // visibility
+  >;
+
+  using MacroRoleDeclAttrLayout = BCRecordLayout<
+    MacroRole_DECL_ATTR,
+    BCFixed<1>,                // implicit flag
+    BCFixed<1>,                // macro syntax
+    MacroRoleField,            // macro role
+    BCVBR<5>,                  // number of names
+    BCArray<IdentifierIDField> // introduced decl name kind and identifier pairs
   >;
 
 #undef SYNTAX_SUGAR_TYPE_LAYOUT
@@ -2178,6 +2279,8 @@ static inline decls_block::RecordKind getKindForTable(const Decl *D) {
     return decls_block::CONSTRUCTOR_DECL;
   case DeclKind::Destructor:
     return decls_block::DESTRUCTOR_DECL;
+  case DeclKind::Macro:
+    return decls_block::MACRO_DECL;
 
   default:
     llvm_unreachable("cannot store this kind of decl in a hash table");

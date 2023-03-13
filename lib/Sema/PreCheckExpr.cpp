@@ -399,76 +399,6 @@ static BinaryExpr *getCompositionExpr(Expr *expr) {
   return nullptr;
 }
 
-/// Whether the given expression "looks like" a (possibly sugared) type. For
-/// example, `(foo, bar)` "looks like" a type, but `foo + bar` does not.
-static bool exprLooksLikeAType(Expr *expr) {
-  return isa<OptionalEvaluationExpr>(expr) ||
-      isa<BindOptionalExpr>(expr) ||
-      isa<ForceValueExpr>(expr) ||
-      isa<ParenExpr>(expr) ||
-      isa<ArrowExpr>(expr) ||
-      isa<TupleExpr>(expr) ||
-      (isa<ArrayExpr>(expr) &&
-       cast<ArrayExpr>(expr)->getElements().size() == 1) ||
-      (isa<DictionaryExpr>(expr) &&
-       cast<DictionaryExpr>(expr)->getElements().size() == 1) ||
-      getCompositionExpr(expr);
-}
-
-static Expr *getPackExpansion(DeclContext *dc, Expr *expr, SourceLoc opLoc) {
-  struct PackReferenceFinder : public ASTWalker {
-    DeclContext *dc;
-    llvm::SmallVector<OpaqueValueExpr *, 2> opaqueValues;
-    llvm::SmallVector<Expr *, 2> bindings;
-    GenericEnvironment *environment;
-
-    PackReferenceFinder(DeclContext *dc)
-      : dc(dc), environment(nullptr) {}
-
-    virtual PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
-      auto &ctx = dc->getASTContext();
-
-      if (auto *declRef = dyn_cast<DeclRefExpr>(E)) {
-        auto *decl = dyn_cast<VarDecl>(declRef->getDecl());
-        if (!decl)
-          return Action::Continue(E);
-
-        if (auto expansionType = decl->getType()->getAs<PackExpansionType>()) {
-          auto sourceRange = declRef->getSourceRange();
-
-          // Map the pattern interface type into the context of the opened
-          // element signature.
-          if (!environment) {
-            auto sig = ctx.getOpenedElementSignature(
-                dc->getGenericSignatureOfContext().getCanonicalSignature());
-            environment = GenericEnvironment::forOpenedElement(sig, UUID::fromTime());
-          }
-          auto elementType = environment->mapPackTypeIntoElementContext(
-              expansionType->getPatternType()->mapTypeOutOfContext());
-
-          auto *opaqueValue = new (ctx) OpaqueValueExpr(sourceRange, elementType);
-          opaqueValues.push_back(opaqueValue);
-          bindings.push_back(declRef);
-          return Action::Continue(opaqueValue);
-        }
-      }
-
-      return Action::Continue(E);
-    }
-  } packReferenceFinder(dc);
-
-  auto *pattern = expr->walk(packReferenceFinder);
-
-  if (!packReferenceFinder.bindings.empty()) {
-    return PackExpansionExpr::create(dc->getASTContext(), pattern,
-                                     packReferenceFinder.opaqueValues,
-                                     packReferenceFinder.bindings,
-                                     opLoc, packReferenceFinder.environment);
-  }
-
-  return nullptr;
-}
-
 /// Bind an UnresolvedDeclRefExpr by performing name lookup and
 /// returning the resultant expression. Context is the DeclContext used
 /// for the lookup.
@@ -1000,6 +930,9 @@ namespace {
     /// The current number of nested \c SequenceExprs that we're within.
     unsigned SequenceExprDepth = 0;
 
+    /// The current number of nested \c SingleValueStmtExprs that we're within.
+    unsigned SingleValueStmtExprDepth = 0;
+
     /// Simplify expressions which are type sugar productions that got parsed
     /// as expressions due to the parser not knowing which identifiers are
     /// type names.
@@ -1020,6 +953,10 @@ namespace {
     /// resolution failure, or `nullptr` if transformation is not applicable.
     Expr *simplifyTypeConstructionWithLiteralArg(Expr *E);
 
+    /// Whether the given expression "looks like" a (possibly sugared) type. For
+    /// example, `(foo, bar)` "looks like" a type, but `foo + bar` does not.
+    bool exprLooksLikeAType(Expr *expr);
+
     /// Whether the current expression \p E is in a context that might turn out
     /// to be a \c TypeExpr after \c simplifyTypeExpr is called up the tree.
     /// This function allows us to make better guesses about whether invalid
@@ -1035,141 +972,12 @@ namespace {
     /// In Swift < 5, diagnose and correct invalid multi-argument or
     /// argument-labeled interpolations. Returns \c true if the AST walk should
     /// continue, or \c false if it should be aborted.
-    bool correctInterpolationIfStrange(InterpolatedStringLiteralExpr *ISLE) {
-      // These expressions are valid in Swift 5+.
-      if (getASTContext().isSwiftVersionAtLeast(5))
-        return true;
-
-      /// Diagnoses appendInterpolation(...) calls with multiple
-      /// arguments or argument labels and corrects them.
-      class StrangeInterpolationRewriter : public ASTWalker {
-        ASTContext &Context;
-
-      public:
-        StrangeInterpolationRewriter(ASTContext &Ctx) : Context(Ctx) {}
-
-        virtual PreWalkAction walkToDeclPre(Decl *D) override {
-          // We don't want to look inside decls.
-          return Action::SkipChildren();
-        }
-
-        virtual PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
-          // One InterpolatedStringLiteralExpr should never be nested inside
-          // another except as a child of a CallExpr, and we don't recurse into
-          // the children of CallExprs.
-          assert(!isa<InterpolatedStringLiteralExpr>(E) &&
-                 "StrangeInterpolationRewriter found nested interpolation?");
-
-          // We only care about CallExprs.
-          if (!isa<CallExpr>(E))
-            return Action::Continue(E);
-
-          auto *call = cast<CallExpr>(E);
-          auto *args = call->getArgs();
-
-          auto lParen = args->getLParenLoc();
-          auto rParen = args->getRParenLoc();
-
-          if (auto callee = dyn_cast<UnresolvedDotExpr>(call->getFn())) {
-            if (callee->getName().getBaseName() ==
-                Context.Id_appendInterpolation) {
-
-              Optional<Argument> newArg;
-              if (args->size() > 1) {
-                auto *secondArg = args->get(1).getExpr();
-                Context.Diags
-                    .diagnose(secondArg->getLoc(),
-                              diag::string_interpolation_list_changing)
-                    .highlightChars(secondArg->getLoc(), rParen);
-                Context.Diags
-                    .diagnose(secondArg->getLoc(),
-                              diag::string_interpolation_list_insert_parens)
-                    .fixItInsertAfter(lParen, "(")
-                    .fixItInsert(rParen, ")");
-
-                // Make sure we don't have an inout arg somewhere, as that's
-                // invalid even with the compatibility fix.
-                for (auto arg : *args) {
-                  if (arg.isInOut()) {
-                    Context.Diags.diagnose(arg.getExpr()->getStartLoc(),
-                                           diag::extraneous_address_of);
-                    return Action::Stop();
-                  }
-                }
-
-                // Form a new argument tuple from the argument list.
-                auto *packed = args->packIntoImplicitTupleOrParen(Context);
-                newArg = Argument::unlabeled(packed);
-              } else if (args->size() == 1 &&
-                         args->front().getLabel() != Identifier()) {
-                // Form a new argument that drops the label.
-                auto *argExpr = args->front().getExpr();
-                newArg = Argument::unlabeled(argExpr);
-
-                SourceLoc argLabelLoc = args->front().getLabelLoc(),
-                          argLoc = argExpr->getStartLoc();
-
-                Context.Diags
-                    .diagnose(argLabelLoc,
-                              diag::string_interpolation_label_changing)
-                    .highlightChars(argLabelLoc, argLoc);
-                Context.Diags
-                    .diagnose(argLabelLoc,
-                              diag::string_interpolation_remove_label,
-                              args->front().getLabel())
-                    .fixItRemoveChars(argLabelLoc, argLoc);
-              }
-
-              // If newArg is no longer null, we need to build a new
-              // appendInterpolation(_:) call that takes it to replace the bad
-              // appendInterpolation(...) call.
-              if (newArg) {
-                auto newCallee = new (Context) UnresolvedDotExpr(
-                    callee->getBase(), /*dotloc=*/SourceLoc(),
-                    DeclNameRef(Context.Id_appendInterpolation),
-                    /*nameloc=*/DeclNameLoc(), /*Implicit=*/true);
-
-                auto *newArgList =
-                    ArgumentList::create(Context, lParen, {*newArg}, rParen,
-                                         /*trailingClosureIdx*/ None,
-                                         /*implicit*/ false);
-                E = CallExpr::create(Context, newCallee, newArgList,
-                                     /*implicit=*/false);
-              }
-            }
-          }
-
-          // There is never a CallExpr between an InterpolatedStringLiteralExpr
-          // and an un-typechecked appendInterpolation(...) call, so whether we
-          // changed E or not, we don't need to recurse any deeper.
-          return Action::SkipChildren(E);
-        }
-      };
-
-      return ISLE->getAppendingExpr()->walk(
-          StrangeInterpolationRewriter(getASTContext()));
-    }
+    bool correctInterpolationIfStrange(InterpolatedStringLiteralExpr *ISLE);
 
     /// Scout out the specified destination of an AssignExpr to recursively
     /// identify DiscardAssignmentExpr in legal places.  We can only allow them
     /// in simple pattern-like expressions, so we reject anything complex here.
-    void markAcceptableDiscardExprs(Expr *E) {
-      if (!E) return;
-
-      if (auto *PE = dyn_cast<ParenExpr>(E))
-        return markAcceptableDiscardExprs(PE->getSubExpr());
-      if (auto *TE = dyn_cast<TupleExpr>(E)) {
-        for (auto &elt : TE->getElements())
-          markAcceptableDiscardExprs(elt);
-        return;
-      }
-      if (auto *BOE = dyn_cast<BindOptionalExpr>(E))
-        return markAcceptableDiscardExprs(BOE->getSubExpr());
-      if (auto *DAE = dyn_cast<DiscardAssignmentExpr>(E))
-        CorrectDiscardAssignmentExprs.insert(DAE);
-
-      // Otherwise, we can't support this.
-    }
+    void markAcceptableDiscardExprs(Expr *E);
 
   public:
     PreCheckExpression(DeclContext *dc, Expr *parent,
@@ -1185,28 +993,11 @@ namespace {
 
     bool shouldWalkCaptureInitializerExpressions() override { return true; }
 
-    VarDecl *getImplicitSelfDeclForSuperContext(SourceLoc Loc) {
-      auto *methodContext = DC->getInnermostMethodContext();
-      if (!methodContext) {
-        Ctx.Diags.diagnose(Loc, diag::super_not_in_class_method);
-        return nullptr;
-      }
-
-      // Do an actual lookup for 'self' in case it shows up in a capture list.
-      auto *methodSelf = methodContext->getImplicitSelfDecl();
-      auto *lookupSelf = ASTScope::lookupSingleLocalDecl(DC->getParentSourceFile(),
-                                                         Ctx.Id_self, Loc);
-      if (lookupSelf && lookupSelf != methodSelf) {
-        // FIXME: This is the wrong diagnostic for if someone manually declares a
-        // variable named 'self' using backticks.
-        Ctx.Diags.diagnose(Loc, diag::super_in_closure_with_capture);
-        Ctx.Diags.diagnose(lookupSelf->getLoc(),
-                           diag::super_in_closure_with_capture_here);
-        return nullptr;
-      }
-
-      return methodSelf;
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Arguments;
     }
+
+    VarDecl *getImplicitSelfDeclForSuperContext(SourceLoc Loc) ;
 
     PreWalkResult<Expr *> walkToExprPre(Expr *expr) override {
       // FIXME(diagnostics): `InOutType` could appear here as a result
@@ -1264,6 +1055,13 @@ namespace {
       // we've determine the complete function type.
       if (auto closure = dyn_cast<ClosureExpr>(expr))
         return finish(walkToClosureExprPre(closure), expr);
+
+      if (auto *SVE = dyn_cast<SingleValueStmtExpr>(expr)) {
+        // Record the scope of a single value stmt expr, as we want to skip
+        // pre-checking of any patterns, similar to closures.
+        SingleValueStmtExprDepth += 1;
+        return finish(true, expr);
+      }
 
       if (auto unresolved = dyn_cast<UnresolvedDeclRefExpr>(expr)) {
         TypeChecker::checkForForbiddenPrefix(
@@ -1361,19 +1159,6 @@ namespace {
         return Action::Continue(result);
       }
 
-      // Rewrite postfix unary '...' expressions containing pack
-      // references to PackExpansionExpr.
-      if (auto *postfixExpr = dyn_cast<PostfixUnaryExpr>(expr)) {
-        auto *op = dyn_cast<OverloadedDeclRefExpr>(postfixExpr->getFn());
-        if (op && Ctx.LangOpts.hasFeature(Feature::VariadicGenerics) &&
-            op->getDecls()[0]->getBaseName().getIdentifier().isExpansionOperator()) {
-          auto *operand = postfixExpr->getOperand();
-          if (auto *expansion = getPackExpansion(DC, operand, op->getLoc())) {
-            return Action::Continue(expansion);
-          }
-        }
-      }
-
       // Type check the type parameters in an UnresolvedSpecializeExpr.
       if (auto *us = dyn_cast<UnresolvedSpecializeExpr>(expr)) {
         if (auto *typeExpr = simplifyUnresolvedSpecializeExpr(us))
@@ -1385,6 +1170,10 @@ namespace {
         assert(DC == ce && "DeclContext imbalance");
         DC = ce->getParent();
       }
+
+      // Restore the depth for the single value stmt counter.
+      if (isa<SingleValueStmtExpr>(expr))
+        SingleValueStmtExprDepth -= 1;
 
       // A 'self.init' or 'super.init' application inside a constructor will
       // evaluate to void, with the initializer's result implicitly rebound
@@ -1529,6 +1318,17 @@ namespace {
     }
 
     PreWalkResult<Stmt *> walkToStmtPre(Stmt *stmt) override {
+      if (auto *RS = dyn_cast<ReturnStmt>(stmt)) {
+        // Pre-check a return statement, which includes potentially turning it
+        // into a FailStmt.
+        auto &eval = Ctx.evaluator;
+        auto *S = evaluateOrDefault(eval, PreCheckReturnStmtRequest{RS, DC},
+                                    nullptr);
+        if (!S)
+          return Action::Stop();
+
+        return Action::Continue(S);
+      }
       return Action::Continue(stmt);
     }
 
@@ -1538,9 +1338,10 @@ namespace {
 
     PreWalkResult<Pattern *> walkToPatternPre(Pattern *pattern) override {
       // Constraint generation is responsible for pattern verification and
-      // type-checking in the body of the closure, so there is no need to
-      // walk into patterns.
-      return Action::SkipChildrenIf(isa<ClosureExpr>(DC), pattern);
+      // type-checking in the body of the closure and single value stmt expr,
+      // so there is no need to walk into patterns.
+      return Action::SkipChildrenIf(
+          isa<ClosureExpr>(DC) || SingleValueStmtExprDepth > 0, pattern);
     }
   };
 } // end anonymous namespace
@@ -1548,6 +1349,23 @@ namespace {
 /// Perform prechecking of a ClosureExpr before we dive into it.  This returns
 /// true when we want the body to be considered part of this larger expression.
 bool PreCheckExpression::walkToClosureExprPre(ClosureExpr *closure) {
+  // If we have a single statement that can become an expression, turn it
+  // into an expression now. This needs to happen before we check
+  // LeaveClosureBodiesUnchecked, as the closure may become a single expression
+  // closure.
+  auto *body = closure->getBody();
+  if (body->getNumElements() == 1) {
+    if (auto *S = body->getLastElement().dyn_cast<Stmt *>()) {
+      if (S->mayProduceSingleValue(Ctx)) {
+        auto *SVE = SingleValueStmtExpr::createWithWrappedBranches(
+            Ctx, S, /*DC*/ closure, /*mustBeExpr*/ false);
+        auto *RS = new (Ctx) ReturnStmt(SourceLoc(), SVE);
+        body->setLastElement(RS);
+        closure->setBody(body, /*isSingleExpression*/ true);
+      }
+    }
+  }
+
   // If we won't be checking the body of the closure, don't walk into it here.
   if (!closure->hasSingleExpressionBody()) {
     if (LeaveClosureBodiesUnchecked)
@@ -1573,8 +1391,9 @@ TypeExpr *PreCheckExpression::simplifyNestedTypeExpr(UnresolvedDotExpr *UDE) {
 
   // Qualified type lookup with a module base is represented as a DeclRefExpr
   // and not a TypeExpr.
-  if (auto *DRE = dyn_cast<DeclRefExpr>(UDE->getBase())) {
-    if (auto *TD = dyn_cast<TypeDecl>(DRE->getDecl())) {
+  auto handleNestedTypeLookup = [&](
+      TypeDecl *TD, DeclNameLoc ParentNameLoc
+    ) -> TypeExpr * {
       // See if the type has a member type with this name.
       auto Result = TypeChecker::lookupMemberType(
           DC, TD->getDeclaredInterfaceType(), Name,
@@ -1584,9 +1403,42 @@ TypeExpr *PreCheckExpression::simplifyNestedTypeExpr(UnresolvedDotExpr *UDE) {
       // a non-type member, so leave the expression as-is.
       if (Result.size() == 1) {
         return TypeExpr::createForMemberDecl(
-            DRE->getNameLoc(), TD, UDE->getNameLoc(), Result.front().Member);
+            ParentNameLoc, TD, UDE->getNameLoc(), Result.front().Member);
       }
+
+      return nullptr;
+  };
+
+  if (auto *DRE = dyn_cast<DeclRefExpr>(UDE->getBase())) {
+    if (auto *TD = dyn_cast<TypeDecl>(DRE->getDecl()))
+      return handleNestedTypeLookup(TD, DRE->getNameLoc());
+
+    return nullptr;
+  }
+
+  // Determine whether there is exactly one type declaration, where all
+  // other declarations are macros.
+  if (auto *ODRE = dyn_cast<OverloadedDeclRefExpr>(UDE->getBase())) {
+    TypeDecl *FoundTD = nullptr;
+    for (auto *D : ODRE->getDecls()) {
+      if (auto *TD = dyn_cast<TypeDecl>(D)) {
+        if (FoundTD)
+          return nullptr;
+
+        FoundTD = TD;
+        continue;
+      }
+
+        // Ignore macros; they can't have any nesting.
+      if (isa<MacroDecl>(D))
+        continue;
+
+      // Anything else prevents folding.
+      return nullptr;
     }
+
+    if (FoundTD)
+      return handleNestedTypeLookup(FoundTD, ODRE->getNameLoc());
 
     return nullptr;
   }
@@ -1615,31 +1467,36 @@ TypeExpr *PreCheckExpression::simplifyNestedTypeExpr(UnresolvedDotExpr *UDE) {
   }
 
   // Fold 'T.U' into a nested type.
-  if (auto *ITR = dyn_cast<IdentTypeRepr>(InnerTypeRepr)) {
-    // Resolve the TypeRepr to get the base type for the lookup.
-    const auto BaseTy = TypeResolution::resolveContextualType(
-        InnerTypeRepr, DC, TypeResolverContext::InExpression,
-        [](auto unboundTy) {
-          // FIXME: Don't let unbound generic types escape type resolution.
-          // For now, just return the unbound generic type.
-          return unboundTy;
-        },
-        // FIXME: Don't let placeholder types escape type resolution.
-        // For now, just return the placeholder type.
-        PlaceholderType::get);
 
-    if (BaseTy->mayHaveMembers()) {
-      // See if there is a member type with this name.
-      auto Result =
-          TypeChecker::lookupMemberType(DC, BaseTy, Name,
-                                        defaultMemberLookupOptions);
+  // Resolve the TypeRepr to get the base type for the lookup.
+  TypeResolutionOptions options(TypeResolverContext::InExpression);
+  // Pre-check always allows pack references during TypeExpr folding.
+  // CSGen will diagnose cases that appear outside of pack expansion
+  // expressions.
+  options |= TypeResolutionFlags::AllowPackReferences;
+  const auto BaseTy = TypeResolution::resolveContextualType(
+      InnerTypeRepr, DC, options,
+      [](auto unboundTy) {
+        // FIXME: Don't let unbound generic types escape type resolution.
+        // For now, just return the unbound generic type.
+        return unboundTy;
+      },
+      // FIXME: Don't let placeholder types escape type resolution.
+      // For now, just return the placeholder type.
+      PlaceholderType::get,
+      // TypeExpr pack elements are opened in CSGen.
+      /*packElementOpener*/ nullptr);
 
-      // If there is no nested type with this name, we have a lookup of
-      // a non-type member, so leave the expression as-is.
-      if (Result.size() == 1) {
-        return TypeExpr::createForMemberDecl(ITR, UDE->getNameLoc(),
-                                             Result.front().Member);
-      }
+  if (BaseTy->mayHaveMembers()) {
+    // See if there is a member type with this name.
+    auto Result = TypeChecker::lookupMemberType(DC, BaseTy, Name,
+                                                defaultMemberLookupOptions);
+
+    // If there is no nested type with this name, we have a lookup of
+    // a non-type member, so leave the expression as-is.
+    if (Result.size() == 1) {
+      return TypeExpr::createForMemberDecl(InnerTypeRepr, UDE->getNameLoc(),
+                                           Result.front().Member);
     }
   }
 
@@ -1651,16 +1508,33 @@ TypeExpr *PreCheckExpression::simplifyUnresolvedSpecializeExpr(
   // If this is a reference type a specialized type, form a TypeExpr.
   // The base should be a TypeExpr that we already resolved.
   if (auto *te = dyn_cast<TypeExpr>(us->getSubExpr())) {
-    if (auto *ITR = dyn_cast_or_null<IdentTypeRepr>(te->getTypeRepr())) {
-      return TypeExpr::createForSpecializedDecl(ITR,
-                                                us->getUnresolvedParams(),
-                                                SourceRange(us->getLAngleLoc(),
-                                                            us->getRAngleLoc()),
-                                                getASTContext());
+    if (auto *declRefTR =
+            dyn_cast_or_null<DeclRefTypeRepr>(te->getTypeRepr())) {
+      return TypeExpr::createForSpecializedDecl(
+          declRefTR, us->getUnresolvedParams(),
+          SourceRange(us->getLAngleLoc(), us->getRAngleLoc()), getASTContext());
     }
   }
 
   return nullptr;
+}
+
+/// Whether the given expression "looks like" a (possibly sugared) type. For
+/// example, `(foo, bar)` "looks like" a type, but `foo + bar` does not.
+bool PreCheckExpression::exprLooksLikeAType(Expr *expr) {
+  return isa<OptionalEvaluationExpr>(expr) ||
+      isa<BindOptionalExpr>(expr) ||
+      isa<ForceValueExpr>(expr) ||
+      isa<ParenExpr>(expr) ||
+      isa<ArrowExpr>(expr) ||
+      isa<PackExpansionExpr>(expr) ||
+      isa<PackElementExpr>(expr) ||
+      isa<TupleExpr>(expr) ||
+      (isa<ArrayExpr>(expr) &&
+       cast<ArrayExpr>(expr)->getElements().size() == 1) ||
+      (isa<DictionaryExpr>(expr) &&
+       cast<DictionaryExpr>(expr)->getElements().size() == 1) ||
+      getCompositionExpr(expr);
 }
 
 bool PreCheckExpression::possiblyInTypeContext(Expr *E) {
@@ -1689,6 +1563,174 @@ bool PreCheckExpression::canSimplifyDiscardAssignmentExpr(
          possiblyInTypeContext(DAE);
 }
 
+
+/// In Swift < 5, diagnose and correct invalid multi-argument or
+/// argument-labeled interpolations. Returns \c true if the AST walk should
+/// continue, or \c false if it should be aborted.
+bool PreCheckExpression::correctInterpolationIfStrange(
+    InterpolatedStringLiteralExpr *ISLE) {
+  // These expressions are valid in Swift 5+.
+  if (getASTContext().isSwiftVersionAtLeast(5))
+    return true;
+
+  /// Diagnoses appendInterpolation(...) calls with multiple
+  /// arguments or argument labels and corrects them.
+  class StrangeInterpolationRewriter : public ASTWalker {
+    ASTContext &Context;
+
+  public:
+    StrangeInterpolationRewriter(ASTContext &Ctx) : Context(Ctx) {}
+
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Expansion;
+    }
+
+    virtual PreWalkAction walkToDeclPre(Decl *D) override {
+      // We don't want to look inside decls.
+      return Action::SkipChildren();
+    }
+
+    virtual PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
+      // One InterpolatedStringLiteralExpr should never be nested inside
+      // another except as a child of a CallExpr, and we don't recurse into
+      // the children of CallExprs.
+      assert(!isa<InterpolatedStringLiteralExpr>(E) &&
+             "StrangeInterpolationRewriter found nested interpolation?");
+
+      // We only care about CallExprs.
+      if (!isa<CallExpr>(E))
+        return Action::Continue(E);
+
+      auto *call = cast<CallExpr>(E);
+      auto *args = call->getArgs();
+
+      auto lParen = args->getLParenLoc();
+      auto rParen = args->getRParenLoc();
+
+      if (auto callee = dyn_cast<UnresolvedDotExpr>(call->getFn())) {
+        if (callee->getName().getBaseName() ==
+            Context.Id_appendInterpolation) {
+
+          Optional<Argument> newArg;
+          if (args->size() > 1) {
+            auto *secondArg = args->get(1).getExpr();
+            Context.Diags
+                .diagnose(secondArg->getLoc(),
+                          diag::string_interpolation_list_changing)
+                .highlightChars(secondArg->getLoc(), rParen);
+            Context.Diags
+                .diagnose(secondArg->getLoc(),
+                          diag::string_interpolation_list_insert_parens)
+                .fixItInsertAfter(lParen, "(")
+                .fixItInsert(rParen, ")");
+
+            // Make sure we don't have an inout arg somewhere, as that's
+            // invalid even with the compatibility fix.
+            for (auto arg : *args) {
+              if (arg.isInOut()) {
+                Context.Diags.diagnose(arg.getExpr()->getStartLoc(),
+                                       diag::extraneous_address_of);
+                return Action::Stop();
+              }
+            }
+
+            // Form a new argument tuple from the argument list.
+            auto *packed = args->packIntoImplicitTupleOrParen(Context);
+            newArg = Argument::unlabeled(packed);
+          } else if (args->size() == 1 &&
+                     args->front().getLabel() != Identifier()) {
+            // Form a new argument that drops the label.
+            auto *argExpr = args->front().getExpr();
+            newArg = Argument::unlabeled(argExpr);
+
+            SourceLoc argLabelLoc = args->front().getLabelLoc(),
+                      argLoc = argExpr->getStartLoc();
+
+            Context.Diags
+                .diagnose(argLabelLoc,
+                          diag::string_interpolation_label_changing)
+                .highlightChars(argLabelLoc, argLoc);
+            Context.Diags
+                .diagnose(argLabelLoc,
+                          diag::string_interpolation_remove_label,
+                          args->front().getLabel())
+                .fixItRemoveChars(argLabelLoc, argLoc);
+          }
+
+          // If newArg is no longer null, we need to build a new
+          // appendInterpolation(_:) call that takes it to replace the bad
+          // appendInterpolation(...) call.
+          if (newArg) {
+            auto newCallee = new (Context) UnresolvedDotExpr(
+                callee->getBase(), /*dotloc=*/SourceLoc(),
+                DeclNameRef(Context.Id_appendInterpolation),
+                /*nameloc=*/DeclNameLoc(), /*Implicit=*/true);
+
+            auto *newArgList =
+                ArgumentList::create(Context, lParen, {*newArg}, rParen,
+                                     /*trailingClosureIdx*/ None,
+                                     /*implicit*/ false);
+            E = CallExpr::create(Context, newCallee, newArgList,
+                                 /*implicit=*/false);
+          }
+        }
+      }
+
+      // There is never a CallExpr between an InterpolatedStringLiteralExpr
+      // and an un-typechecked appendInterpolation(...) call, so whether we
+      // changed E or not, we don't need to recurse any deeper.
+      return Action::SkipChildren(E);
+    }
+  };
+
+  return ISLE->getAppendingExpr()->walk(
+      StrangeInterpolationRewriter(getASTContext()));
+}
+
+/// Scout out the specified destination of an AssignExpr to recursively
+/// identify DiscardAssignmentExpr in legal places.  We can only allow them
+/// in simple pattern-like expressions, so we reject anything complex here.
+void PreCheckExpression::markAcceptableDiscardExprs(Expr *E) {
+  if (!E) return;
+
+  if (auto *PE = dyn_cast<ParenExpr>(E))
+    return markAcceptableDiscardExprs(PE->getSubExpr());
+  if (auto *TE = dyn_cast<TupleExpr>(E)) {
+    for (auto &elt : TE->getElements())
+      markAcceptableDiscardExprs(elt);
+    return;
+  }
+  if (auto *BOE = dyn_cast<BindOptionalExpr>(E))
+    return markAcceptableDiscardExprs(BOE->getSubExpr());
+  if (auto *DAE = dyn_cast<DiscardAssignmentExpr>(E))
+    CorrectDiscardAssignmentExprs.insert(DAE);
+
+  // Otherwise, we can't support this.
+}
+
+VarDecl *PreCheckExpression::getImplicitSelfDeclForSuperContext(SourceLoc Loc) {
+  auto *methodContext = DC->getInnermostMethodContext();
+  if (!methodContext) {
+    Ctx.Diags.diagnose(Loc, diag::super_not_in_class_method);
+    return nullptr;
+  }
+
+  // Do an actual lookup for 'self' in case it shows up in a capture list.
+  auto *methodSelf = methodContext->getImplicitSelfDecl();
+  auto *lookupSelf = ASTScope::lookupSingleLocalDecl(DC->getParentSourceFile(),
+                                                     Ctx.Id_self, Loc);
+  if (lookupSelf && lookupSelf != methodSelf) {
+    // FIXME: This is the wrong diagnostic for if someone manually declares a
+    // variable named 'self' using backticks.
+    Ctx.Diags.diagnose(Loc, diag::super_in_closure_with_capture);
+    Ctx.Diags.diagnose(lookupSelf->getLoc(),
+                       diag::super_in_closure_with_capture_here);
+    return nullptr;
+  }
+
+  return methodSelf;
+}
+
 /// Simplify expressions which are type sugar productions that got parsed
 /// as expressions due to the parser not knowing which identifiers are
 /// type names.
@@ -1702,8 +1744,8 @@ TypeExpr *PreCheckExpression::simplifyTypeExpr(Expr *E) {
   if (auto *DAE = dyn_cast<DiscardAssignmentExpr>(E)) {
     if (canSimplifyDiscardAssignmentExpr(DAE)) {
       auto *placeholderRepr =
-          new (getASTContext()) PlaceholderTypeRepr(DAE->getLoc());
-      return new (getASTContext()) TypeExpr(placeholderRepr);
+          new (Ctx) PlaceholderTypeRepr(DAE->getLoc());
+      return new (Ctx) TypeExpr(placeholderRepr);
     }
   }
 
@@ -1730,8 +1772,8 @@ TypeExpr *PreCheckExpression::simplifyTypeExpr(Expr *E) {
       return TyExpr;
 
     auto *NewTypeRepr =
-        new (getASTContext()) OptionalTypeRepr(InnerTypeRepr, QuestionLoc);
-    return new (getASTContext()) TypeExpr(NewTypeRepr);
+        new (Ctx) OptionalTypeRepr(InnerTypeRepr, QuestionLoc);
+    return new (Ctx) TypeExpr(NewTypeRepr);
   }
 
   // Fold T! into an IUO type when T is a TypeExpr.
@@ -1744,10 +1786,10 @@ TypeExpr *PreCheckExpression::simplifyTypeExpr(Expr *E) {
            "This doesn't work on implicit TypeExpr's, "
            "the TypeExpr should have been built correctly in the first place");
 
-    auto *NewTypeRepr = new (getASTContext())
+    auto *NewTypeRepr = new (Ctx)
         ImplicitlyUnwrappedOptionalTypeRepr(InnerTypeRepr,
                                             FVE->getExclaimLoc());
-    return new (getASTContext()) TypeExpr(NewTypeRepr);
+    return new (Ctx) TypeExpr(NewTypeRepr);
   }
 
   // Fold (T) into a type T with parens around it.
@@ -1760,9 +1802,9 @@ TypeExpr *PreCheckExpression::simplifyTypeExpr(Expr *E) {
            "SubscriptExpr doesn't work on implicit TypeExpr's, "
            "the TypeExpr should have been built correctly in the first place");
 
-    auto *NewTypeRepr = TupleTypeRepr::create(getASTContext(), InnerTypeRepr,
+    auto *NewTypeRepr = TupleTypeRepr::create(Ctx, InnerTypeRepr,
                                               PE->getSourceRange());
-    return new (getASTContext()) TypeExpr(NewTypeRepr);
+    return new (Ctx) TypeExpr(NewTypeRepr);
   }
   
   // Fold a tuple expr like (T1,T2) into a tuple type (T1,T2).
@@ -1774,6 +1816,11 @@ TypeExpr *PreCheckExpression::simplifyTypeExpr(Expr *E) {
     SmallVector<TupleTypeReprElement, 4> Elts;
     unsigned EltNo = 0;
     for (auto Elt : TE->getElements()) {
+      // Try to simplify the element, e.g. to fold PackExpansionExprs
+      // into TypeExprs.
+      if (auto simplified = simplifyTypeExpr(Elt))
+        Elt = simplified;
+
       auto *eltTE = dyn_cast<TypeExpr>(Elt);
       if (!eltTE) return nullptr;
       TupleTypeReprElement elt;
@@ -1790,8 +1837,8 @@ TypeExpr *PreCheckExpression::simplifyTypeExpr(Expr *E) {
       ++EltNo;
     }
     auto *NewTypeRepr = TupleTypeRepr::create(
-        getASTContext(), Elts, TE->getSourceRange());
-    return new (getASTContext()) TypeExpr(NewTypeRepr);
+        Ctx, Elts, TE->getSourceRange());
+    return new (Ctx) TypeExpr(NewTypeRepr);
   }
   
 
@@ -1804,10 +1851,10 @@ TypeExpr *PreCheckExpression::simplifyTypeExpr(Expr *E) {
     if (!TyExpr)
       return nullptr;
 
-    auto *NewTypeRepr = new (getASTContext())
+    auto *NewTypeRepr = new (Ctx)
         ArrayTypeRepr(TyExpr->getTypeRepr(),
                       SourceRange(AE->getLBracketLoc(), AE->getRBracketLoc()));
-    return new (getASTContext()) TypeExpr(NewTypeRepr);
+    return new (Ctx) TypeExpr(NewTypeRepr);
   }
 
   // Fold [K : V] into a dictionary type.
@@ -1842,11 +1889,11 @@ TypeExpr *PreCheckExpression::simplifyTypeExpr(Expr *E) {
       valueTypeRepr = TRE->getElementType(1);
     }
 
-    auto *NewTypeRepr = new (getASTContext()) DictionaryTypeRepr(
+    auto *NewTypeRepr = new (Ctx) DictionaryTypeRepr(
         keyTypeRepr, valueTypeRepr,
         /*FIXME:colonLoc=*/SourceLoc(),
         SourceRange(DE->getLBracketLoc(), DE->getRBracketLoc()));
-    return new (getASTContext()) TypeExpr(NewTypeRepr);
+    return new (Ctx) TypeExpr(NewTypeRepr);
   }
 
   // Reinterpret arrow expr T1 -> T2 as function type.
@@ -1873,7 +1920,6 @@ TypeExpr *PreCheckExpression::simplifyTypeExpr(Expr *E) {
       }
     };
 
-    auto &ctx = getASTContext();
     auto extractInputTypeRepr = [&](Expr *E) -> TupleTypeRepr * {
       if (!E)
         return nullptr;
@@ -1881,13 +1927,12 @@ TypeExpr *PreCheckExpression::simplifyTypeExpr(Expr *E) {
         auto ArgRepr = TyE->getTypeRepr();
         if (auto *TTyRepr = dyn_cast<TupleTypeRepr>(ArgRepr))
           return TTyRepr;
-        diagnoseMissingParens(ctx, ArgRepr);
-        return TupleTypeRepr::create(ctx, {ArgRepr}, ArgRepr->getSourceRange());
+        diagnoseMissingParens(Ctx, ArgRepr);
+        return TupleTypeRepr::create(Ctx, {ArgRepr}, ArgRepr->getSourceRange());
       }
       if (auto *TE = dyn_cast<TupleExpr>(E))
         if (TE->getNumElements() == 0)
-          return TupleTypeRepr::createEmpty(getASTContext(),
-                                            TE->getSourceRange());
+          return TupleTypeRepr::createEmpty(Ctx, TE->getSourceRange());
 
       // When simplifying a type expr like "(P1 & P2) -> (P3 & P4) -> Int",
       // it may have been folded at the same time; recursively simplify it.
@@ -1895,8 +1940,8 @@ TypeExpr *PreCheckExpression::simplifyTypeExpr(Expr *E) {
         auto ArgRepr = ArgsTypeExpr->getTypeRepr();
         if (auto *TTyRepr = dyn_cast<TupleTypeRepr>(ArgRepr))
           return TTyRepr;
-        diagnoseMissingParens(ctx, ArgRepr);
-        return TupleTypeRepr::create(ctx, {ArgRepr}, ArgRepr->getSourceRange());
+        diagnoseMissingParens(Ctx, ArgRepr);
+        return TupleTypeRepr::create(Ctx, {ArgRepr}, ArgRepr->getSourceRange());
       }
       return nullptr;
     };
@@ -1908,7 +1953,7 @@ TypeExpr *PreCheckExpression::simplifyTypeExpr(Expr *E) {
         return TyE->getTypeRepr();
       if (auto *TE = dyn_cast<TupleExpr>(E))
         if (TE->getNumElements() == 0)
-          return TupleTypeRepr::createEmpty(ctx, TE->getSourceRange());
+          return TupleTypeRepr::createEmpty(Ctx, TE->getSourceRange());
 
       // When simplifying a type expr like "P1 & P2 -> P3 & P4 -> Int",
       // it may have been folded at the same time; recursively simplify it.
@@ -1919,26 +1964,26 @@ TypeExpr *PreCheckExpression::simplifyTypeExpr(Expr *E) {
 
     TupleTypeRepr *ArgsTypeRepr = extractInputTypeRepr(AE->getArgsExpr());
     if (!ArgsTypeRepr) {
-      ctx.Diags.diagnose(AE->getArgsExpr()->getLoc(),
+      Ctx.Diags.diagnose(AE->getArgsExpr()->getLoc(),
                          diag::expected_type_before_arrow);
       auto ArgRange = AE->getArgsExpr()->getSourceRange();
-      auto ErrRepr = new (ctx) ErrorTypeRepr(ArgRange);
+      auto ErrRepr = new (Ctx) ErrorTypeRepr(ArgRange);
       ArgsTypeRepr =
-          TupleTypeRepr::create(ctx, {ErrRepr}, ArgRange);
+          TupleTypeRepr::create(Ctx, {ErrRepr}, ArgRange);
     }
 
     TypeRepr *ResultTypeRepr = extractTypeRepr(AE->getResultExpr());
     if (!ResultTypeRepr) {
-      ctx.Diags.diagnose(AE->getResultExpr()->getLoc(),
+      Ctx.Diags.diagnose(AE->getResultExpr()->getLoc(),
                          diag::expected_type_after_arrow);
-      ResultTypeRepr = new (ctx)
+      ResultTypeRepr = new (Ctx)
           ErrorTypeRepr(AE->getResultExpr()->getSourceRange());
     }
 
-    auto NewTypeRepr = new (ctx)
+    auto NewTypeRepr = new (Ctx)
         FunctionTypeRepr(nullptr, ArgsTypeRepr, AE->getAsyncLoc(),
                          AE->getThrowsLoc(), AE->getArrowLoc(), ResultTypeRepr);
-    return new (ctx) TypeExpr(NewTypeRepr);
+    return new (Ctx) TypeExpr(NewTypeRepr);
   }
   
   // Fold 'P & Q' into a composition type
@@ -1970,10 +2015,28 @@ TypeExpr *PreCheckExpression::simplifyTypeExpr(Expr *E) {
     if (!rhs) return nullptr;
     Types.push_back(rhs->getTypeRepr());
 
-    auto CompRepr = CompositionTypeRepr::create(getASTContext(), Types,
+    auto CompRepr = CompositionTypeRepr::create(Ctx, Types,
                                                 lhsExpr->getStartLoc(),
                                                 binaryExpr->getSourceRange());
-    return new (getASTContext()) TypeExpr(CompRepr);
+    return new (Ctx) TypeExpr(CompRepr);
+  }
+
+  // Fold a pack expansion expr into a TypeExpr when the pattern is a TypeExpr.
+  if (auto *expansion = dyn_cast<PackExpansionExpr>(E)) {
+    if (auto *pattern = dyn_cast<TypeExpr>(expansion->getPatternExpr())) {
+      auto *repr = new (Ctx) PackExpansionTypeRepr(expansion->getStartLoc(),
+                                                   pattern->getTypeRepr());
+      return new (Ctx) TypeExpr(repr);
+    }
+  }
+
+  // Fold a PackElementExpr into a TypeExpr when the element is a TypeExpr
+  if (auto *element = dyn_cast<PackElementExpr>(E)) {
+    if (auto *refExpr = dyn_cast<TypeExpr>(element->getPackRefExpr())) {
+      auto *repr = new (Ctx) PackElementTypeRepr(element->getStartLoc(),
+                                                 refExpr->getTypeRepr());
+      return new (Ctx) TypeExpr(repr);
+    }
   }
 
   return nullptr;
@@ -2169,7 +2232,9 @@ Expr *PreCheckExpression::simplifyTypeConstructionWithLiteralArg(Expr *E) {
         },
         // FIXME: Don't let placeholder types escape type resolution.
         // For now, just return the placeholder type.
-        PlaceholderType::get);
+        PlaceholderType::get,
+        // Pack elements for CoerceExprs are opened in CSGen.
+        /*packElementOpener*/ nullptr);
 
     if (result->hasError())
       return new (getASTContext())
@@ -2194,7 +2259,7 @@ Expr *PreCheckExpression::simplifyTypeConstructionWithLiteralArg(Expr *E) {
              : nullptr;
 }
 
-bool ConstraintSystem::preCheckTarget(SolutionApplicationTarget &target,
+bool ConstraintSystem::preCheckTarget(SyntacticElementTarget &target,
                                       bool replaceInvalidRefsWithErrors,
                                       bool leaveClosureBodiesUnchecked) {
   auto *DC = target.getDeclContext();

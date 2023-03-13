@@ -9,6 +9,7 @@ add_sourcekit_library(SourceKitSwiftLang
   SwiftEditorInterfaceGen.cpp
   SwiftIndexing.cpp
   SwiftLangSupport.cpp
+  SwiftMangling.cpp
   SwiftSourceDocInfo.cpp
   SwiftTypeContextInfo.cpp
     LLVM_LINK_COMPONENTS ${LLVM_TARGETS_TO_BUILD}
@@ -42,7 +43,6 @@ target_link_libraries(SourceKitSwiftLang PRIVATE
   swiftSema
   swiftBasic
   swiftSerialization
-  swiftSyntax
   swiftOption
   swiftSymbolGraphGen
   swiftRefactoring

@@ -27,15 +27,15 @@ public func createString(_ ptr: UnsafePointer<CChar>) -> String {
 #include "StringCreator.h"
 
 int main() {
-  using namespace Swift;
+  using namespace swift;
   auto emptyString = String::init();
   NSString *nsStr = emptyString;
 }
 
-// CHECKARC: %[[VAL:.*]] = call swiftcc i8* @"$sSS23_bridgeToObjectiveCImplyXlyF"
-// CHECKARC: call i8* @llvm.objc.autorelease(i8* %[[VAL]])
+// CHECKARC: %[[VAL:.*]] = {{(tail )?}}call swiftcc ptr @"$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF"
+// CHECKARC: call ptr @llvm.objc.autorelease(ptr %[[VAL]])
 // CHECKARC: @llvm.objc.
-// CHECKARC-SAME: autorelease(i8*)
+// CHECKARC-SAME: autorelease(ptr)
 // CHECKARC-NOT: @llvm.objc.
 
 //--- string-to-nsstring.mm
@@ -45,7 +45,7 @@ int main() {
 #include "StringCreator.h"
 
 int main() {
-  using namespace Swift;
+  using namespace swift;
 
   auto emptyString = String::init();
 
@@ -60,6 +60,14 @@ int main() {
     NSString *nsStr = aStr;
     assert(std::string(nsStr.UTF8String) == "hello");
     assert([nsStr isEqualToString:@"hello"]);
+  }
+
+  {
+    NSString *nsStr = @"nsstr";
+    auto str = String::init(nsStr);
+    NSString *nsStr2 = str;
+    assert(std::string(nsStr.UTF8String) == "nsstr");
+    assert([nsStr2 isEqualToString:nsStr]);
   }
   return 0;
 }

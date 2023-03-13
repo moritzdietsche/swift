@@ -294,12 +294,14 @@ public:
   SILInstruction *visitConvertFunctionInst(ConvertFunctionInst *CFI);
   SILInstruction *
   visitConvertEscapeToNoEscapeInst(ConvertEscapeToNoEscapeInst *Cvt);
-
+  SILInstruction *
+  visitDifferentiableFunctionExtractInst(DifferentiableFunctionExtractInst *DFEI);
+  
   SILInstruction *legacyVisitGlobalValueInst(GlobalValueInst *globalValue);
 
 #define PASS(ID, TAG, DESCRIPTION)
 #define SWIFT_FUNCTION_PASS(ID, TAG, DESCRIPTION)
-#define SWIFT_INSTRUCTION_PASS(INST, TAG) \
+#define SWIFT_SILCOMBINE_PASS(INST) \
   SILInstruction *visit##INST(INST *);
 #include "swift/SILOptimizer/PassManager/Passes.def"
 

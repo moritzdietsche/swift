@@ -139,9 +139,13 @@ static SubstitutionMap getSubstitutionsForPropertyInitializer(
     // replacement types are the archetypes of the initializer itself.
     return SubstitutionMap::get(
       nominal->getGenericSignatureOfContext(),
-      [&](SubstitutableType *type) {
+      [&](SubstitutableType *type) -> Type {
         if (auto gp = type->getAs<GenericTypeParamType>()) {
-          return genericEnv->mapTypeIntoContext(gp);
+          auto archetype = genericEnv->mapTypeIntoContext(gp);
+          if (!gp->isParameterPack())
+            return archetype;
+
+          return PackType::getSingletonPackExpansion(archetype);
         }
 
         return Type(type);
@@ -207,6 +211,13 @@ static void emitImplicitValueConstructor(SILGenFunction &SGF,
       SILValue slot =
         SGF.B.createStructElementAddr(Loc, resultSlot, field,
                                       fieldTy.getAddressType());
+
+      if (SGF.getOptions().EnableImportPtrauthFieldFunctionPointers &&
+          field->getPointerAuthQualifier().isPresent()) {
+        slot = SGF.B.createBeginAccess(
+            Loc, slot, SILAccessKind::Init, SILAccessEnforcement::Signed,
+            /* noNestedConflict */ false, /* fromBuiltin */ false);
+      }
       InitializationPtr init(new KnownAddressInitialization(slot));
 
       // If it's memberwise initialized, do so now.
@@ -259,6 +270,10 @@ static void emitImplicitValueConstructor(SILGenFunction &SGF,
         }
 
         SGF.emitExprInto(field->getParentInitializer(), init.get());
+      }
+      if (SGF.getOptions().EnableImportPtrauthFieldFunctionPointers &&
+          field->getPointerAuthQualifier().isPresent()) {
+        SGF.B.createEndAccess(Loc, slot, /* aborted */ false);
       }
     }
 
@@ -388,7 +403,11 @@ void SILGenFunction::emitValueConstructor(ConstructorDecl *ctor) {
   // Allocate the local variable for 'self'.
   emitLocalVariableWithCleanup(selfDecl, MUIKind)->finishInitialization(*this);
 
-  SILValue selfLV = VarLocs[selfDecl].value;
+  ManagedValue selfLV =
+      maybeEmitValueOfLocalVarDecl(selfDecl, AccessKind::ReadWrite);
+  if (!selfLV)
+    selfLV = maybeEmitAddressForBoxOfLocalVarDecl(selfDecl, selfDecl);
+  assert(selfLV);
 
   // Emit the prolog.
   emitBasicProlog(ctor->getParameters(),
@@ -480,7 +499,13 @@ void SILGenFunction::emitValueConstructor(ConstructorDecl *ctor) {
 
     if (!F.getConventions().hasIndirectSILResults()) {
       // Otherwise, load and return the final 'self' value.
-      selfValue = lowering.emitLoad(B, cleanupLoc, selfLV,
+      if (selfLV.getType().isMoveOnly()) {
+        selfLV = B.createMarkMustCheckInst(
+            cleanupLoc, selfLV,
+            MarkMustCheckInst::CheckKind::AssignableButNotConsumable);
+      }
+
+      selfValue = lowering.emitLoad(B, cleanupLoc, selfLV.getValue(),
                                     LoadOwnershipQualifier::Copy);
 
       // Inject the self value into an optional if the constructor is failable.
@@ -502,17 +527,16 @@ void SILGenFunction::emitValueConstructor(ConstructorDecl *ctor) {
         returnAddress = completeReturnAddress;
       } else {
         // If this is a failable initializer, project out the payload.
-        returnAddress = B.createInitEnumDataAddr(cleanupLoc,
-                                                 completeReturnAddress,
-                                         getASTContext().getOptionalSomeDecl(),
-                                                 selfLV->getType());
+        returnAddress = B.createInitEnumDataAddr(
+            cleanupLoc, completeReturnAddress,
+            getASTContext().getOptionalSomeDecl(), selfLV.getType());
       }
       
       // We have to do a non-take copy because someone else may be using the
       // box (e.g. someone could have closed over it).
-      B.createCopyAddr(cleanupLoc, selfLV, returnAddress,
+      B.createCopyAddr(cleanupLoc, selfLV.getLValueAddress(), returnAddress,
                        IsNotTake, IsInitialization);
-      
+
       // Inject the enum tag if the result is optional because of failability.
       if (ctor->isFailable()) {
         // Inject the 'Some' tag.
@@ -609,12 +633,6 @@ void SILGenFunction::emitEnumConstructor(EnumElementDecl *element) {
     scope.pop();
     B.createReturn(ReturnLoc, result);
   }
-}
-
-bool Lowering::usesObjCAllocator(ClassDecl *theClass) {
-  // If the root class was implemented in Objective-C, use Objective-C's
-  // allocation methods because they may have been overridden.
-  return theClass->getObjectModel() == ReferenceCounting::ObjC;
 }
 
 void SILGenFunction::emitClassConstructorAllocator(ConstructorDecl *ctor) {
@@ -834,7 +852,8 @@ void SILGenFunction::emitClassConstructorInitializer(ConstructorDecl *ctor) {
       if (selfArg.getType().isMoveOnly()) {
         assert(selfArg.getOwnershipKind() == OwnershipKind::Owned);
         selfArg = B.createMarkMustCheckInst(
-            selfDecl, selfArg, MarkMustCheckInst::CheckKind::NoImplicitCopy);
+            selfDecl, selfArg,
+            MarkMustCheckInst::CheckKind::ConsumableAndAssignable);
       }
       VarLocs[selfDecl] = VarLoc::get(selfArg.getValue());
     }
@@ -1016,14 +1035,19 @@ void SILGenFunction::emitClassConstructorInitializer(ConstructorDecl *ctor) {
 static ManagedValue emitSelfForMemberInit(SILGenFunction &SGF, SILLocation loc,
                                           VarDecl *selfDecl) {
   CanType selfFormalType = selfDecl->getType()->getCanonicalType();
-  if (selfFormalType->hasReferenceSemantics())
+  if (selfFormalType->hasReferenceSemantics()) {
     return SGF.emitRValueForDecl(loc, selfDecl, selfFormalType,
                                  AccessSemantics::DirectToStorage,
                                  SGFContext::AllowImmediatePlusZero)
       .getAsSingleValue(SGF, loc);
-  else
+  } else {
+    // First see if we have a variable that is boxed without a value.
+    if (auto value = SGF.maybeEmitAddressForBoxOfLocalVarDecl(loc, selfDecl))
+      return value;
+    // Otherwise, emit the address directly.
     return SGF.emitAddressOfLocalVarDecl(loc, selfDecl, selfFormalType,
                                          SGFAccessKind::Write);
+  }
 }
 
 // FIXME: Can emitMemberInit() share code with InitializationForPattern in
@@ -1038,7 +1062,8 @@ emitMemberInit(SILGenFunction &SGF, VarDecl *selfDecl, Pattern *pattern) {
                           cast<ParenPattern>(pattern)->getSubPattern());
 
   case PatternKind::Tuple: {
-    TupleInitialization *init = new TupleInitialization();
+    TupleInitialization *init = new TupleInitialization(
+        cast<TupleType>(pattern->getType()->getCanonicalType()));
     auto tuple = cast<TuplePattern>(pattern);
     for (auto &elt : tuple->getElements()) {
       init->SubInitializations.push_back(
@@ -1063,7 +1088,8 @@ emitMemberInit(SILGenFunction &SGF, VarDecl *selfDecl, Pattern *pattern) {
       slot = SGF.B.createStructElementAddr(pattern, self.forward(SGF), field,
                                            fieldTy.getAddressType());
     } else {
-      assert(isa<ClassDecl>(field->getDeclContext()));
+      assert(isa<ClassDecl>(field->getDeclContext()->
+                                getImplementedObjCContext()));
       slot = SGF.B.createRefElementAddr(pattern, self.forward(SGF), field,
                                         fieldTy.getAddressType());
     }
@@ -1160,7 +1186,7 @@ void SILGenFunction::emitMemberInitializers(DeclContext *dc,
                                             NominalTypeDecl *nominal) {
   auto subs = getSubstitutionsForPropertyInitializer(dc, nominal);
 
-  for (auto member : nominal->getMembers()) {
+  for (auto member : nominal->getImplementationContext()->getMembers()) {
     // Find instance pattern binding declarations that have initializers.
     if (auto pbd = dyn_cast<PatternBindingDecl>(member)) {
       if (pbd->isStatic()) continue;

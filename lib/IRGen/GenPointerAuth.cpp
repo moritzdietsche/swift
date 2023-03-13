@@ -238,6 +238,60 @@ PointerAuthInfo PointerAuthInfo::emit(IRGenFunction &IGF,
   return PointerAuthInfo(key, discriminator);
 }
 
+PointerAuthInfo
+PointerAuthInfo::emit(IRGenFunction &IGF,
+                      clang::PointerAuthQualifier pointerAuthQual,
+                      llvm::Value *storageAddress) {
+  unsigned key = pointerAuthQual.getKey();
+
+  // Produce the 'other' discriminator.
+  auto otherDiscriminator = pointerAuthQual.getExtraDiscriminator();
+  llvm::Value *discriminator =
+      llvm::ConstantInt::get(IGF.IGM.Int64Ty, otherDiscriminator);
+
+  // Factor in the address.
+  if (pointerAuthQual.isAddressDiscriminated()) {
+    assert(storageAddress &&
+           "no storage address for address-discriminated schema");
+
+    if (otherDiscriminator != 0) {
+      discriminator = emitPointerAuthBlend(IGF, storageAddress, discriminator);
+    } else {
+      discriminator =
+          IGF.Builder.CreatePtrToInt(storageAddress, IGF.IGM.Int64Ty);
+    }
+  }
+
+  return PointerAuthInfo(key, discriminator);
+}
+
+PointerAuthInfo PointerAuthInfo::emit(IRGenFunction &IGF,
+                                      const PointerAuthSchema &schema,
+                                      llvm::Value *storageAddress,
+                                      llvm::ConstantInt *otherDiscriminator) {
+  if (!schema)
+    return PointerAuthInfo();
+
+  unsigned key = schema.getKey();
+
+  llvm::Value *discriminator = otherDiscriminator;
+
+  // Factor in the address.
+  if (schema.isAddressDiscriminated()) {
+    assert(storageAddress &&
+           "no storage address for address-discriminated schema");
+
+    if (!otherDiscriminator->isZero()) {
+      discriminator = emitPointerAuthBlend(IGF, storageAddress, discriminator);
+    } else {
+      discriminator =
+          IGF.Builder.CreatePtrToInt(storageAddress, IGF.IGM.Int64Ty);
+    }
+  }
+
+  return PointerAuthInfo(key, discriminator);
+}
+
 llvm::ConstantInt *
 PointerAuthInfo::getOtherDiscriminator(IRGenModule &IGM,
                                        const PointerAuthSchema &schema,
@@ -325,6 +379,8 @@ PointerAuthEntity::getDeclDiscriminator(IRGenModule &IGM) const {
         return SpecialPointerAuthDiscriminators::KeyPathMetadataAccessor;
       case Special::DynamicReplacementKey:
         return SpecialPointerAuthDiscriminators::DynamicReplacementKey;
+      case Special::TypeLayoutString:
+        return SpecialPointerAuthDiscriminators::TypeLayoutString;
       case Special::BlockCopyHelper:
       case Special::BlockDisposeHelper:
         llvm_unreachable("no known discriminator for these foreign entities");

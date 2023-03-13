@@ -28,10 +28,58 @@ internal func _swiftJobRun(_ job: UnownedJob,
 public struct UnownedJob: Sendable {
   private var context: Builtin.Job
 
+  /// The priority of this job.
+  @available(SwiftStdlib 5.9, *)
+  public var priority: JobPriority {
+    let raw = _swift_concurrency_jobPriority(self)
+    return JobPriority(rawValue: raw)
+  }
+
   @_alwaysEmitIntoClient
   @inlinable
+  @available(*, deprecated, renamed: "runSynchronously")
   public func _runSynchronously(on executor: UnownedSerialExecutor) {
       _swiftJobRun(self, executor)
+  }
+
+  @_alwaysEmitIntoClient
+  @inlinable
+  public func runSynchronously(on executor: UnownedSerialExecutor) {
+      _swiftJobRun(self, executor)
+  }
+}
+
+/// The priority of this job.
+///
+/// The executor determines how priority information affects the way tasks are scheduled.
+/// The behavior varies depending on the executor currently being used.
+/// Typically, executors attempt to run tasks with a higher priority
+/// before tasks with a lower priority.
+/// However, the semantics of how priority is treated are left up to each
+/// platform and `Executor` implementation.
+///
+/// A Job's priority is roughly equivalent to a `TaskPriority`,
+/// however, since not all jobs are tasks, represented as separate type.
+///
+/// Conversions between the two priorities are available as initializers on the respective types.
+@available(SwiftStdlib 5.9, *)
+@frozen
+public struct JobPriority {
+  public typealias RawValue = UInt8
+
+  /// The raw priority value.
+  public var rawValue: RawValue
+}
+
+@available(SwiftStdlib 5.9, *)
+extension TaskPriority {
+  /// Convert a job priority to a task priority.
+  ///
+  /// Most values are directly interchangeable, but this initializer reserves the right to fail for certain values.
+  @available(SwiftStdlib 5.9, *)
+  public init?(_ p: JobPriority) {
+    // currently we always convert, but we could consider mapping over only recognized values etc.
+    self = .init(rawValue: p.rawValue)
   }
 }
 
@@ -246,13 +294,30 @@ internal func _resumeUnsafeThrowingContinuationWithError<T>(
 
 #endif
 
-/// Suspends the current task,
-/// then calls the given closure with an unsafe continuation for the current task.
+
+/// Invokes the passed in closure with a unsafe continuation for the current task.
+///
+/// The body of the closure executes synchronously on the calling task, and once it returns
+/// the calling task is suspended. It is possible to immediately resume the task, or escape the
+/// continuation in order to complete it afterwards, which will them resume suspended task.
+///
+/// You must invoke the continuation's `resume` method exactly once.
+///
+/// Missing to invoke it (eventually) will cause the calling task to remain suspended
+/// indefinitely which will result in the task "hanging" as well as being leaked with
+/// no possibility to destroy it.
+///
+/// Unlike the "checked" continuation variant, the `UnsafeContinuation` does not
+/// detect or diagnose any kind of misuse, so you need to be extra careful to avoid
+/// calling `resume` twice or forgetting to call resume before letting go of the
+/// continuation object.
 ///
 /// - Parameter fn: A closure that takes an `UnsafeContinuation` parameter.
-/// You must resume the continuation exactly once.
+/// - Returns: The value continuation is resumed with.
 ///
-/// - Returns: The value passed to the continuation by the closure.
+/// - SeeAlso: `withUnsafeThrowingContinuation(function:_:)`
+/// - SeeAlso: `withCheckedContinuation(function:_:)`
+/// - SeeAlso: `withCheckedThrowingContinuation(function:_:)`
 @available(SwiftStdlib 5.1, *)
 @_unsafeInheritExecutor
 @_alwaysEmitIntoClient
@@ -264,16 +329,31 @@ public func withUnsafeContinuation<T>(
   }
 }
 
-/// Suspends the current task,
-/// then calls the given closure with an unsafe throwing continuation for the current task.
+/// Invokes the passed in closure with a unsafe continuation for the current task.
+///
+/// The body of the closure executes synchronously on the calling task, and once it returns
+/// the calling task is suspended. It is possible to immediately resume the task, or escape the
+/// continuation in order to complete it afterwards, which will them resume suspended task.
+///
+/// If `resume(throwing:)` is called on the continuation, this function throws that error.
+///
+/// You must invoke the continuation's `resume` method exactly once.
+///
+/// Missing to invoke it (eventually) will cause the calling task to remain suspended
+/// indefinitely which will result in the task "hanging" as well as being leaked with
+/// no possibility to destroy it.
+///
+/// Unlike the "checked" continuation variant, the `UnsafeContinuation` does not
+/// detect or diagnose any kind of misuse, so you need to be extra careful to avoid
+/// calling `resume` twice or forgetting to call resume before letting go of the
+/// continuation object.
 ///
 /// - Parameter fn: A closure that takes an `UnsafeContinuation` parameter.
-/// You must resume the continuation exactly once.
+/// - Returns: The value continuation is resumed with.
 ///
-/// - Returns: The value passed to the continuation by the closure.
-///
-/// If `resume(throwing:)` is called on the continuation,
-/// this function throws that error.
+/// - SeeAlso: `withUnsafeContinuation(function:_:)`
+/// - SeeAlso: `withCheckedContinuation(function:_:)`
+/// - SeeAlso: `withCheckedThrowingContinuation(function:_:)`
 @available(SwiftStdlib 5.1, *)
 @_unsafeInheritExecutor
 @_alwaysEmitIntoClient
@@ -291,3 +371,7 @@ public func withUnsafeThrowingContinuation<T>(
 public func _abiEnableAwaitContinuation() {
   fatalError("never use this function")
 }
+
+@available(SwiftStdlib 5.9, *)
+@_silgen_name("swift_concurrency_jobPriority")
+internal func _swift_concurrency_jobPriority(_ job: UnownedJob) -> UInt8

@@ -90,7 +90,7 @@ getAllMovedPlatformVersions(Decl *D) {
   for (auto *attr: D->getAttrs()) {
     if (auto *ODA = dyn_cast<OriginallyDefinedInAttr>(attr)) {
       auto Active = ODA->isActivePlatform(D->getASTContext());
-      if (Active.hasValue()) {
+      if (Active.has_value()) {
         Results.push_back(*Active);
       }
     }
@@ -132,7 +132,7 @@ static std::set<int8_t> getSequenceNodePlatformList(ASTContext &Ctx, Node *N) {
   for (auto &E: *cast<SequenceNode>(N)) {
     auto Platform = getScalaNodeText(&E);
     auto Id = getLinkerPlatformId(Platform);
-    if (Id.hasValue()) {
+    if (Id.has_value()) {
       Results.insert(*Id);
     } else {
       // Diagnose unrecognized platform name.
@@ -174,9 +174,9 @@ parseEntry(ASTContext &Ctx,
         return 1;
       auto &Store = Stores.insert(std::make_pair(ModuleName,
         InstallNameStore())).first->second;
-      if (Platforms.hasValue()) {
+      if (Platforms.has_value()) {
         // This install name is platform-specific.
-        for (auto Id: Platforms.getValue()) {
+        for (auto Id: Platforms.value()) {
           Store.PlatformInstallName[Id] = InstallName;
         }
       } else {
@@ -277,6 +277,18 @@ getInnermostIntroVersion(ArrayRef<Decl*> DeclStack, PlatformKind Platform) {
   return None;
 }
 
+/// Using the introducing version of a symbol as the start version to redirect
+/// linkage path isn't sufficient. This is because the executable can be deployed
+/// to OS versions that were before the symbol was introduced. When that happens,
+/// strictly using the introductory version can lead to NOT redirecting.
+static llvm::VersionTuple calculateLdPreviousVersionStart(ASTContext &ctx,
+                                                llvm::VersionTuple introVer) {
+  auto minDep = ctx.LangOpts.getMinPlatformVersion();
+  if (minDep < introVer)
+    return llvm::VersionTuple(1, 0);
+  return introVer;
+}
+
 void TBDGenVisitor::addLinkerDirectiveSymbolsLdPrevious(StringRef name,
                                                 llvm::MachO::SymbolKind kind) {
   if (kind != llvm::MachO::SymbolKind::GlobalSymbol)
@@ -293,7 +305,7 @@ void TBDGenVisitor::addLinkerDirectiveSymbolsLdPrevious(StringRef name,
   for (auto &Ver: MovedVers) {
     auto IntroVer = getInnermostIntroVersion(DeclStack, Ver.Platform);
     assert(IntroVer && "cannot find OS intro version");
-    if (!IntroVer.hasValue())
+    if (!IntroVer.has_value())
       continue;
     // This decl is available after the top-level symbol has been moved here,
     // so we don't need the linker directives.
@@ -321,9 +333,10 @@ void TBDGenVisitor::addLinkerDirectiveSymbolsLdPrevious(StringRef name,
     OS << ComptibleVersion << "$";
     OS << std::to_string((uint8_t)PlatformNumber) << "$";
     static auto getMinor = [](Optional<unsigned> Minor) {
-      return Minor.hasValue() ? *Minor : 0;
+      return Minor.has_value() ? *Minor : 0;
     };
-    OS << IntroVer->getMajor() << "." << getMinor(IntroVer->getMinor()) << "$";
+    auto verStart = calculateLdPreviousVersionStart(Ctx, *IntroVer);
+    OS << verStart.getMajor() << "." << getMinor(verStart.getMinor()) << "$";
     OS << Ver.Version.getMajor() << "." << getMinor(Ver.Version.getMinor()) << "$";
     OS << name << "$";
     addSymbolInternal(OS.str(), SymbolKind::GlobalSymbol,
@@ -351,17 +364,17 @@ void TBDGenVisitor::addLinkerDirectiveSymbolsLdHide(StringRef name,
   unsigned Major[2];
   unsigned Minor[2];
   Major[1] = MovedVer.getMajor();
-  Minor[1] = MovedVer.getMinor().hasValue() ? *MovedVer.getMinor(): 0;
+  Minor[1] = MovedVer.getMinor().has_value() ? *MovedVer.getMinor(): 0;
   auto IntroVer = getInnermostIntroVersion(DeclStack, Platform);
   assert(IntroVer && "cannot find the start point of availability");
-  if (!IntroVer.hasValue())
+  if (!IntroVer.has_value())
     return;
   // This decl is available after the top-level symbol has been moved here,
   // so we don't need the linker directives.
   if (*IntroVer >= MovedVer)
     return;
   Major[0] = IntroVer->getMajor();
-  Minor[0] = IntroVer->getMinor().hasValue() ? IntroVer->getMinor().getValue() : 0;
+  Minor[0] = IntroVer->getMinor().has_value() ? IntroVer->getMinor().value() : 0;
   for (auto CurMaj = Major[0]; CurMaj <= Major[1]; ++ CurMaj) {
     unsigned MinRange[2] = {0, 31};
     if (CurMaj == Major[0])
@@ -400,8 +413,15 @@ void TBDGenVisitor::addSymbol(StringRef name, SymbolSource source,
   }
 }
 
-void TBDGenVisitor::willVisitDecl(Decl *D) {
+bool TBDGenVisitor::willVisitDecl(Decl *D) {
+  // A @_silgen_name("...") function without a body only exists to
+  // forward-declare a symbol from another library.
+  if (auto AFD = dyn_cast<AbstractFunctionDecl>(D))
+    if (!AFD->hasBody() && AFD->getAttrs().hasAttribute<SILGenNameAttr>())
+      return false;
+
   DeclStack.push_back(D);
+  return true;
 }
 
 void TBDGenVisitor::didVisitDecl(Decl *D) {
@@ -563,7 +583,6 @@ TBDFile GenerateTBDRequest::evaluate(Evaluator &evaluator,
   file.setInstallName(opts.InstallName);
   file.setTwoLevelNamespace();
   file.setSwiftABIVersion(irgen::getSwiftABIVersion());
-  file.setInstallAPI(opts.IsInstallAPI);
 
   if (auto packed = parsePackedVersion(CurrentVersion,
                                        opts.CurrentVersion, ctx)) {
@@ -578,7 +597,7 @@ TBDFile GenerateTBDRequest::evaluate(Evaluator &evaluator,
   llvm::MachO::Target target(ctx.LangOpts.Target);
   file.addTarget(target);
   // Add target variant
-  if (ctx.LangOpts.TargetVariant.hasValue()) {
+  if (ctx.LangOpts.TargetVariant.has_value()) {
     llvm::MachO::Target targetVar(*ctx.LangOpts.TargetVariant);
     file.addTarget(targetVar);
   }
@@ -600,6 +619,11 @@ PublicSymbolsRequest::evaluate(Evaluator &evaluator,
   auto addSymbol = [&](StringRef symbol, SymbolKind kind, SymbolSource source) {
     if (kind == SymbolKind::GlobalSymbol)
       symbols.push_back(symbol.str());
+    // TextAPI ObjC Class Kinds represents two symbols.
+    else if (kind == SymbolKind::ObjectiveCClass) {
+      symbols.push_back((llvm::MachO::ObjC2ClassNamePrefix + symbol).str());
+      symbols.push_back((llvm::MachO::ObjC2MetaClassNamePrefix + symbol).str());
+    }
   };
   SimpleAPIRecorder recorder(addSymbol);
   TBDGenVisitor visitor(desc, recorder);

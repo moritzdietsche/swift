@@ -163,6 +163,12 @@ static bool readOptionsBlock(llvm::BitstreamCursor &cursor,
     case options_block::IS_CONCURRENCY_CHECKED:
       extendedInfo.setIsConcurrencyChecked(true);
       break;
+    case options_block::MODULE_PACKAGE_NAME:
+      extendedInfo.setModulePackageName(blobData);
+      break;
+    case options_block::MODULE_EXPORT_AS_NAME:
+      extendedInfo.setExportAsName(blobData);
+      break;
     default:
       // Unknown options record, possibly for use by a future version of the
       // module format.
@@ -310,6 +316,9 @@ static ValidationInfo validateControlBlock(
     case control_block::TARGET:
       result.targetTriple = blobData;
       break;
+    case control_block::ALLOWABLE_CLIENT_NAME:
+      result.allowableClients.push_back(blobData);
+      break;
     case control_block::SDK_NAME: {
       result.sdkName = blobData;
 
@@ -347,7 +356,7 @@ static ValidationInfo validateControlBlock(
       // Disable this restriction for compiler testing by setting this
       // env var to any value.
       static const char* ignoreRevision =
-        ::getenv("SWIFT_DEBUG_IGNORE_SWIFTMODULE_REVISION");
+        ::getenv("SWIFT_IGNORE_SWIFTMODULE_REVISION");
       if (ignoreRevision)
         break;
 
@@ -357,18 +366,24 @@ static ValidationInfo validateControlBlock(
       static const char* forcedDebugRevision =
         ::getenv("SWIFT_DEBUG_FORCE_SWIFTMODULE_REVISION");
 
-      bool isCompilerTagged = forcedDebugRevision ||
-        version::isCurrentCompilerTagged();
-
       StringRef moduleRevision = blobData;
-      if (isCompilerTagged) {
+      if (forcedDebugRevision ||
+          (requiresRevisionMatch && version::isCurrentCompilerTagged())) {
         StringRef compilerRevision = forcedDebugRevision ?
-          forcedDebugRevision : version::getCurrentCompilerTag();
+          forcedDebugRevision : version::getCurrentCompilerSerializationTag();
         if (moduleRevision != compilerRevision) {
-          result.status = Status::RevisionIncompatible;
+          // The module versions are mismatching, record it and diagnose later.
+          result.problematicRevision = moduleRevision;
 
-          // We can't trust this module format at this point.
-          return result;
+          // Reject the module only it still mismatches without the last digit.
+          StringRef compilerRevisionHead = compilerRevision.rsplit('.').first;
+          StringRef moduleRevisionHead = moduleRevision.rsplit('.').first;
+          if (moduleRevisionHead != compilerRevisionHead) {
+            result.status = Status::RevisionIncompatible;
+
+            // We can't trust the module format at this point.
+            return result;
+          }
         }
       }
       break;
@@ -398,7 +413,8 @@ static ValidationInfo validateControlBlock(
 
 static bool validateInputBlock(
     llvm::BitstreamCursor &cursor, SmallVectorImpl<uint64_t> &scratch,
-    SmallVectorImpl<SerializationOptions::FileDependency> &dependencies) {
+    SmallVectorImpl<SerializationOptions::FileDependency> *dependencies,
+    SmallVectorImpl<SearchPath> *searchPaths) {
   SmallVector<StringRef, 4> dependencyDirectories;
   SmallString<256> dependencyFullPathBuffer;
 
@@ -427,33 +443,43 @@ static bool validateInputBlock(
     }
     unsigned kind = maybeKind.get();
     switch (kind) {
-    case input_block::FILE_DEPENDENCY: {
-      bool isHashBased = scratch[2] != 0;
-      bool isSDKRelative = scratch[3] != 0;
+    case input_block::FILE_DEPENDENCY:
+      if (dependencies) {
+        bool isHashBased = scratch[2] != 0;
+        bool isSDKRelative = scratch[3] != 0;
 
-      StringRef path = blobData;
-      size_t directoryIndex = scratch[4];
-      if (directoryIndex != 0) {
-        if (directoryIndex > dependencyDirectories.size())
-          return true;
-        dependencyFullPathBuffer = dependencyDirectories[directoryIndex-1];
-        llvm::sys::path::append(dependencyFullPathBuffer, blobData);
-        path = dependencyFullPathBuffer;
-      }
+        StringRef path = blobData;
+        size_t directoryIndex = scratch[4];
+        if (directoryIndex != 0) {
+          if (directoryIndex > dependencyDirectories.size())
+            return true;
+          dependencyFullPathBuffer = dependencyDirectories[directoryIndex - 1];
+          llvm::sys::path::append(dependencyFullPathBuffer, blobData);
+          path = dependencyFullPathBuffer;
+        }
 
-      if (isHashBased) {
-        dependencies.push_back(
-          SerializationOptions::FileDependency::hashBased(
-            path, isSDKRelative, scratch[0], scratch[1]));
-      } else {
-        dependencies.push_back(
-          SerializationOptions::FileDependency::modTimeBased(
-            path, isSDKRelative, scratch[0], scratch[1]));
+        if (isHashBased)
+          dependencies->push_back(
+              SerializationOptions::FileDependency::hashBased(
+                  path, isSDKRelative, scratch[0], scratch[1]));
+        else
+          dependencies->push_back(
+              SerializationOptions::FileDependency::modTimeBased(
+                  path, isSDKRelative, scratch[0], scratch[1]));
       }
       break;
-    }
     case input_block::DEPENDENCY_DIRECTORY:
-      dependencyDirectories.push_back(blobData);
+      if (dependencies)
+        dependencyDirectories.push_back(blobData);
+      break;
+    case input_block::SEARCH_PATH:
+      if (searchPaths) {
+        bool isFramework;
+        bool isSystem;
+        input_block::SearchPathLayout::readRecord(scratch, isFramework,
+                                                  isSystem);
+        searchPaths->push_back({std::string(blobData), isFramework, isSystem});
+      }
       break;
     default:
       // Unknown metadata record, possibly for use by a future version of the
@@ -464,17 +490,17 @@ static bool validateInputBlock(
   return false;
 }
 
-
 bool serialization::isSerializedAST(StringRef data) {
   StringRef signatureStr(reinterpret_cast<const char *>(SWIFTMODULE_SIGNATURE),
-                         llvm::array_lengthof(SWIFTMODULE_SIGNATURE));
+                         std::size(SWIFTMODULE_SIGNATURE));
   return data.startswith(signatureStr);
 }
 
 ValidationInfo serialization::validateSerializedAST(
     StringRef data, bool requiresOSSAModules, StringRef requiredSDK,
     bool requiresRevisionMatch, ExtendedValidationInfo *extendedInfo,
-    SmallVectorImpl<SerializationOptions::FileDependency> *dependencies) {
+    SmallVectorImpl<SerializationOptions::FileDependency> *dependencies,
+    SmallVectorImpl<SearchPath> *searchPaths) {
   ValidationInfo result;
 
   // Check 32-bit alignment.
@@ -518,9 +544,9 @@ ValidationInfo serialization::validateSerializedAST(
           requiresOSSAModules, requiresRevisionMatch,
           requiredSDK,
           extendedInfo, localObfuscator);
-      if (result.status == Status::Malformed)
+      if (result.status != Status::Valid)
         return result;
-    } else if (dependencies &&
+    } else if ((dependencies || searchPaths) &&
                result.status == Status::Valid &&
                topLevelEntry.ID == INPUT_BLOCK_ID) {
       if (llvm::Error Err = cursor.EnterSubBlock(INPUT_BLOCK_ID)) {
@@ -529,7 +555,7 @@ ValidationInfo serialization::validateSerializedAST(
         result.status = Status::Malformed;
         return result;
       }
-      if (validateInputBlock(cursor, scratch, *dependencies)) {
+      if (validateInputBlock(cursor, scratch, dependencies, searchPaths)) {
         result.status = Status::Malformed;
         return result;
       }
@@ -995,6 +1021,8 @@ getActualImportControl(unsigned rawValue) {
     return ModuleDecl::ImportFilterKind::Exported;
   case static_cast<unsigned>(serialization::ImportControl::ImplementationOnly):
     return ModuleDecl::ImportFilterKind::ImplementationOnly;
+  case static_cast<unsigned>(serialization::ImportControl::PackageOnly):
+    return ModuleDecl::ImportFilterKind::PackageOnly;
   default:
     return None;
   }
@@ -1320,6 +1348,7 @@ ModuleFileSharedCore::ModuleFileSharedCore(
       SDKName = info.sdkName;
       CompatibilityVersion = info.compatibilityVersion;
       UserModuleVersion = info.userModuleVersion;
+      AllowableClientNames = info.allowableClients;
       Bits.ArePrivateImportsEnabled = extInfo.arePrivateImportsEnabled();
       Bits.IsSIB = extInfo.isSIB();
       Bits.IsStaticLibrary = extInfo.isStaticLibrary();
@@ -1333,6 +1362,8 @@ ModuleFileSharedCore::ModuleFileSharedCore(
       Bits.IsConcurrencyChecked = extInfo.isConcurrencyChecked();
       MiscVersion = info.miscVersion;
       ModuleABIName = extInfo.getModuleABIName();
+      ModulePackageName = extInfo.getModulePackageName();
+      ModuleExportAsName = extInfo.getExportAsName();
 
       hasValidControlBlock = true;
       break;
@@ -1402,7 +1433,7 @@ ModuleFileSharedCore::ModuleFileSharedCore(
           }
 
           Dependencies.push_back(
-              {blobData, spiBlob, importKind.getValue(), scoped});
+              {blobData, spiBlob, importKind.value(), scoped});
           break;
         }
         case input_block::LINK_LIBRARY: {

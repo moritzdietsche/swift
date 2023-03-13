@@ -91,8 +91,10 @@ struct ValidationInfo {
   version::Version compatibilityVersion = {};
   llvm::VersionTuple userModuleVersion;
   StringRef sdkName = {};
+  StringRef problematicRevision = {};
   size_t bytes = 0;
   Status status = Status::Malformed;
+  std::vector<StringRef> allowableClients;
 };
 
 /// A collection of options that can be used to set up a new AST context
@@ -106,6 +108,8 @@ class ExtendedValidationInfo {
   SmallVector<StringRef, 4> ExtraClangImporterOpts;
   std::string SDKPath;
   StringRef ModuleABIName;
+  StringRef ModulePackageName;
+  StringRef ExportAsName;
   struct {
     unsigned ArePrivateImportsEnabled : 1;
     unsigned IsSIB : 1;
@@ -178,12 +182,24 @@ public:
   StringRef getModuleABIName() const { return ModuleABIName; }
   void setModuleABIName(StringRef name) { ModuleABIName = name; }
 
+  StringRef getModulePackageName() const { return ModulePackageName; }
+  void setModulePackageName(StringRef name) { ModulePackageName = name; }
+
+  StringRef getExportAsName() const { return ExportAsName; }
+  void setExportAsName(StringRef name) { ExportAsName = name; }
+
   bool isConcurrencyChecked() const {
     return Bits.IsConcurrencyChecked;
   }
   void setIsConcurrencyChecked(bool val = true) {
     Bits.IsConcurrencyChecked = val;
   }
+};
+
+struct SearchPath {
+  std::string Path;
+  bool IsFramework;
+  bool IsSystem;
 };
 
 /// Returns info about the serialized AST in the given data.
@@ -215,7 +231,8 @@ ValidationInfo validateSerializedAST(
     bool requiresRevisionMatch = true,
     ExtendedValidationInfo *extendedInfo = nullptr,
     SmallVectorImpl<SerializationOptions::FileDependency> *dependencies =
-        nullptr);
+        nullptr,
+    SmallVectorImpl<SearchPath> *searchPaths = nullptr);
 
 /// Emit diagnostics explaining a failure to load a serialized AST.
 ///

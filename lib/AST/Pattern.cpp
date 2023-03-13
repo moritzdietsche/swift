@@ -19,6 +19,7 @@
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/GenericEnvironment.h"
+#include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeLoc.h"
 #include "swift/AST/TypeRepr.h"
 #include "swift/Basic/Statistic.h"
@@ -167,6 +168,12 @@ namespace {
     WalkToVarDecls(const std::function<void(VarDecl*)> &fn)
     : fn(fn) {}
 
+    /// Walk everything that's available; there shouldn't be macro expansions
+    /// that matter anyway.
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::ArgumentsAndExpansion;
+    }
+
     PostWalkResult<Pattern *> walkToPatternPost(Pattern *P) override {
       // Handle vars.
       if (auto *Named = dyn_cast<NamedPattern>(P))
@@ -306,12 +313,29 @@ bool Pattern::hasAnyMutableBindings() const {
   return HasMutable;
 }
 
+OptionalSomePattern *OptionalSomePattern::create(ASTContext &ctx,
+                                                 Pattern *subPattern,
+                                                 SourceLoc questionLoc) {
+  return new (ctx) OptionalSomePattern(ctx, subPattern, questionLoc);
+}
+
+OptionalSomePattern *
+OptionalSomePattern::createImplicit(ASTContext &ctx, Pattern *subPattern,
+                                    SourceLoc questionLoc) {
+  auto *P = OptionalSomePattern::create(ctx, subPattern, questionLoc);
+  P->setImplicit();
+  return P;
+}
+
+EnumElementDecl *OptionalSomePattern::getElementDecl() const {
+  return Ctx.getOptionalSomeDecl();
+}
+
 /// Return true if this is a non-resolved ExprPattern which is syntactically
 /// irrefutable.
 static bool isIrrefutableExprPattern(const ExprPattern *EP) {
-  // If the pattern has a registered match expression, it's
-  // a type-checked ExprPattern.
-  if (EP->getMatchExpr()) return false;
+  // If the pattern is resolved, it must be irrefutable.
+  if (EP->isResolved()) return false;
 
   auto expr = EP->getSubExpr();
   while (true) {
@@ -477,12 +501,33 @@ void IsPattern::setCastType(Type type) {
 
 TypeRepr *IsPattern::getCastTypeRepr() const { return CastType->getTypeRepr(); }
 
-/// Construct an ExprPattern.
-ExprPattern::ExprPattern(Expr *e, bool isResolved, Expr *matchExpr,
-                         VarDecl *matchVar)
-  : Pattern(PatternKind::Expr), SubExprAndIsResolved(e, isResolved),
-    MatchExpr(matchExpr), MatchVar(matchVar) {
-  assert(!matchExpr || e->isImplicit() == matchExpr->isImplicit());
+ExprPattern *ExprPattern::createParsed(ASTContext &ctx, Expr *E,
+                                       DeclContext *DC) {
+  return new (ctx) ExprPattern(E, DC, /*isResolved*/ false);
+}
+
+ExprPattern *ExprPattern::createResolved(ASTContext &ctx, Expr *E,
+                                         DeclContext *DC) {
+  return new (ctx) ExprPattern(E, DC, /*isResolved*/ true);
+}
+
+ExprPattern *ExprPattern::createImplicit(ASTContext &ctx, Expr *E,
+                                         DeclContext *DC) {
+  auto *EP = ExprPattern::createResolved(ctx, E, DC);
+  EP->setImplicit();
+  return EP;
+}
+
+Expr *ExprPattern::getMatchExpr() const {
+  auto &eval = DC->getASTContext().evaluator;
+  return evaluateOrDefault(eval, ExprPatternMatchRequest{this}, None)
+      .getMatchExpr();
+}
+
+VarDecl *ExprPattern::getMatchVar() const {
+  auto &eval = DC->getASTContext().evaluator;
+  return evaluateOrDefault(eval, ExprPatternMatchRequest{this}, None)
+      .getMatchVar();
 }
 
 SourceLoc EnumElementPattern::getStartLoc() const {
@@ -586,5 +631,13 @@ bool ContextualPattern::allowsInference() const {
 
 void swift::simple_display(llvm::raw_ostream &out,
                            const ContextualPattern &pattern) {
-  out << "(pattern @ " << pattern.getPattern() << ")";
+  simple_display(out, pattern.getPattern());
+}
+
+void swift::simple_display(llvm::raw_ostream &out, const Pattern *pattern) {
+  out << "(pattern @ " << pattern << ")";
+}
+
+SourceLoc swift::extractNearestSourceLoc(const Pattern *pattern) {
+  return pattern->getLoc();
 }

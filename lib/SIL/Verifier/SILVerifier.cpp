@@ -79,6 +79,7 @@ static llvm::cl::opt<bool> SkipConvertEscapeToNoescapeAttributes(
 // Allow unit tests to gradually migrate toward -allow-critical-edges=false.
 static llvm::cl::opt<bool> AllowCriticalEdges("allow-critical-edges",
                                               llvm::cl::init(true));
+extern llvm::cl::opt<bool> SILPrintDebugInfo;
 
 // The verifier is basically all assertions, so don't compile it with NDEBUG to
 // prevent release builds from triggering spurious unused variable warnings.
@@ -92,7 +93,7 @@ static llvm::cl::opt<bool> AllowCriticalEdges("allow-critical-edges",
 static bool isArchetypeValidInFunction(ArchetypeType *A, const SILFunction *F) {
   if (!isa<PrimaryArchetypeType>(A) && !isa<PackArchetypeType>(A))
     return true;
-  if (isa<OpenedArchetypeType>(A))
+  if (isa<LocalArchetypeType>(A))
     return true;
   if (isa<OpaqueTypeArchetypeType>(A))
     return true;
@@ -449,6 +450,7 @@ struct ImmutableAddressUseVerifier {
   bool isConsumingOrMutatingArgumentConvention(SILArgumentConvention conv) {
     switch (conv) {
     case SILArgumentConvention::Indirect_In_Guaranteed:
+    case SILArgumentConvention::Pack_Guaranteed:
       return false;
 
     case SILArgumentConvention::Indirect_InoutAliasable:
@@ -461,9 +463,11 @@ struct ImmutableAddressUseVerifier {
       // TODO: Remove this in favor of using Inout and In_Guaranteed.
       return false;
 
+    case SILArgumentConvention::Pack_Out:
+    case SILArgumentConvention::Pack_Owned:
+    case SILArgumentConvention::Pack_Inout:
     case SILArgumentConvention::Indirect_Out:
     case SILArgumentConvention::Indirect_In:
-    case SILArgumentConvention::Indirect_In_Constant:
     case SILArgumentConvention::Indirect_Inout:
       return true;
 
@@ -494,6 +498,15 @@ struct ImmutableAddressUseVerifier {
   // A "copy_addr * to * %dst" is mutating on "%dst".
   bool isConsumingOrMutatingCopyAddrUse(Operand *use) {
     auto *copyAddr = cast<CopyAddrInst>(use->getUser());
+    if (copyAddr->getDest() == use->get())
+      return true;
+    if (copyAddr->getSrc() == use->get() && copyAddr->isTakeOfSrc() == IsTake)
+      return true;
+    return false;
+  }
+
+  bool isConsumingOrMutatingExplicitCopyAddrUse(Operand *use) {
+    auto *copyAddr = cast<ExplicitCopyAddrInst>(use->getUser());
     if (copyAddr->getDest() == use->get())
       return true;
     if (copyAddr->getSrc() == use->get() && copyAddr->isTakeOfSrc() == IsTake)
@@ -600,6 +613,11 @@ struct ImmutableAddressUseVerifier {
         // mutation can happen. The checker will prove eventually that we can
         // convert it to a copy_addr [take] [init].
         break;
+      case SILInstructionKind::ExplicitCopyAddrInst:
+        if (isConsumingOrMutatingExplicitCopyAddrUse(use))
+          return true;
+        else
+          break;
       case SILInstructionKind::CopyAddrInst:
         if (isConsumingOrMutatingCopyAddrUse(use))
           return true;
@@ -684,6 +702,10 @@ class SILVerifier : public SILVerifierBase<SILVerifier> {
   const SILFunction &F;
   SILFunctionConventions fnConv;
   Lowering::TypeConverter &TC;
+
+  bool SingleFunction = true;
+  bool checkLinearLifetime = false;
+
   SmallVector<std::pair<StringRef, SILType>, 16> DebugVars;
   const SILInstruction *CurInstruction = nullptr;
   const SILArgument *CurArgument = nullptr;
@@ -691,10 +713,10 @@ class SILVerifier : public SILVerifierBase<SILVerifier> {
 
   // Used for dominance checking within a basic block.
   llvm::DenseMap<const SILInstruction *, unsigned> InstNumbers;
-  
-  DeadEndBlocks DEBlocks;
+
+  std::unique_ptr<DeadEndBlocks> DEBlocks;
+
   LoadBorrowImmutabilityAnalysis loadBorrowImmutabilityAnalysis;
-  bool SingleFunction = true;
 
   /// A cache of the isOperandInValueUse check. When we process an operand, we
   /// fix this for each of its uses.
@@ -932,6 +954,13 @@ public:
     }
   }
 
+  template <class T>
+  T *requireValueKind(SILValue value, const Twine &what) {
+    auto match = dyn_cast<T>(value);
+    _require(match != nullptr, what, [=] { llvm::dbgs() << value; });
+    return match;
+  }
+
   static unsigned numInstsInFunction(const SILFunction &F) {
     unsigned numInsts = 0;
     for (auto &BB : F) {
@@ -940,16 +969,17 @@ public:
     return numInsts;
   }
 
-  SILVerifier(const SILFunction &F, bool SingleFunction = true)
+  SILVerifier(const SILFunction &F, bool SingleFunction, bool checkLinearLifetime)
       : M(F.getModule().getSwiftModule()), F(F),
         fnConv(F.getConventionsInContext()), TC(F.getModule().Types),
+        SingleFunction(SingleFunction),
+        checkLinearLifetime(checkLinearLifetime),
         Dominance(nullptr),
-        InstNumbers(numInstsInFunction(F)), DEBlocks(&F),
-        loadBorrowImmutabilityAnalysis(DEBlocks, &F),
-        SingleFunction(SingleFunction) {
+        InstNumbers(numInstsInFunction(F)),
+        loadBorrowImmutabilityAnalysis(DEBlocks.get(), &F) {
     if (F.isExternalDeclaration())
       return;
-      
+
     // Check to make sure that all blocks are well formed.  If not, the
     // SILVerifier object will explode trying to compute dominance info.
     unsigned InstIdx = 0;
@@ -1042,7 +1072,9 @@ public:
   void visitSILArgument(SILArgument *arg) {
     CurArgument = arg;
     checkLegalType(arg->getFunction(), arg, nullptr);
-    checkValueBaseOwnership(arg);
+    if (checkLinearLifetime) {
+      checkValueBaseOwnership(arg);
+    }
     if (auto *phiArg = dyn_cast<SILPhiArgument>(arg)) {
       if (phiArg->isPhi())
         visitSILPhiArgument(phiArg);
@@ -1082,7 +1114,9 @@ public:
 
     for (auto result : I->getResults()) {
       checkLegalType(F, result, I);
-      checkValueBaseOwnership(result);
+      if (checkLinearLifetime) {
+        checkValueBaseOwnership(result);
+      }
     }
   }
 
@@ -1100,7 +1134,7 @@ public:
               "Once ownership is gone, all values should have none ownership");
       return;
     }
-    SILValue(V).verifyOwnership(&DEBlocks);
+    SILValue(V).verifyOwnership(DEBlocks.get());
   }
 
   void checkSILInstruction(SILInstruction *I) {
@@ -1427,6 +1461,9 @@ public:
     if (auto *baResult = isaResultOf<BeginApplyInst>(value))
       return baResult->isBeginApplyToken();
 
+    if (isa<OpenPackElementInst>(value))
+      return true;
+
     // Add more token cases here as they arise.
 
     return false;
@@ -1472,13 +1509,13 @@ public:
       require(isArchetypeValidInFunction(A, F),
               "Operand is of an ArchetypeType that does not exist in the "
               "Caller's generic param list.");
-      if (auto OpenedA = getOpenedArchetypeOf(A)) {
+      if (auto localA = getLocalArchetypeOf(A)) {
         auto *openingInst =
-            F->getModule().getRootOpenedArchetypeDefInst(OpenedA.getRoot(), F);
+            F->getModule().getRootLocalArchetypeDefInst(localA.getRoot(), F);
         require(I == nullptr || openingInst == I ||
                     properlyDominates(openingInst, I),
-                "Use of an opened archetype should be dominated by a "
-                "definition of this root opened archetype");
+                "Use of a local archetype should be dominated by a "
+                "definition of this root local archetype");
       }
     });
   }
@@ -1499,7 +1536,7 @@ public:
     require(AI->getType().isAddress(),
             "result of alloc_stack must be an address type");
 
-    verifyOpenedArchetype(AI, AI->getElementType().getASTType());
+    verifyLocalArchetype(AI, AI->getElementType().getASTType());
 
     require(!AI->isVarInfoInvalidated() || !bool(AI->getVarInfo()),
             "AllocStack Var Info should be None if invalidated");
@@ -1511,9 +1548,15 @@ public:
     // It's illegal code but the compiler should not crash on it.
   }
 
+  void checkAllocPackInst(AllocPackInst *AI) {
+    requireAddressType(SILPackType, AI->getType(),
+                       "result of alloc_pack must be an address of "
+                       "lowered pack type");
+  }
+
   void checkAllocRefBase(AllocRefInstBase *ARI) {
     requireReferenceValue(ARI, "Result of alloc_ref");
-    verifyOpenedArchetype(ARI, ARI->getType().getASTType());
+    verifyLocalArchetype(ARI, ARI->getType().getASTType());
     auto Types = ARI->getTailAllocatedTypes();
     auto Counts = ARI->getTailAllocatedCounts();
     unsigned NumTypes = Types.size();
@@ -1521,7 +1564,7 @@ public:
     require(NumTypes == 0 || !ARI->isObjC(),
             "Can't tail allocate with ObjC class");
     for (unsigned Idx = 0; Idx < NumTypes; ++Idx) {
-      verifyOpenedArchetype(ARI, Types[Idx].getASTType());
+      verifyLocalArchetype(ARI, Types[Idx].getASTType());
       require(Counts[Idx].get()->getType().is<BuiltinIntegerType>(),
               "count needs integer type");
     }
@@ -1592,31 +1635,31 @@ public:
     return fnTy->substGenericArgs(F.getModule(), subs, F.getTypeExpansionContext());
   }
 
-  /// Check that for each opened archetype or dynamic self type in substitutions
-  /// or the calle type, there is a type dependent operand.
+  /// Check that for each local archetype or dynamic self type in substitutions
+  /// or the called type, there is a type dependent operand.
   void checkApplyTypeDependentArguments(ApplySite AS) {
     SILInstruction *AI = AS.getInstruction();
 
-    llvm::DenseSet<OpenedArchetypeType *> FoundRootOpenedArchetypes;
+    llvm::DenseSet<LocalArchetypeType *> FoundRootLocalArchetypes;
     unsigned hasDynamicSelf = 0;
 
-    // Function to collect opened archetypes in FoundOpenedArchetypes and set
-    // hasDynamicSelf.
+    // Function to collect local archetypes in FoundRootLocalArchetypes
+    // and set hasDynamicSelf.
     auto HandleType = [&](CanType Ty) {
-      if (const auto A = dyn_cast<OpenedArchetypeType>(Ty)) {
+      if (const auto A = dyn_cast<LocalArchetypeType>(Ty)) {
         require(isArchetypeValidInFunction(A, AI->getFunction()),
                 "Archetype to be substituted must be valid in function.");
 
         const auto root = A.getRoot();
 
-        // Collect all root opened archetypes used in the substitutions list.
-        FoundRootOpenedArchetypes.insert(root);
+        // Collect all root local archetypes used in the substitutions list.
+        FoundRootLocalArchetypes.insert(root);
         // Also check that they are properly tracked inside the current
         // function.
-        auto *openingInst = F.getModule().getRootOpenedArchetypeDefInst(
+        auto *openingInst = F.getModule().getRootLocalArchetypeDefInst(
             root, AI->getFunction());
         require(openingInst == AI || properlyDominates(openingInst, AI),
-                "Use of an opened archetype should be dominated by a "
+                "Use of a local archetype should be dominated by a "
                 "definition of this root opened archetype");
       }
       if (Ty->hasDynamicSelfType()) {
@@ -1624,15 +1667,15 @@ public:
       }
     };
 
-    // Search for opened archetypes and dynamic self.
+    // Search for local archetypes and dynamic self.
     for (auto Replacement : AS.getSubstitutionMap().getReplacementTypes()) {
       Replacement->getCanonicalType().visit(HandleType);
     }
     AS.getSubstCalleeType().visit(HandleType);
 
-    require(FoundRootOpenedArchetypes.size() + hasDynamicSelf ==
+    require(FoundRootLocalArchetypes.size() + hasDynamicSelf ==
                 AI->getTypeDependentOperands().size(),
-            "Number of opened archetypes and dynamic self in the substitutions "
+            "Number of local archetypes and dynamic self in the substitutions "
             "list should match the number of type dependent operands");
 
     for (auto &Op : AI->getTypeDependentOperands()) {
@@ -1645,14 +1688,21 @@ public:
         require((ValueBase *)V == AI->getFunction()->getDynamicSelfMetadata(),
                 "wrong self metadata operand");
       } else {
-        require(isa<SingleValueInstruction>(V),
-                "opened archetype operand should refer to a SIL instruction");
-        auto Archetype =
-            cast<SingleValueInstruction>(V)->getDefinedOpenedArchetype();
-        require(Archetype,
-                "opened archetype operand should define an opened archetype");
-        require(FoundRootOpenedArchetypes.count(Archetype),
-                "opened archetype operand does not correspond to any opened "
+        auto DI = V->getDefiningInstruction();
+        require(DI,
+                "local archetype operand should refer to a SIL instruction");
+        bool definesFoundArchetype = false;
+        bool definesAnyArchetype = false;
+        DI->forEachDefinedLocalArchetype(
+            [&](CanLocalArchetypeType archetype, SILValue dependency) {
+          definesAnyArchetype = true;
+          if (FoundRootLocalArchetypes.count(archetype))
+            definesFoundArchetype = true;
+        });
+        require(definesAnyArchetype,
+                "local archetype operand should define a local archetype");
+        require(definesFoundArchetype,
+                "local archetype operand does not correspond to any local "
                 "archetype from the substitutions list");
       }
     }
@@ -2242,6 +2292,10 @@ public:
     require(
         F.hasOwnership(),
         "Inst with qualified ownership in a function that is not qualified");
+    if (EBI->getOperand()->getType().isAddress()) {
+      require(isa<StoreBorrowInst>(EBI->getOperand()),
+              "end_borrow of an address not produced by store_borrow");
+    }
   }
 
   void checkEndLifetimeInst(EndLifetimeInst *I) {
@@ -2310,11 +2364,26 @@ public:
 
     switch (BAI->getAccessKind()) {
     case SILAccessKind::Init:
-    case SILAccessKind::Deinit:
-      require(BAI->getEnforcement() == SILAccessEnforcement::Static,
-              "init/deinit accesses cannot use non-static enforcement");
+      // A signed access preserves the access marker until IRGen
+      require(BAI->getEnforcement() == SILAccessEnforcement::Static ||
+                  BAI->getEnforcement() == SILAccessEnforcement::Signed,
+              "init accesses cannot use non-static/non-signed enforcement");
       break;
 
+    case SILAccessKind::Deinit:
+      // A signed access preserves the access marker until IRGen.
+      //
+      // NOTE: We allow for deinit to be non-static before Lowered SIL to allow
+      // for it to be used to represent deinit accesses for move only types
+      // stored in classes, globals, and escaping mutable captures. This is ok
+      // to do since even though we allow for them to be represented there, the
+      // move only checker passes will always emit an error for them implying
+      // that we will never get to LoweredSIL and codegen.
+      require(BAI->getEnforcement() == SILAccessEnforcement::Static ||
+                  BAI->getEnforcement() == SILAccessEnforcement::Signed ||
+                  BAI->getModule().getStage() != SILStage::Lowered,
+              "init accesses cannot use non-static/non-signed enforcement");
+      break;
     case SILAccessKind::Read:
     case SILAccessKind::Modify:
       break;
@@ -2373,10 +2442,22 @@ public:
 
     switch (BUAI->getAccessKind()) {
     case SILAccessKind::Init:
-    case SILAccessKind::Deinit:
       require(BUAI->getEnforcement() == SILAccessEnforcement::Static,
-              "init/deinit accesses cannot use non-static enforcement");
+              "init accesses cannot use non-static enforcement");
       break;
+    case SILAccessKind::Deinit:
+      // NOTE: We allow for deinit to be non-static before Lowered SIL to allow
+      // for it to be used to represent deinit accesses for move only types
+      // stored in classes, globals, and escaping mutable captures. This is ok
+      // to do since even though we allow for them to be represented there, the
+      // move only checker passes will always emit an error for them implying
+      // that we will never get to LoweredSIL and codegen.
+      require(
+          BUAI->getEnforcement() == SILAccessEnforcement::Static ||
+              BUAI->getModule().getStage() != SILStage::Lowered,
+          "deinit accesses cannot use non-static enforcement in Lowered SIL");
+      break;
+
     case SILAccessKind::Read:
     case SILAccessKind::Modify:
       break;
@@ -2445,6 +2526,8 @@ public:
   }
 
   void checkStoreBorrowInst(StoreBorrowInst *SI) {
+    // A store_borrow must be to an alloc_stack.  That alloc_stack can only be
+    // used by store_borrows (and dealloc_stacks).
     require(SI->getSrc()->getType().isObject(),
             "Can't store from an address source");
     require(!fnConv.useLoweredAddresses()
@@ -2452,15 +2535,12 @@ public:
             "Can't store a non loadable type");
     require(SI->getDest()->getType().isAddress(),
             "Must store to an address dest");
-    require(isa<AllocStackInst>(SI->getDest()),
-            "store_borrow destination should be alloc_stack");
-    requireSameType(SI->getDest()->getType().getObjectType(),
-                    SI->getSrc()->getType(),
-                    "Store operand type and dest type mismatch");
-
     // Note: This is the current implementation and the design is not final.
     require(isa<AllocStackInst>(SI->getDest()),
             "store_borrow destination can only be an alloc_stack");
+    requireSameType(SI->getDest()->getType().getObjectType(),
+                    SI->getSrc()->getType(),
+                    "Store operand type and dest type mismatch");
 
     SSAPrunedLiveness scopedAddressLiveness;
     ScopedAddressValue scopedAddress(SI);
@@ -2480,11 +2560,11 @@ public:
     bool success = useKind == AddressUseKind::NonEscaping;
 
     require(!success || checkScopedAddressUses(
-                            scopedAddress, &scopedAddressLiveness, &DEBlocks),
+              scopedAddress, &scopedAddressLiveness, DEBlocks.get()),
             "Ill formed store_borrow scope");
 
     require(!success || !hasOtherStoreBorrowsInLifetime(
-                            SI, &scopedAddressLiveness, &DEBlocks),
+              SI, &scopedAddressLiveness, DEBlocks.get()),
             "A store_borrow cannot be nested within another "
             "store_borrow to its destination");
 
@@ -2541,13 +2621,11 @@ public:
             "assign instruction can only exist in raw SIL");
     require(Dest->getType().isAddress(), "Must store to an address dest");
 
-    if (AI->getOriginator() ==
-        AssignByWrapperInst::Originator::PropertyWrapper) {
-      SILValue initFn = AI->getInitializer();
-      CanSILFunctionType initTy = initFn->getType().castTo<SILFunctionType>();
-      SILFunctionConventions initConv(initTy, AI->getModule());
-      checkAssignByWrapperArgs(Src->getType(), initConv);
-      switch (initConv.getNumIndirectSILResults()) {
+    SILValue initFn = AI->getInitializer();
+    CanSILFunctionType initTy = initFn->getType().castTo<SILFunctionType>();
+    SILFunctionConventions initConv(initTy, AI->getModule());
+    checkAssignByWrapperArgs(Src->getType(), initConv);
+    switch (initConv.getNumIndirectSILResults()) {
       case 0:
         require(initConv.getNumDirectSILResults() == 1,
                 "wrong number of init function results");
@@ -2568,13 +2646,6 @@ public:
         break;
       default:
         require(false, "wrong number of indirect init function results");
-      }
-    } else {
-      require(AI->getOriginator() ==
-                  AssignByWrapperInst::Originator::TypeWrapper,
-              "wrong originator");
-      require(isa<SILUndef>(AI->getInitializer()),
-              "assignment via type wrapper does not have initializer");
     }
 
     SILValue setterFn = AI->getSetter();
@@ -3026,6 +3097,9 @@ public:
 
   void checkTupleInst(TupleInst *TI) {
     CanTupleType ResTy = requireObjectType(TupleType, TI, "Result of tuple");
+    require(!ResTy.containsPackExpansionType(),
+            "tuple instruction cannot be used with tuples containing "
+            "pack expansions");
 
     require(TI->getElements().size() == ResTy->getNumElements(),
             "Tuple field count mismatch!");
@@ -3051,7 +3125,7 @@ public:
     auto MetaTy = MI->getType().castTo<MetatypeType>();
     require(MetaTy->hasRepresentation(),
             "metatype instruction must have a metatype representation");
-    verifyOpenedArchetype(MI, MetaTy.getInstanceType());
+    verifyLocalArchetype(MI, MetaTy.getInstanceType());
   }
   void checkValueMetatypeInst(ValueMetatypeInst *MI) {
     require(MI->getType().is<MetatypeType>(),
@@ -3106,6 +3180,11 @@ public:
             "Operand of dealloc_stack must be an alloc_stack or partial_apply "
             "[stack]");
   }
+  void checkDeallocPackInst(DeallocPackInst *DI) {
+    require(isa<SILUndef>(DI->getOperand()) ||
+            isa<AllocPackInst>(DI->getOperand()),
+            "Operand of dealloc_pack must be an alloc_pack");
+  }
   void checkDeallocRefInst(DeallocRefInst *DI) {
     require(DI->getOperand()->getType().isObject(),
             "Operand of dealloc_ref must be object");
@@ -3139,7 +3218,7 @@ public:
     require(AI->getType().isObject(),
             "result of alloc_box must be an object");
     for (unsigned field : indices(AI->getBoxType()->getLayout()->getFields())) {
-      verifyOpenedArchetype(AI, getSILBoxFieldLoweredType(
+      verifyLocalArchetype(AI, getSILBoxFieldLoweredType(
                                     F.getTypeExpansionContext(), AI->getBoxType(),
                                     F.getModule().Types, field));
     }
@@ -3212,6 +3291,10 @@ public:
   void checkTupleExtractInst(TupleExtractInst *EI) {
     CanTupleType operandTy = requireObjectType(TupleType, EI->getOperand(),
                                                "Operand of tuple_extract");
+    require(!operandTy.containsPackExpansionType(),
+            "tuple_extract cannot be used with tuples containing "
+            "pack expansions");
+
     require(EI->getType().isObject(),
             "result of tuple_extract must be object");
 
@@ -3251,6 +3334,13 @@ public:
                 EI->getForwardingOwnershipKind() == OwnershipKind::Guaranteed,
             "invalid forwarding ownership kind on tuple_extract instruction");
 
+    require(!EI->getModule()
+                    .getOptions()
+                    .EnableImportPtrauthFieldFunctionPointers ||
+                !EI->getField()->getPointerAuthQualifier().isPresent(),
+            "Imported structs with ptrauth qualified fields should not be "
+            "promoted to a value");
+
     if (EI->getModule().getStage() != SILStage::Lowered) {
       SILType loweredFieldTy = operandTy.getFieldType(
           EI->getField(), F.getModule(), F.getTypeExpansionContext());
@@ -3260,21 +3350,21 @@ public:
   }
 
   void checkTupleElementAddrInst(TupleElementAddrInst *EI) {
-    SILType operandTy = EI->getOperand()->getType();
-    require(operandTy.isAddress(),
-            "must derive element_addr from address");
     require(EI->getType().isAddress(),
             "result of tuple_element_addr must be address");
-    require(operandTy.is<TupleType>(),
-            "must derive tuple_element_addr from tuple");
+    SILType operandTy = EI->getOperand()->getType();
+    auto tupleType = requireAddressType(TupleType, operandTy,
+            "operand of tuple_element_addr must be the address of a tuple");
+    require(!tupleType.containsPackExpansionType(),
+            "tuple_element_addr cannot be used with tuples containing "
+            "pack expansions");
 
-    ArrayRef<TupleTypeElt> fields = operandTy.castTo<TupleType>()->getElements();
-    require(EI->getFieldIndex() < fields.size(),
-            "invalid field index for element_addr instruction");
+    require(EI->getFieldIndex() < tupleType->getNumElements(),
+            "invalid field index for tuple_element_addr instruction");
     if (EI->getModule().getStage() != SILStage::Lowered) {
       requireSameType(
           EI->getType().getASTType(),
-          CanType(fields[EI->getFieldIndex()].getType()),
+          tupleType.getElementType(EI->getFieldIndex()),
           "type of tuple_element_addr does not match type of element");
     }
   }
@@ -3298,6 +3388,15 @@ public:
     require(EI->getField()->getDeclContext() == sd,
             "struct_element_addr field is not a member of the struct");
 
+    if (EI->getModule().getOptions().EnableImportPtrauthFieldFunctionPointers &&
+        EI->getField()->getPointerAuthQualifier().isPresent()) {
+      for (auto *use : EI->getUses()) {
+        auto *bai = dyn_cast<BeginAccessInst>(use->getUser());
+        require(bai && bai->getEnforcement() == SILAccessEnforcement::Signed,
+                "Access to ptrauth qualified fields should be scoped with "
+                "begin_access [signed]/end_access");
+      }
+    }
     if (EI->getModule().getStage() != SILStage::Lowered) {
       SILType loweredFieldTy = operandTy.getFieldType(
           EI->getField(), F.getModule(), F.getTypeExpansionContext());
@@ -3437,10 +3536,10 @@ public:
             "requirement Self parameter must conform to called protocol");
 
     auto lookupType = AMI->getLookupType();
-    if (getOpenedArchetypeOf(lookupType) || lookupType->hasDynamicSelfType()) {
+    if (getLocalArchetypeOf(lookupType) || lookupType->hasDynamicSelfType()) {
       require(AMI->getTypeDependentOperands().size() == 1,
               "Must have a type dependent operand for the opened archetype");
-      verifyOpenedArchetype(AMI, lookupType);
+      verifyLocalArchetype(AMI, lookupType);
     } else {
       require(AMI->getTypeDependentOperands().empty(),
               "Should not have an operand for the opened existential");
@@ -3663,7 +3762,7 @@ public:
       require(isa<ArchetypeType>(operandInstanceType) ||
               operandInstanceType->isObjCExistentialType(),
               "operand type must be an archetype or self-conforming existential");
-      verifyOpenedArchetype(OMI, OMI->getType().getASTType());
+      verifyLocalArchetype(OMI, OMI->getType().getASTType());
     }
 
     // TODO: We should enforce that ObjC methods are dispatched on ObjC
@@ -3721,7 +3820,7 @@ public:
     auto archetype = getOpenedArchetypeOf(OEI->getType().getASTType());
     require(archetype,
         "open_existential_addr result must be an opened existential archetype");
-    require(OEI->getModule().getRootOpenedArchetypeDefInst(
+    require(OEI->getModule().getRootLocalArchetypeDefInst(
                 archetype, OEI->getFunction()) == OEI,
             "Archetype opened by open_existential_addr should be registered in "
             "SILFunction");
@@ -3755,7 +3854,7 @@ public:
     auto archetype = getOpenedArchetypeOf(resultInstanceTy);
     require(archetype,
         "open_existential_ref result must be an opened existential archetype");
-    require(OEI->getModule().getRootOpenedArchetypeDefInst(
+    require(OEI->getModule().getRootLocalArchetypeDefInst(
                 archetype, OEI->getFunction()) == OEI,
             "Archetype opened by open_existential_ref should be registered in "
             "SILFunction");
@@ -3778,7 +3877,7 @@ public:
     auto archetype = getOpenedArchetypeOf(resultInstanceTy);
     require(archetype,
         "open_existential_box result must be an opened existential archetype");
-    require(OEI->getModule().getRootOpenedArchetypeDefInst(
+    require(OEI->getModule().getRootLocalArchetypeDefInst(
                 archetype, OEI->getFunction()) == OEI,
             "Archetype opened by open_existential_box should be registered in "
             "SILFunction");
@@ -3801,7 +3900,7 @@ public:
     auto archetype = getOpenedArchetypeOf(resultInstanceTy);
     require(archetype,
         "open_existential_box_value result not an opened existential archetype");
-    require(OEI->getModule().getRootOpenedArchetypeDefInst(
+    require(OEI->getModule().getRootLocalArchetypeDefInst(
                 archetype, OEI->getFunction()) == OEI,
             "Archetype opened by open_existential_box_value should be "
             "registered in SILFunction");
@@ -3848,7 +3947,7 @@ public:
     require(archetype, "open_existential_metatype result must be an opened "
                        "existential metatype");
     require(
-        I->getModule().getRootOpenedArchetypeDefInst(archetype,
+        I->getModule().getRootLocalArchetypeDefInst(archetype,
                                                      I->getFunction()) == I,
         "Archetype opened by open_existential_metatype should be registered in "
         "SILFunction");
@@ -3868,7 +3967,7 @@ public:
     auto archetype = getOpenedArchetypeOf(OEI->getType().getASTType());
     require(archetype, "open_existential_value result must be an opened "
                        "existential archetype");
-    require(OEI->getModule().getRootOpenedArchetypeDefInst(
+    require(OEI->getModule().getRootLocalArchetypeDefInst(
                 archetype, OEI->getFunction()) == OEI,
             "Archetype opened by open_existential should be registered in "
             "SILFunction");
@@ -3887,7 +3986,7 @@ public:
     checkExistentialProtocolConformances(exType.getASTType(),
                                          AEBI->getFormalConcreteType(),
                                          AEBI->getConformances());
-    verifyOpenedArchetype(AEBI, AEBI->getFormalConcreteType());
+    verifyLocalArchetype(AEBI, AEBI->getFormalConcreteType());
   }
 
   void checkInitExistentialAddrInst(InitExistentialAddrInst *AEI) {
@@ -3920,7 +4019,7 @@ public:
     checkExistentialProtocolConformances(exType.getASTType(),
                                          AEI->getFormalConcreteType(),
                                          AEI->getConformances());
-    verifyOpenedArchetype(AEI, AEI->getFormalConcreteType());
+    verifyLocalArchetype(AEI, AEI->getFormalConcreteType());
   }
 
   void checkInitExistentialValueInst(InitExistentialValueInst *IEI) {
@@ -3948,7 +4047,7 @@ public:
     checkExistentialProtocolConformances(exType.getASTType(),
                                          IEI->getFormalConcreteType(),
                                          IEI->getConformances());
-    verifyOpenedArchetype(IEI, IEI->getFormalConcreteType());
+    verifyLocalArchetype(IEI, IEI->getFormalConcreteType());
   }
 
   void checkInitExistentialRefInst(InitExistentialRefInst *IEI) {
@@ -3980,7 +4079,7 @@ public:
     checkExistentialProtocolConformances(exType.getASTType(),
                                          IEI->getFormalConcreteType(),
                                          IEI->getConformances());
-    verifyOpenedArchetype(IEI, IEI->getFormalConcreteType());
+    verifyLocalArchetype(IEI, IEI->getFormalConcreteType());
   }
 
   void checkDeinitExistentialAddrInst(DeinitExistentialAddrInst *DEI) {
@@ -4046,7 +4145,7 @@ public:
     checkExistentialProtocolConformances(resultInstanceType,
                                          operandInstanceType,
                                          I->getConformances());
-    verifyOpenedArchetype(I, MetaTy.getInstanceType());
+    verifyLocalArchetype(I, MetaTy.getInstanceType());
   }
 
   void checkExistentialProtocolConformances(CanType resultType,
@@ -4129,7 +4228,7 @@ public:
     verifyCheckedCast(/*exact*/ false,
                       CI->getOperand()->getType(),
                       CI->getType());
-    verifyOpenedArchetype(CI, CI->getType().getASTType());
+    verifyLocalArchetype(CI, CI->getType().getASTType());
   }
 
   // Make sure that opcodes handled by isRCIdentityPreservingCast cannot cast
@@ -4141,17 +4240,17 @@ public:
             "Unexpected trivial-to-reference conversion: ");
   }
 
-  /// Verify if a given type is or contains an opened archetype or dynamic self.
+  /// Verify if a given type is or contains a local archetype or dynamic self.
   /// If this is the case, verify that the provided instruction has a type
   /// dependent operand for it.
-  void verifyOpenedArchetype(SILInstruction *I, CanType Ty) {
+  void verifyLocalArchetype(SILInstruction *I, CanType Ty) {
     if (!Ty)
       return;
     // Check the type and all of its contained types.
     Ty.visit([&](CanType t) {
       SILValue Def;
-      if (const auto archetypeTy = dyn_cast<OpenedArchetypeType>(t)) {
-        Def = I->getModule().getRootOpenedArchetypeDefInst(
+      if (const auto archetypeTy = dyn_cast<LocalArchetypeType>(t)) {
+        Def = I->getModule().getRootLocalArchetypeDefInst(
             archetypeTy.getRoot(), I->getFunction());
         require(Def, "Root opened archetype should be registered in SILModule");
       } else if (t->hasDynamicSelfType()) {
@@ -4178,7 +4277,7 @@ public:
     verifyCheckedCast(CBI->isExact(),
                       CBI->getSourceLoweredType(),
                       CBI->getTargetLoweredType());
-    verifyOpenedArchetype(CBI, CBI->getTargetFormalType());
+    verifyLocalArchetype(CBI, CBI->getTargetFormalType());
 
     require(CBI->getSuccessBB()->args_size() == 1,
             "success dest of checked_cast_br must take one argument");
@@ -4377,7 +4476,7 @@ public:
   }
   
   void checkUncheckedRefCastInst(UncheckedRefCastInst *AI) {
-    verifyOpenedArchetype(AI, AI->getType().getASTType());
+    verifyLocalArchetype(AI, AI->getType().getASTType());
     require(AI->getOperand()->getType().isObject(),
             "unchecked_ref_cast operand must be a value");
     require(AI->getType().isObject(),
@@ -4401,7 +4500,7 @@ public:
   }
   
   void checkUncheckedAddrCastInst(UncheckedAddrCastInst *AI) {
-    verifyOpenedArchetype(AI, AI->getType().getASTType());
+    verifyLocalArchetype(AI, AI->getType().getASTType());
 
     require(AI->getOperand()->getType().isAddress(),
             "unchecked_addr_cast operand must be an address");
@@ -4410,7 +4509,7 @@ public:
   }
   
   void checkUncheckedTrivialBitCastInst(UncheckedTrivialBitCastInst *BI) {
-    verifyOpenedArchetype(BI, BI->getType().getASTType());
+    verifyLocalArchetype(BI, BI->getType().getASTType());
     require(BI->getOperand()->getType().isObject(),
             "unchecked_trivial_bit_cast must operate on a value");
     require(BI->getType().isObject(),
@@ -4420,7 +4519,7 @@ public:
   }
 
   void checkUncheckedBitwiseCastInst(UncheckedBitwiseCastInst *BI) {
-    verifyOpenedArchetype(BI, BI->getType().getASTType());
+    verifyLocalArchetype(BI, BI->getType().getASTType());
     require(BI->getOperand()->getType().isObject(),
             "unchecked_bitwise_cast must operate on a value");
     require(BI->getType().isObject(),
@@ -4437,7 +4536,7 @@ public:
   }
 
   void checkRawPointerToRefInst(RawPointerToRefInst *AI) {
-    verifyOpenedArchetype(AI, AI->getType().getASTType());
+    verifyLocalArchetype(AI, AI->getType().getASTType());
     require(AI->getType()
               .getASTType()->isBridgeableObjectType()
             || AI->getType().getASTType()->isEqual(
@@ -4464,7 +4563,7 @@ public:
   }
   
   void checkBridgeObjectToRefInst(BridgeObjectToRefInst *RI) {
-    verifyOpenedArchetype(RI, RI->getType().getASTType());
+    verifyLocalArchetype(RI, RI->getType().getASTType());
     requireSameType(RI->getConverted()->getType(),
                     SILType::getBridgeObjectType(F.getASTContext()),
                     "bridge_object_to_ref must take a BridgeObject");
@@ -5171,7 +5270,7 @@ public:
           baseTy,
           leafTy,
           component,
-          KPI->getAllOperands(),
+          KPI->getPatternOperands(),
           KPI->getPattern()->getGenericSignature(),
           KPI->getSubstitutions(),
           /*property descriptor*/false,
@@ -5382,6 +5481,319 @@ public:
     }
   }
 
+  void verifySameShape(CanPackType left, CanPackType right) {
+    verifySameShape(left, right, 0, right->getNumElements());
+  }
+  void verifySameShape(CanPackType left, CanPackType right,
+                       unsigned rightBegin, unsigned rightEnd) {
+    auto rightElements = right.getElementTypes();
+    require(rightBegin <= rightEnd && rightEnd <= rightElements.size(),
+            "slice out of range");
+    _verifySameShape(left.getElementTypes(),
+                     rightElements.slice(rightBegin, rightEnd - rightBegin));
+  }
+  void verifySameShape(CanPackType left, ArrayRef<CanType> right) {
+    _verifySameShape(left.getElementTypes(), right);
+  }
+  template <class LeftArray, class RightArray>
+  void _verifySameShape(LeftArray left, RightArray right) {
+    require(left.size() == right.size(), "packs must agree in length");
+
+    for (size_t i : indices(left)) {
+      auto leftExpansion = dyn_cast<PackExpansionType>(left[i]);
+      auto rightExpansion = dyn_cast<PackExpansionType>(right[i]);
+      if (leftExpansion && rightExpansion) {
+        require(leftExpansion.getCountType()->getReducedShape() ==
+                rightExpansion.getCountType()->getReducedShape(),
+                "packs must have same shape: corresponding expansion "
+                "components must expand packs of same shape");
+      } else {
+        require(!leftExpansion && !rightExpansion,
+                "packs must have same shape: must agree in whether "
+                "corresponding components are expansions");
+      }
+    }
+  }
+
+  /// Given that we're indexing into the given pack, verify that the
+  /// element type is a valid type for the element at the given index.
+  void verifyPackElementType(CanSILPackType packType,
+                             AnyPackIndexInst *packIndex,
+                             SILType elementType) {
+    require(elementType.isAddress() == packType->isElementAddress(),
+            "pack element address-ness must match pack");
+
+    verifyPackElementType(packType->getElementTypes(),
+                          packIndex,
+                          elementType.getASTType(),
+                          /*SILType*/ true);
+  }
+
+  /// Verify that the element type is the right type for a particular
+  /// index of a pack with the given components.  This implements the
+  /// structural type matching for pack indexing algorithm described
+  /// in the specification for the SIL pack indexing instructions.
+  void verifyPackElementType(ArrayRef<CanType> indexedPack,
+                             AnyPackIndexInst *packIndex,
+                             CanType targetElementType,
+                            bool typesAreSILTypes) {
+    verifySameShape(packIndex->getIndexedPackType(), indexedPack);
+
+    if (auto spi = dyn_cast<ScalarPackIndexInst>(packIndex)) {
+      requireSameType(targetElementType,
+                      indexedPack[spi->getComponentIndex()],
+                      "scalar pack index must match exactly");
+    } else if (auto ppi = dyn_cast<PackPackIndexInst>(packIndex)) {
+      auto start = ppi->getComponentStartIndex();
+      auto end = ppi->getComponentEndIndex();
+      verifyPackElementType(indexedPack.slice(start, end - start),
+                            ppi->getSliceIndexOperand(),
+                            targetElementType,
+                            typesAreSILTypes);
+    } else {
+      auto dpi = cast<DynamicPackIndexInst>(packIndex);
+      verifyDynamicPackIndexStructuralEquality(indexedPack, dpi,
+                                               targetElementType,
+                                               typesAreSILTypes);
+    }
+  }
+
+  /// Collect the opened element archetypes in the named type that
+  /// are opened by an instruction using the given pack-indexing
+  /// instruction.
+  llvm::DenseMap<CanType, CanPackType>
+  collectOpenedElementArchetypeBindings(CanType type,
+                                        AnyPackIndexInst *indexedBy) {
+    llvm::DenseMap<CanType, CanPackType> result;
+
+    type.visit([&](CanType type) {
+      auto opened = dyn_cast<ElementArchetypeType>(type);
+      if (!opened) return;
+      opened = opened.getRoot();
+
+      // Don't repeat this work if the same archetype is named twice.
+      if (result.count(opened)) return;
+
+      // Ignore archetypes defined by open_pack_elements not based on the
+      // same pack_index instruction.
+      auto openingInst =
+        F.getModule().getRootLocalArchetypeDef(opened,
+                                               const_cast<SILFunction*>(&F));
+      auto opi = dyn_cast<OpenPackElementInst>(openingInst);
+      if (!opi || opi->getIndexOperand() != indexedBy) return;
+
+      // Map each root opened element archetype to its pack substitution.
+      // FIXME: remember conformances?
+      auto openedEnv = opi->getOpenedGenericEnvironment();
+      openedEnv->forEachPackElementBinding(
+          [&](ElementArchetypeType *elementArchetype, PackType *substitution) {
+        auto subPack = cast<PackType>(substitution->getCanonicalType());
+        result.insert({elementArchetype->getCanonicalType(), subPack});
+      });
+    });
+
+    return result;
+  }
+
+  /// Verify that the lowered element type is a valid type for a
+  /// particular dynamic_pack_index into a pack operand with the given
+  /// components.
+  ///
+  /// This implements part of the structural type matching algorithm
+  /// for pack indexing:
+  ///
+  /// Let S be the set of opened pack element archetypes in the element
+  /// type that were opened by open_pack_element instructions based on
+  /// the same dynamic_pack_index instruction.  By construction,
+  /// the pack substitutions given to open_pack_element for the opened
+  /// type parameter packs must all have the same shape as the indexed
+  /// pack type of the open_pack_element's index operand.  That index
+  /// operand is the given dynamic_pack_index instruction, which is being
+  /// used to index into a pack with the given pack components, so the
+  /// components must have the same shape as the pack substitutions.
+  /// The lowered element type is a valid type for this index if, for
+  /// each component of this shape, there is a substitution which
+  /// (optionally) replaces archetypes in S with the correponding
+  /// component type (pattern types for expansions) of the pack
+  /// substitution to get the corresponding component type (pattern
+  /// type for expansions) of the pack operand.
+  ///
+  /// That is, suppose we have:
+  ///   open_pack_element %index of <each P0, each P1 where (P0,P1):Any>
+  ///                            at <Pack{A0, repeat each B0, C0},
+  ///                                Pack{A1, repeat each B1, C1}>,
+  ///                            shape $P0, uuid "01234"
+  ///
+  /// And suppose we're indexing into this pack (recalling that the
+  /// pack shape rules require this to have the same shape as the pack
+  /// substitutions):
+  ///   $Pack{Ap, repeat each Bp, Cp},
+  ///
+  /// Finally, suppose that the expected element type of this index is E,
+  /// a type expression in terms of @pack_element("01234") P0 and
+  /// @pack_element("01234") P1.
+  ///
+  /// Then applying this substitution to E:
+  ///   @pack_element("01234") P0   =>   A0
+  ///   @pack_element("01234") P1   =>   A1
+  /// should yield the type expression Ap, and so on for each component
+  /// of the shape.
+  void verifyDynamicPackIndexStructuralEquality(
+                                          ArrayRef<CanType> indexedPack,
+                                          DynamicPackIndexInst *dpi,
+                                          CanType targetElementType,
+                                          bool typesAreSILTypes) {
+    // If there are no pack components, this code must be unreachable.
+    if (indexedPack.empty()) return;
+
+    // Collect the set S of opened pack archetypes based on the given
+    // pack index instruction, mapping them to their pack substitution
+    // types.
+    auto allOpened =
+      collectOpenedElementArchetypeBindings(targetElementType, dpi);
+
+    // Expand each of the pack components.
+    for (unsigned componentIndex : indices(indexedPack)) {
+      CanType indexedElementType = indexedPack[componentIndex];
+      CanType indexedShape;
+      if (auto exp = dyn_cast<PackExpansionType>(indexedElementType)) {
+        indexedShape = exp.getCountType();
+        indexedElementType = exp.getPatternType();
+      }
+
+      // If we have an exact match without substitution, that's great.
+      if (targetElementType == indexedElementType) continue;
+
+      // If we don't have any substitutions, this must be a case where the
+      // expansion is invariant to the archetypes.
+      if (allOpened.empty()) {
+        // This condition is always false.
+        requireSameType(targetElementType, indexedElementType,
+                        "no opened archetypes based on a matching pack index "
+                        "instruction; element type must be invariant");
+        continue;
+      }
+
+      // Otherwise, we expect lanewise substitution to turn the expected
+      // element type into the lanewise component of the original pack.
+
+      // Provide substitution functions that replace the pack archetypes
+      // we found above with the corresponding lane of the pack substitution.
+      auto substTypes = [&](SubstitutableType *type) -> Type {
+        auto it = allOpened.find(type->getCanonicalType());
+        if (it == allOpened.end()) return Type();
+        auto pack = it->second;
+        auto packElementType = pack.getElementType(componentIndex);
+        if (auto exp = dyn_cast<PackExpansionType>(packElementType)) {
+          assert(indexedShape && "pack substitution doesn't match in shape");
+          packElementType = exp.getPatternType();
+        } else {
+          assert(!indexedShape && "pack substitution doesn't match in shape");
+        }
+        return packElementType;
+      };
+      auto substConformances = [&](CanType dependentType,
+                                   Type conformingType,
+                                   ProtocolDecl *protocol) -> ProtocolConformanceRef {
+        // FIXME: substitute back to the pack context to get the
+        // corresponding conformance pack, then project out the
+        // appropriate lane.
+        llvm_unreachable("unimplemented");
+      };
+
+      // If the pack components and expected element types are SIL types,
+      // we need to perform SIL substitution.
+      if (typesAreSILTypes) {
+        auto targetElementSILType =
+          SILType::getPrimitiveObjectType(targetElementType);
+        auto indexedElementSILType =
+          SILType::getPrimitiveObjectType(indexedElementType);
+        auto substTargetElementSILType =
+          targetElementSILType.subst(F.getModule(),
+                                     substTypes, substConformances);
+        requireSameType(indexedElementSILType, substTargetElementSILType,
+                        "lanewise-substituted pack element type didn't "
+                        "match expected element type");
+      } else {
+        auto substTargetElementType =
+          targetElementType.subst(substTypes, substConformances)
+                           ->getCanonicalType();
+        requireSameType(indexedElementType, substTargetElementType,
+                        "lanewise-substituted pack element type didn't "
+                        "match expected element type");
+      }
+    }
+  }
+
+  void checkPackPackIndexInst(PackPackIndexInst *i) {
+    auto innerIndex = requireValueKind<AnyPackIndexInst>(i->getOperand(),
+                                          "component pack index operand");
+    if (!innerIndex) return;
+
+    auto packType = i->getIndexedPackType();
+    require(i->getComponentStartIndex() < packType->getNumElements(),
+            "component index must be in bounds for indexed pack type");
+    verifySameShape(innerIndex->getIndexedPackType(), packType,
+                    i->getComponentStartIndex(), i->getComponentEndIndex());
+  }
+
+  void checkScalarPackIndexInst(ScalarPackIndexInst *i) {
+    auto packType = i->getIndexedPackType();
+    require(i->getComponentIndex() < packType->getNumElements(),
+            "component index must be in bounds for indexed pack type");
+    require(!isa<PackExpansionType>(
+               packType.getElementType(i->getComponentIndex())),
+            "component index must correspond to scalar component of "
+            "indexed pack type");
+  }
+
+  void checkOpenPackElementInst(OpenPackElementInst *i) {
+    requireObjectType(BuiltinPackIndexType, i->getOperand()->getType(),
+                      "pack index operand");
+    auto index = requireValueKind<AnyPackIndexInst>(i->getOperand(),
+            "pack index operand must be one of the pack_index instructions");
+    if (!index) return;
+
+    verifySameShape(index->getIndexedPackType(), i->getOpenedShapeClass());
+  }
+
+  void checkPackElementGetInst(PackElementGetInst *i) {
+    auto index = requireValueKind<AnyPackIndexInst>(i->getIndex(),
+            "pack index operand must be one of the pack_index instructions");
+    if (!index) return;
+
+    verifyPackElementType(i->getPackType(), index, i->getElementType());
+  }
+
+  void checkPackElementSetInst(PackElementSetInst *i) {
+    auto index = requireValueKind<AnyPackIndexInst>(i->getIndex(),
+            "pack index operand must be one of the pack_index instructions");
+    if (!index) return;
+
+    verifyPackElementType(i->getPackType(), index, i->getElementType());
+  }
+
+  void checkTuplePackElementAddrInst(TuplePackElementAddrInst *i) {
+    auto index = requireValueKind<AnyPackIndexInst>(i->getIndex(),
+            "pack index operand must be one of the pack_index instructions");
+    if (!index) return;
+
+    // Remove the extra tuple element type structure.
+    SmallVector<CanType, 8> tupleElements; {
+      auto tupleType = requireAddressType(TupleType, i->getTuple()->getType(),
+                                  "tuple operand of tuple_pack_element_addr");
+      auto eltTypes = tupleType.getElementTypes();
+      tupleElements.append(eltTypes.begin(), eltTypes.end());
+    }
+
+    require(i->getElementType().isAddress(),
+            "result of tuple_pack_element_addr must be an address");
+
+    verifyPackElementType(tupleElements, index,
+                          i->getElementType().getASTType(),
+                          /*types are SIL types*/ true);
+  }
+
   // This verifies that the entry block of a SIL function doesn't have
   // any predecessors and also verifies the entry point arguments.
   void verifyEntryBlock(SILBasicBlock *entry) {
@@ -5455,13 +5867,17 @@ public:
                          if (!bbarg->getType().isAddress())
                            return true;
                          switch (paramInfo.getConvention()) {
-                         default:
+                         case ParameterConvention::Direct_Unowned:
+                         case ParameterConvention::Direct_Guaranteed:
+                         case ParameterConvention::Direct_Owned:
                            return false;
                          case ParameterConvention::Indirect_In:
-                         case ParameterConvention::Indirect_In_Constant:
                          case ParameterConvention::Indirect_Inout:
                          case ParameterConvention::Indirect_InoutAliasable:
                          case ParameterConvention::Indirect_In_Guaranteed:
+                         case ParameterConvention::Pack_Owned:
+                         case ParameterConvention::Pack_Guaranteed:
+                         case ParameterConvention::Pack_Inout:
                            return true;
                          }
                        }),
@@ -5477,6 +5893,13 @@ public:
   }
 
   void checkMarkMustCheckInst(MarkMustCheckInst *i) {
+    require(i->getModule().getStage() == SILStage::Raw,
+            "Only valid in Raw SIL! Should have been eliminated by /some/ "
+            "diagnostic pass");
+  }
+
+  void checkMarkUnresolvedReferenceBindingInst(
+      MarkUnresolvedReferenceBindingInst *i) {
     require(i->getModule().getStage() == SILStage::Raw,
             "Only valid in Raw SIL! Should have been eliminated by /some/ "
             "diagnostic pass");
@@ -5801,6 +6224,7 @@ public:
       return;
 
     const SILDebugScope *LastSeenScope = nullptr;
+    SILInstruction *LastSeenScopeInst = nullptr;
     for (SILInstruction &SI : *BB) {
       if (SI.isMetaInstruction())
         continue;
@@ -5811,9 +6235,15 @@ public:
       // map and go on.
       auto *DS = SI.getDebugScope();
       assert(DS && "Each instruction should have a debug scope");
+
+      // We don't support this verification on inlined call sites yet.
+      if (DS->InlinedCallSite)
+        continue;
+
       if (!AlreadySeenScopes.count(DS)) {
         AlreadySeenScopes.insert(DS);
         LastSeenScope = DS;
+        LastSeenScopeInst = &SI;
         continue;
       }
 
@@ -5821,14 +6251,12 @@ public:
       // the scope is an ancestor of the scope we're currently leaving.
       auto isAncestorScope = [](const SILDebugScope *Cur,
                                 const SILDebugScope *Previous) {
+        assert(Cur && "null current scope queried");
+        assert(Previous && "null previous scope queried");
         const SILDebugScope *Tmp = Previous;
-        assert(Tmp && "scope can't be null");
         while (Tmp) {
-          PointerUnion<const SILDebugScope *, SILFunction *> Parent =
-              Tmp->Parent;
+          auto Parent = Tmp->Parent;
           auto *ParentScope = Parent.dyn_cast<const SILDebugScope *>();
-          if (!ParentScope)
-            break;
           if (ParentScope == Cur)
             return true;
           Tmp = ParentScope;
@@ -5838,13 +6266,28 @@ public:
 
       if (isAncestorScope(DS, LastSeenScope)) {
         LastSeenScope = DS;
+        LastSeenScopeInst = &SI;
         continue;
       }
       if (DS != LastSeenScope) {
-        LLVM_DEBUG(llvm::dbgs() << "Broken instruction!\n"; SI.dump());
-        LLVM_DEBUG(llvm::dbgs() << "Please report a bug on bugs.swift.org\n");
-        LLVM_DEBUG(llvm::dbgs() <<
-          "Pass -Xllvm -verify-di-holes=false to disable the verification\n");
+        llvm::errs() << "Broken instruction!\n"; 
+        SI.dump();
+#ifndef NDEBUG
+        llvm::errs() << "in scope\n";
+        DS->print(SI.getFunction()->getModule());
+#endif
+        llvm::errs() << "Previous, non-contiguous scope set by";
+        LastSeenScopeInst->dump();
+#ifndef NDEBUG
+        llvm::errs() << "in scope\n";
+        LastSeenScope->print(SI.getFunction()->getModule());
+#endif
+        llvm::errs() << "Please report a bug on bugs.swift.org\n";
+        llvm::errs() <<
+          "Pass -Xllvm -verify-di-holes=false to disable the verification\n";
+        // Turn on debug info printing so that the log actually shows the bad
+        // scopes.
+        SILPrintDebugInfo.setValue(true);
         require(
             DS == LastSeenScope,
             "Basic block contains a non-contiguous lexical scope at -Onone");
@@ -5853,18 +6296,6 @@ public:
   }
 
   void visitSILBasicBlock(SILBasicBlock *BB) {
-    // Make sure that each of the successors/predecessors of this basic block
-    // have this basic block in its predecessor/successor list.
-    for (const auto *SuccBB : BB->getSuccessorBlocks()) {
-      require(SuccBB->isPredecessorBlock(BB),
-              "Must be a predecessor of each successor.");
-    }
-
-    for (const SILBasicBlock *PredBB : BB->getPredecessorBlocks()) {
-      require(PredBB->isSuccessorBlock(BB),
-              "Must be a successor of each predecessor.");
-    }
-    
     SILInstructionVisitor::visitSILBasicBlock(BB);
     verifyDebugScopeHoles(BB);
   }
@@ -5894,6 +6325,33 @@ public:
       if (VisitedBBs.contains(&BB))
         continue;
       visitSILBasicBlock(&BB);
+    }
+
+    verifyPredecessorSucessorStructure(F);
+  }
+
+  // Make sure that each of the successors/predecessors of a basic block
+  // have this basic block in its predecessor/successor list.
+  void verifyPredecessorSucessorStructure(SILFunction *f) {
+    using PredSuccPair = std::pair<SILBasicBlock *, SILBasicBlock *>;
+    llvm::DenseSet<PredSuccPair> foundSuccessors;
+    llvm::DenseSet<PredSuccPair> foundPredecessors;
+
+    for (auto &block : *f) {
+      for (SILBasicBlock *succ : block.getSuccessorBlocks()) {
+        foundSuccessors.insert({&block, succ});
+      }
+      for (SILBasicBlock *pred : block.getPredecessorBlocks()) {
+        foundPredecessors.insert({pred, &block});
+      }
+    }
+    for (PredSuccPair predSucc : foundSuccessors) {
+      require(foundPredecessors.contains(predSucc),
+              "block is not predecessor of its successor");
+    }
+    for (PredSuccPair predSucc : foundPredecessors) {
+      require(foundSuccessors.contains(predSucc),
+              "block is not successor of its predecessor");
     }
   }
 
@@ -5988,7 +6446,10 @@ public:
     }
   }
 
-  void verify() {
+  void verify(bool isCompleteOSSA) {
+    if (!isCompleteOSSA || !F.getModule().getOptions().OSSACompleteLifetimes) {
+      DEBlocks = std::make_unique<DeadEndBlocks>(const_cast<SILFunction *>(&F));
+    }
     visitSILFunction(const_cast<SILFunction*>(&F));
   }
 };
@@ -6021,21 +6482,23 @@ static bool verificationEnabled(const SILModule &M) {
 
 /// verify - Run the SIL verifier to make sure that the SILFunction follows
 /// invariants.
-void SILFunction::verify(bool SingleFunction) const {
+void SILFunction::verify(bool SingleFunction, bool isCompleteOSSA,
+                         bool checkLinearLifetime) const {
   if (!verificationEnabled(getModule()))
     return;
 
   // Please put all checks in visitSILFunction in SILVerifier, not here. This
   // ensures that the pretty stack trace in the verifier is included with the
   // back trace when the verifier crashes.
-  SILVerifier(*this, SingleFunction).verify();
+  SILVerifier(*this, SingleFunction, checkLinearLifetime).verify(isCompleteOSSA);
 }
 
 void SILFunction::verifyCriticalEdges() const {
   if (!verificationEnabled(getModule()))
     return;
 
-  SILVerifier(*this, /*SingleFunction=*/true).verifyBranches(this);
+  SILVerifier(*this, /*SingleFunction=*/true,
+                     /*checkLinearLifetime=*/ false).verifyBranches(this);
 }
 
 /// Verify that a property descriptor follows invariants.
@@ -6152,7 +6615,8 @@ void SILVTable::verify(const SILModule &M) const {
     }
 
     if (M.getStage() != SILStage::Lowered) {
-      SILVerifier(*entry.getImplementation())
+      SILVerifier(*entry.getImplementation(), /*SingleFunction=*/true,
+                                              /*checkLinearLifetime=*/ false)
           .requireABICompatibleFunctionTypes(
               baseInfo.getSILType().castTo<SILFunctionType>(),
               entry.getImplementation()->getLoweredFunctionType(),
@@ -6297,7 +6761,7 @@ void SILGlobalVariable::verify() const {
 }
 
 /// Verify the module.
-void SILModule::verify() const {
+void SILModule::verify(bool isCompleteOSSA, bool checkLinearLifetime) const {
   if (!verificationEnabled(*this))
     return;
 
@@ -6312,7 +6776,7 @@ void SILModule::verify() const {
       llvm::errs() << "Symbol redefined: " << f.getName() << "!\n";
       assert(false && "triggering standard assertion failure routine");
     }
-    f.verify(/*singleFunction*/ false);
+    f.verify(/*singleFunction*/ false, isCompleteOSSA, checkLinearLifetime);
   }
 
   // Check all globals.

@@ -13,9 +13,11 @@
 #ifndef SWIFT_PRINTASCLANG_CLANGSYNTAXPRINTER_H
 #define SWIFT_PRINTASCLANG_CLANGSYNTAXPRINTER_H
 
-#include "swift/AST/GenericRequirement.h"
+#include "swift/AST/ASTMangler.h"
+#include "swift/AST/Type.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/ClangImporter/ClangImporter.h"
+#include "swift/IRGen/GenericRequirement.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -25,6 +27,7 @@ class CanGenericSignature;
 class GenericTypeParamType;
 class ModuleDecl;
 class NominalTypeDecl;
+class PrimitiveTypeMapping;
 
 namespace cxx_synthesis {
 
@@ -50,10 +53,10 @@ public:
 
   /// Print a given identifier. If the identifer conflicts with a keyword, add a
   /// trailing underscore.
-  void printIdentifier(StringRef name);
+  void printIdentifier(StringRef name) const;
 
   /// Print the base name of the given declaration.
-  void printBaseName(const ValueDecl *decl);
+  void printBaseName(const ValueDecl *decl) const;
 
   /// Print the C-style prefix for the given module name, that's used for
   /// C type names inside the module.
@@ -104,7 +107,7 @@ public:
                                  const ModuleDecl *moduleContext);
 
   /// Print out the C++ record qualifier for the given C++ record.
-  void printNominalClangTypeReference(const clang::Decl *typeDecl);
+  void printClangTypeReference(const clang::Decl *typeDecl);
 
   /// Print out the C++ class access qualifier for the given Swift  type
   /// declaration.
@@ -118,14 +121,19 @@ public:
   void printNominalTypeQualifier(const NominalTypeDecl *typeDecl,
                                  const ModuleDecl *moduleContext);
 
-  /// Print a C++ namespace declaration with the give name and body.
-  void
-  printNamespace(llvm::function_ref<void(raw_ostream &OS)> namePrinter,
-                 llvm::function_ref<void(raw_ostream &OS)> bodyPrinter) const;
+  enum class NamespaceTrivia { None, AttributeSwiftPrivate };
 
-  void
-  printNamespace(StringRef name,
-                 llvm::function_ref<void(raw_ostream &OS)> bodyPrinter) const;
+  void printModuleNamespaceStart(const ModuleDecl &moduleContext) const;
+
+  /// Print a C++ namespace declaration with the give name and body.
+  void printNamespace(llvm::function_ref<void(raw_ostream &OS)> namePrinter,
+                      llvm::function_ref<void(raw_ostream &OS)> bodyPrinter,
+                      NamespaceTrivia trivia = NamespaceTrivia::None,
+                      const ModuleDecl *moduleContext = nullptr) const;
+
+  void printNamespace(StringRef name,
+                      llvm::function_ref<void(raw_ostream &OS)> bodyPrinter,
+                      NamespaceTrivia trivia = NamespaceTrivia::None) const;
 
   /// Print an extern C block with given body.
   void
@@ -166,7 +174,7 @@ public:
 
   /// Print the metadata accessor function for the given type declaration.
   void printCTypeMetadataTypeFunction(
-      const NominalTypeDecl *typeDecl, StringRef typeMetadataFuncName,
+      const TypeDecl *typeDecl, StringRef typeMetadataFuncName,
       llvm::ArrayRef<GenericRequirement> genericRequirements);
 
   /// Print the name of the generic type param type in C++.
@@ -216,8 +224,21 @@ public:
   void printIgnoredCxx17ExtensionDiagnosticBlock(
       llvm::function_ref<void()> bodyPrinter);
 
+  /// Print the macro that applies Clang's `external_source_symbol` attribute
+  /// on the generated declaration.
+  void printSymbolUSRAttribute(const ValueDecl *D) const;
+
+  /// Print the given **known** type as a C type.
+  void printKnownCType(Type t, PrimitiveTypeMapping &typeMapping) const;
+
+  /// Print the nominal type's Swift mangled name as a typedef from a char to
+  /// the mangled name, and a static constexpr variable declaration, whose type
+  /// is the aforementioned typedef, and whose name is known to the debugger.
+  void printSwiftMangledNameForDebugger(const NominalTypeDecl *typeDecl);
+
 protected:
   raw_ostream &os;
+  swift::Mangle::ASTMangler mangler;
 };
 
 } // end namespace swift

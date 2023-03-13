@@ -2,7 +2,101 @@
 
 _**Note:** This is in reverse chronological order, so newer entries are added to the top._
 
+## Swift 5.9
+
+* [SE-0366][]:
+
+  The lifetime of a local variable value can be explicitly ended using the
+  `consume` operator, forwarding ownership to the surrounding call, assignment,
+  or initialization without copying:
+
+  ```swift
+  var x: [String] = []
+  x.append("apples")
+  x.append("bananas")
+  x.append("oranges")
+
+  process(consume x) // forward the current value, without copying
+
+  x = [] // start building a new value
+  x.append("broccoli")
+  x.append("cauliflower")
+  x.append("asparagus")
+  ...
+  ```
+
+* [SE-0377][]:
+
+  Functions can now declare whether they take value parameters by `borrowing`
+  access to a value provided by the caller, or by `consuming` a value that the
+  callee is allowed to take ownership of:
+
+  ```
+  struct HealthyFoods {
+    var values: [String] = []
+
+    // Ask to `consume` the parameter, since we want to use it
+    // to incorporate into our own `values` array
+    mutating func add(_ value: consuming String) {
+        values.append(value)
+    }
+  }
+  ```
+
 ## Swift 5.8
+
+* [SE-0376][]:
+
+  The `@backDeployed(before:)` attribute may now be used to extend the availability of a function to OS releases prior to the introduction of that function as ABI.
+  
+  For example, suppose that `struct Temperature` was introduced in a macOS SDK framework in macOS 12. Later in macOS 13 the framework authors decided to add a `degreesFahrenheit` property as a convenience:
+  
+  ```swift
+  @available(macOS 12, *)
+  public struct Temperature {
+    public var degreesCelsius: Double
+    
+    // ...
+  }
+  
+  extension Temperature {
+    @available(macOS 12, *)
+    @backDeployed(before: macOS 13)
+    public var degreesFahrenheit: Double {
+      return (degreesCelsius * 9 / 5) + 32
+    }
+  }
+  ```
+  
+  Adding the `@backDeployed` attribute to `degreesFahrenheit` enables the framework author to make this new declaration available to apps with a minimum deployment target of macOS 12, even though the ABI entry point for `degreesFahrenheit` is only present in macOS 13 and up.
+  
+  When a function with `@backDeployed` is called, the compiler wraps the invocation of the function in a thunk. The thunk checks whether the library entry point for the declaration is available at runtime, and invokes it if it is. Otherwise, a copy of the function that was emitted into the client is called instead.
+
+* [#56139][]:
+
+  Сollection downcasts in cast patterns are now supported. For example:
+
+  ```swift
+  func collectionDowncast(_ arr: [Any]) {
+    switch arr {
+    case let ints as [Int]:
+      // ...
+    case is [Bool]:
+      // ...
+    }
+  }
+  ``` 
+* [SE-0370][]:
+
+  The API of `UnsafeMutableRawPointer`, `UnsafeMutableBufferPointer`, `UnsafeMutableRawBufferPointer` were improved, adding previously missing initialization (and deinitialization) methods, including more performant initialization from `Collection` types.
+
+  For `UnsafeMutablePointer<T>` and `UnsafeMutableBufferPointer<T>`, method names containing the word "assign" were renamed to use the word "update", and many more were added. Every multi-element initialization method of `UnsafeMutablePointer` and `UnsafeMutableBufferPointer` now has a corresponding "update" method.
+
+  Slices of `UnsafeBufferPointer`, `UnsafeRawBufferPointer`, `UnsafeMutableBufferPointer` and `UnsafeMutableRawBufferPointer` now share the collection-like API of their base type. For example, given an initialized `b: UnsafeMutableBufferPointer<Int>`, the following lines are synonymous:
+  ```swift
+  b.update(repeating: 0)
+  b[b.startIndex..<b.endIndex].update(repeating: 0)
+  ```
 
 * [SE-0365][]:
  
@@ -9584,6 +9678,10 @@ using the `.dynamicType` member to retrieve the type of an expression should mig
 [SE-0358]: <https://github.com/apple/swift-evolution/blob/main/proposals/0358-primary-associated-types-in-stdlib.md>
 [SE-0362]: <https://github.com/apple/swift-evolution/blob/main/proposals/0362-piecemeal-future-features.md>
 [SE-0365]: <https://github.com/apple/swift-evolution/blob/main/proposals/0365-implicit-self-weak-capture.md>
+[SE-0366]: <https://github.com/apple/swift-evolution/blob/main/proposals/0366-move-function.md>
+[SE-0370]: <https://github.com/apple/swift-evolution/blob/main/proposals/0370-pointer-family-initialization-improvements.md>
+[SE-0376]: <https://github.com/apple/swift-evolution/blob/main/proposals/0376-function-back-deployment.md>
+[SE-0377]: <https://github.com/apple/swift-evolution/blob/main/proposals/0377-parameter-ownership-modifiers.md>
 
 [#42697]: <https://github.com/apple/swift/issues/42697>
 [#42728]: <https://github.com/apple/swift/issues/42728>
@@ -9624,3 +9722,4 @@ using the `.dynamicType` member to retrieve the type of an expression should mig
 [#54246]: <https://github.com/apple/swift/issues/54246>
 [#57081]: <https://github.com/apple/swift/issues/57081>
 [#57225]: <https://github.com/apple/swift/issues/57225>
+[#56139]: <https://github.com/apple/swift/issues/56139>

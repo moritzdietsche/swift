@@ -234,6 +234,10 @@ private:
   /// Compiler plugin library search paths.
   std::vector<std::string> CompilerPluginLibraryPaths;
 
+  /// Compiler plugin executable paths and providing module names.
+  /// Format: '<path>#<module names>'
+  std::vector<std::string> CompilerPluginExecutablePaths;
+
   /// Add a single import search path. Must only be called from
   /// \c ASTContext::addSearchPath.
   void addImportSearchPath(StringRef Path, llvm::vfs::FileSystem *FS) {
@@ -261,6 +265,11 @@ private:
                            FrameworkSearchPaths.size() - 1);
   }
 
+  llvm::Optional<StringRef> WinSDKRoot = llvm::None;
+  llvm::Optional<StringRef> WinSDKVersion = llvm::None;
+  llvm::Optional<StringRef> VCToolsRoot = llvm::None;
+  llvm::Optional<StringRef> VCToolsVersion = llvm::None;
+
 public:
   StringRef getSDKPath() const { return SDKPath; }
 
@@ -277,6 +286,26 @@ public:
                                           frameworksScratch.str().str()};
 
     Lookup.searchPathsDidChange();
+  }
+
+  llvm::Optional<StringRef> getWinSDKRoot() const { return WinSDKRoot; }
+  void setWinSDKRoot(StringRef root) {
+    WinSDKRoot = root;
+  }
+
+  llvm::Optional<StringRef> getWinSDKVersion() const { return WinSDKVersion; }
+  void setWinSDKVersion(StringRef version) {
+    WinSDKVersion = version;
+  }
+
+  llvm::Optional<StringRef> getVCToolsRoot() const { return VCToolsRoot; }
+  void setVCToolsRoot(StringRef root) {
+    VCToolsRoot = root;
+  }
+
+  llvm::Optional<StringRef> getVCToolsVersion() const { return VCToolsVersion; }
+  void setVCToolsVersion(StringRef version) {
+    VCToolsVersion = version;
   }
 
   ArrayRef<std::string> getImportSearchPaths() const {
@@ -324,6 +353,16 @@ public:
     return CompilerPluginLibraryPaths;
   }
 
+  void setCompilerPluginExecutablePaths(
+      std::vector<std::string> NewCompilerPluginExecutablePaths) {
+    CompilerPluginExecutablePaths = NewCompilerPluginExecutablePaths;
+    Lookup.searchPathsDidChange();
+  }
+
+  ArrayRef<std::string> getCompilerPluginExecutablePaths() const {
+    return CompilerPluginExecutablePaths;
+  }
+
   /// Path(s) to virtual filesystem overlay YAML files.
   std::vector<std::string> VFSOverlayFiles;
 
@@ -338,6 +377,10 @@ public:
   /// Paths to search for compiler-relative stdlib dylibs, in order of
   /// preference.
   std::vector<std::string> RuntimeLibraryPaths;
+
+  /// Paths that contain compiler plugins loaded on demand for, e.g.,
+  /// macro implementations.
+  std::vector<std::string> PluginSearchPaths;
 
   /// Don't look in for compiler-provided modules.
   bool SkipRuntimeLibraryImportPaths = false;
@@ -354,6 +397,10 @@ public:
 
   /// A map of explicit Swift module information.
   std::string ExplicitSwiftModuleMap;
+
+  /// Module inputs specified with -swift-module-input,
+  /// <ModuleName, Path to .swiftmodule file>
+  std::vector<std::pair<std::string, std::string>> ExplicitSwiftModuleInputs;
 
   /// A map of placeholder Swift module dependency information.
   std::string PlaceholderDependencyModuleMap;
@@ -420,6 +467,12 @@ public:
                         hash_combine_range(RuntimeLibraryImportPaths.begin(),
                                            RuntimeLibraryImportPaths.end()),
                         DisableModulesValidateSystemDependencies);
+  }
+
+  /// Return a hash code of any components from these options that should
+  /// contribute to a Swift Dependency Scanning hash.
+  llvm::hash_code getModuleScanningHashComponents() const {
+    return getPCHHashComponents();
   }
 };
 }

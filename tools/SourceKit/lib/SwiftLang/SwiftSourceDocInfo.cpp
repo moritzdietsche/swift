@@ -346,7 +346,7 @@ private:
       return genericParamTypeTag;
     if (context.is(PrintStructureKind::TupleElement))
       return "tuple.element.type";
-    if (context.getPrintStructureKind().hasValue() || context.isType())
+    if (context.getPrintStructureKind().has_value() || context.isType())
       return "";
 
     assert(context.getDecl() && "unexpected context kind");
@@ -651,7 +651,7 @@ static void mapLocToLatestSnapshot(
 
       auto OptBegin = mapOffsetToNewerSnapshot(Location.Offset,
                                                PrevSnap, LatestSnap);
-      if (!OptBegin.hasValue()) {
+      if (!OptBegin.has_value()) {
         Location.Filename = StringRef();
         return;
       }
@@ -659,7 +659,7 @@ static void mapLocToLatestSnapshot(
       auto OptEnd = mapOffsetToNewerSnapshot(Location.Offset +
                                              Location.Length,
                                              PrevSnap, LatestSnap);
-      if (!OptEnd.hasValue()) {
+      if (!OptEnd.has_value()) {
         Location.Filename = StringRef();
         return;
       }
@@ -715,7 +715,7 @@ collectAvailableRenameInfo(const ValueDecl *VD, Optional<RenameRefInfo> RefInfo,
 }
 
 static void collectAvailableRefactoringsOtherThanRename(
-    ResolvedCursorInfo CursorInfo,
+    ResolvedCursorInfoPtr CursorInfo,
     SmallVectorImpl<RefactoringInfo> &Refactorings) {
   SmallVector<RefactoringKind, 8> Kinds;
   collectAvailableRefactorings(CursorInfo, Kinds, /*ExcludeRename*/ true);
@@ -898,7 +898,7 @@ static void setLocationInfo(const ValueDecl *VD,
     };
     unsigned NameLen;
     if (auto SigLen = getSignatureRange(VD)) {
-      NameLen = SigLen.getValue();
+      NameLen = SigLen.value();
     } else if (VD->hasName()) {
       NameLen = VD->getBaseName().userFacingName().size();
     } else {
@@ -911,6 +911,24 @@ static void setLocationInfo(const ValueDecl *VD,
     Location.Length = NameLen;
     std::tie(Location.Line, Location.Column) = SM.getLineAndColumnInBuffer(
         Loc, DeclBufID);
+    if (auto GeneratedSourceInfo = SM.getGeneratedSourceInfo(DeclBufID)) {
+      if (GeneratedSourceInfo->kind ==
+          GeneratedSourceInfo::ReplacedFunctionBody) {
+        // The location was in a temporary source buffer that just contains the
+        // function body and which we created while reusing the ASTContext for
+        // the rest of the file. Map the location back to the original file.
+        unsigned OriginalBufID = SM.findBufferContainingLoc(
+            GeneratedSourceInfo->originalSourceRange.getStart());
+        auto OriginalStartOffset = SM.getLocOffsetInBuffer(
+            GeneratedSourceInfo->originalSourceRange.getStart(), OriginalBufID);
+        auto GeneratedStartOffset = SM.getLocOffsetInBuffer(
+            GeneratedSourceInfo->generatedSourceRange.getStart(), DeclBufID);
+        Location.Offset += OriginalStartOffset - GeneratedStartOffset;
+        assert(SM.findBufferContainingLoc(Loc) == DeclBufID);
+        std::tie(Location.Line, Location.Column) =
+            SM.getPresumedLineAndColumnForLoc(Loc, DeclBufID);
+      }
+    }
   } else if (ClangNode) {
     ClangImporter *Importer =
         static_cast<ClangImporter*>(Ctx.getClangModuleLoader());
@@ -920,8 +938,8 @@ static void setLocationInfo(const ValueDecl *VD,
 
 static llvm::Error
 fillSymbolInfo(CursorSymbolInfo &Symbol, const DeclInfo &DInfo,
-               ModuleDecl *MainModule, SourceLoc CursorLoc, bool AddSymbolGraph,
-               SwiftLangSupport &Lang, const CompilerInvocation &Invoc,
+               SourceLoc CursorLoc, bool AddSymbolGraph, SwiftLangSupport &Lang,
+               const CompilerInvocation &Invoc,
                ArrayRef<ImmutableTextSnapshotRef> PreviousSnaps,
                llvm::BumpPtrAllocator &Allocator) {
   SmallString<256> Buffer;
@@ -979,7 +997,7 @@ fillSymbolInfo(CursorSymbolInfo &Symbol, const DeclInfo &DInfo,
     auto *Group = DInfo.InSynthesizedExtension ? DInfo.BaseType->getAnyNominal()
                                                : DInfo.VD;
     if (auto Name = Group->getGroupName())
-      Symbol.GroupName = Name.getValue();
+      Symbol.GroupName = Name.value();
   }
 
   ide::getLocalizationKey(DInfo.VD, OS);
@@ -995,18 +1013,12 @@ fillSymbolInfo(CursorSymbolInfo &Symbol, const DeclInfo &DInfo,
   if (AddSymbolGraph) {
     SmallVector<symbolgraphgen::PathComponent, 4> PathComponents;
     SmallVector<symbolgraphgen::FragmentInfo, 8> FragmentInfos;
-    symbolgraphgen::SymbolGraphOptions Options{
-        "",
-        Invoc.getLangOptions().Target,
-        /*PrettyPrint=*/false,
-        AccessLevel::Private,
-        /*EmitSynthesizedMembers=*/false,
-        /*PrintMessages=*/false,
-        /*SkipInheritedDocs=*/false,
-        /*IncludeSPISymbols=*/true,
-        /*IncludeClangDocs=*/true,
-        /*EmitExtensionBlockSymbols=*/false,
-    };
+
+    symbolgraphgen::SymbolGraphOptions Options;
+    Options.Target = Invoc.getLangOptions().Target;
+    Options.MinimumAccessLevel = AccessLevel::Private;
+    Options.IncludeSPISymbols = true;
+    Options.IncludeClangDocs = true;
 
     symbolgraphgen::printSymbolGraphForDecl(DInfo.VD, DInfo.BaseType,
                                             DInfo.InSynthesizedExtension,
@@ -1142,15 +1154,15 @@ fillSymbolInfo(CursorSymbolInfo &Symbol, const DeclInfo &DInfo,
 
 /// Returns true on success, false on error (and sets `Diagnostic` accordingly).
 static bool passCursorInfoForDecl(
-    const ResolvedCursorInfo &Info, ModuleDecl *MainModule,
-    bool AddRefactorings, bool AddSymbolGraph,
-    ArrayRef<RefactoringInfo> KnownRefactoringInfo, SwiftLangSupport &Lang,
-    const CompilerInvocation &Invoc, std::string &Diagnostic,
-    ArrayRef<ImmutableTextSnapshotRef> PreviousSnaps,
+    ResolvedValueRefCursorInfoPtr Info, bool AddRefactorings,
+    bool AddSymbolGraph, ArrayRef<RefactoringInfo> KnownRefactoringInfo,
+    SwiftLangSupport &Lang, const CompilerInvocation &Invoc,
+    std::string &Diagnostic, ArrayRef<ImmutableTextSnapshotRef> PreviousSnaps,
+    bool DidReuseAST,
     std::function<void(const RequestResult<CursorInfoData> &)> Receiver) {
-  DeclInfo OrigInfo(Info.ValueD, Info.ContainerType, Info.IsRef, Info.IsDynamic,
-                    Info.ReceiverTypes, Invoc);
-  DeclInfo CtorTypeInfo(Info.CtorTyRef, Type(), true, false,
+  DeclInfo OrigInfo(Info->getValueD(), Info->getContainerType(), Info->isRef(),
+                    Info->isDynamic(), Info->getReceiverTypes(), Invoc);
+  DeclInfo CtorTypeInfo(Info->getCtorTyRef(), Type(), true, false,
                         ArrayRef<NominalTypeDecl *>(), Invoc);
   DeclInfo &MainInfo = CtorTypeInfo.VD ? CtorTypeInfo : OrigInfo;
   if (MainInfo.Unavailable) {
@@ -1165,42 +1177,49 @@ static bool passCursorInfoForDecl(
   // The primary result for constructor calls, eg. `MyType()` should be
   // the type itself, rather than the constructor. The constructor will be
   // added as a secondary result.
-  if (auto Err = fillSymbolInfo(MainSymbol, MainInfo, MainModule, Info.Loc,
-                                AddSymbolGraph, Lang, Invoc, PreviousSnaps,
-                                Allocator)) {
+  if (auto Err =
+          fillSymbolInfo(MainSymbol, MainInfo, Info->getLoc(), AddSymbolGraph,
+                         Lang, Invoc, PreviousSnaps, Allocator)) {
     llvm::handleAllErrors(std::move(Err), [&](const llvm::StringError &E) {
       Diagnostic = E.message();
     });
     return false;
   }
+
   if (MainInfo.VD != OrigInfo.VD && !OrigInfo.Unavailable) {
     CursorSymbolInfo &CtorSymbol = Symbols.emplace_back();
-    if (auto Err = fillSymbolInfo(CtorSymbol, OrigInfo, MainModule, Info.Loc,
-                                  AddSymbolGraph, Lang, Invoc, PreviousSnaps,
-                                  Allocator)) {
-      // Ignore but make sure to remove the partially-filled symbol
-      llvm::handleAllErrors(std::move(Err), [](const llvm::StringError &E) {});
-      Symbols.pop_back();
-    }
-  }
-  for (auto D : Info.ShorthandShadowedDecls) {
-    CursorSymbolInfo &SymbolInfo = Symbols.emplace_back();
-    DeclInfo DInfo(D, Type(), /*IsRef=*/true, /*IsDynamic=*/false,
-                   ArrayRef<NominalTypeDecl *>(), Invoc);
-    if (auto Err = fillSymbolInfo(SymbolInfo, DInfo, MainModule, Info.Loc,
-                                  AddSymbolGraph, Lang, Invoc, PreviousSnaps,
-                                  Allocator)) {
+    if (auto Err =
+            fillSymbolInfo(CtorSymbol, OrigInfo, Info->getLoc(), AddSymbolGraph,
+                           Lang, Invoc, PreviousSnaps, Allocator)) {
       // Ignore but make sure to remove the partially-filled symbol
       llvm::handleAllErrors(std::move(Err), [](const llvm::StringError &E) {});
       Symbols.pop_back();
     }
   }
 
+  // Add in shadowed declarations if on a decl. For references just go to the
+  // actual declaration.
+  if (!Info->isRef()) {
+    for (auto D : Info->getShorthandShadowedDecls()) {
+      CursorSymbolInfo &SymbolInfo = Symbols.emplace_back();
+      DeclInfo DInfo(D, Type(), /*IsRef=*/true, /*IsDynamic=*/false,
+                     ArrayRef<NominalTypeDecl *>(), Invoc);
+      if (auto Err =
+              fillSymbolInfo(SymbolInfo, DInfo, Info->getLoc(), AddSymbolGraph,
+                             Lang, Invoc, PreviousSnaps, Allocator)) {
+        // Ignore but make sure to remove the partially-filled symbol
+        llvm::handleAllErrors(std::move(Err), [](const llvm::StringError &E) {});
+        Symbols.pop_back();
+      }
+    }
+  }
+
   SmallVector<RefactoringInfo, 8> Refactorings;
   if (AddRefactorings) {
     Optional<RenameRefInfo> RefInfo;
-    if (Info.IsRef)
-      RefInfo = {Info.SF, Info.Loc, Info.IsKeywordArgument};
+    if (Info->isRef())
+      RefInfo = {Info->getSourceFile(), Info->getLoc(),
+                 Info->isKeywordArgument()};
     collectAvailableRenameInfo(MainInfo.VD, RefInfo, Refactorings);
     collectAvailableRefactoringsOtherThanRename(Info, Refactorings);
   }
@@ -1210,6 +1229,7 @@ static bool passCursorInfoForDecl(
   CursorInfoData Data;
   Data.Symbols = llvm::makeArrayRef(Symbols);
   Data.AvailableActions = llvm::makeArrayRef(Refactorings);
+  Data.DidReuseAST = DidReuseAST;
   Receiver(RequestResult<CursorInfoData>::fromResult(Data));
   return true;
 }
@@ -1280,17 +1300,17 @@ static DeclName getSwiftDeclName(const ValueDecl *VD,
 }
 
 /// Returns true on success, false on error (and sets `Diagnostic` accordingly).
-static bool passNameInfoForDecl(ResolvedCursorInfo CursorInfo,
-                                NameTranslatingInfo &Info,
-                                std::string &Diagnostic,
-                    std::function<void(const RequestResult<NameTranslatingInfo> &)> Receiver) {
-  auto *VD = CursorInfo.ValueD;
+static bool passNameInfoForDecl(
+    const ResolvedValueRefCursorInfo &CursorInfo, NameTranslatingInfo &Info,
+    std::string &Diagnostic,
+    std::function<void(const RequestResult<NameTranslatingInfo> &)> Receiver) {
+  auto *VD = CursorInfo.getValueD();
 
   // If the given name is not a function name, and the cursor points to
   // a constructor call, we use the type declaration instead of the init
   // declaration to translate the name.
   if (Info.ArgNames.empty() && !Info.IsZeroArgSelector) {
-    if (auto *TD = CursorInfo.CtorTyRef) {
+    if (auto *TD = CursorInfo.getCtorTyRef()) {
       VD = TD;
     }
   }
@@ -1416,14 +1436,14 @@ public:
             return Offset;
 
           auto OptOffset = mapOffsetToOlderSnapshot(Offset, InputSnap, Snap);
-          if (!OptOffset.hasValue())
+          if (!OptOffset.has_value())
             return None;
 
           // Check that the new and old offset still point to the same token.
           StringRef NewTok = getSourceToken(Offset, InputSnap);
           if (NewTok.empty())
             return None;
-          if (NewTok == getSourceToken(OptOffset.getValue(), Snap))
+          if (NewTok == getSourceToken(OptOffset.value(), Snap))
             return OptOffset;
 
           return None;
@@ -1433,7 +1453,7 @@ public:
     };
 
     auto OldOffsetOpt = mappedBackOffset();
-    if (OldOffsetOpt.hasValue()) {
+    if (OldOffsetOpt.has_value()) {
       Offset = *OldOffsetOpt;
       PreviousASTSnaps.append(Snapshots.begin(), Snapshots.end());
       LOG_INFO_FUNC(High, "will try existing AST");
@@ -1476,9 +1496,8 @@ static void resolveCursor(
 
     void handlePrimaryAST(ASTUnitRef AstUnit) override {
       auto &CompIns = AstUnit->getCompilerInstance();
-      ModuleDecl *MainModule = CompIns.getMainModule();
       SourceManager &SM = CompIns.getSourceMgr();
-      unsigned BufferID = AstUnit->getPrimarySourceFile().getBufferID().getValue();
+      unsigned BufferID = AstUnit->getPrimarySourceFile().getBufferID().value();
       SourceLoc Loc =
         Lexer::getLocForStartOfToken(SM, BufferID, Offset);
       if (Loc.isInvalid()) {
@@ -1503,7 +1522,7 @@ static void resolveCursor(
       if (Actionables && Length) {
         SmallVector<RefactoringKind, 8> Kinds;
         RangeConfig Range;
-        Range.BufferId = BufferID;
+        Range.BufferID = BufferID;
         auto Pair = SM.getLineAndColumnInBuffer(Loc);
         Range.Line = Pair.first;
         Range.Column = Pair.second;
@@ -1529,24 +1548,29 @@ static void resolveCursor(
       }
 
       auto *File = &AstUnit->getPrimarySourceFile();
-      ResolvedCursorInfo CursorInfo =
-        evaluateOrDefault(File->getASTContext().evaluator,
-                          CursorInfoRequest{CursorInfoOwner(File, Loc)},
-                          ResolvedCursorInfo());
+      ResolvedCursorInfoPtr CursorInfo =
+          evaluateOrDefault(File->getASTContext().evaluator,
+                            CursorInfoRequest{CursorInfoOwner(File, Loc)},
+                            new ResolvedCursorInfo());
 
       CompilerInvocation CompInvok;
       ASTInvok->applyTo(CompInvok);
 
-      switch (CursorInfo.Kind) {
-      case CursorInfoKind::ModuleRef:
-        passCursorInfoForModule(CursorInfo.Mod, Lang.getIFaceGenContexts(),
-                                CompInvok, Receiver);
+      switch (CursorInfo->getKind()) {
+      case CursorInfoKind::ModuleRef: {
+        auto ModuleRefInfo = cast<ResolvedModuleRefCursorInfo>(CursorInfo);
+        passCursorInfoForModule(ModuleRefInfo->getMod(),
+                                Lang.getIFaceGenContexts(), CompInvok,
+                                Receiver);
         return;
+      }
       case CursorInfoKind::ValueRef: {
         std::string Diagnostic;
         bool Success = passCursorInfoForDecl(
-            CursorInfo, MainModule, Actionables, SymbolGraph, Actions, Lang,
-            CompInvok, Diagnostic, getPreviousASTSnaps(), Receiver);
+            cast<ResolvedValueRefCursorInfo>(CursorInfo), Actionables,
+            SymbolGraph, Actions, Lang, CompInvok, Diagnostic,
+            getPreviousASTSnaps(),
+            /*DidReuseAST=*/false, Receiver);
         if (!Success) {
           if (!getPreviousASTSnaps().empty()) {
             // Attempt again using the up-to-date AST.
@@ -1633,7 +1657,7 @@ static void computeDiagnostics(
 
     void handlePrimaryAST(ASTUnitRef AstUnit) override {
       unsigned BufferID =
-          AstUnit->getPrimarySourceFile().getBufferID().getValue();
+          AstUnit->getPrimarySourceFile().getBufferID().value();
       auto &DiagConsumer = AstUnit->getEditorDiagConsumer();
       auto Diagnostics = DiagConsumer.getDiagnosticsForBuffer(BufferID);
       Receiver(RequestResult<DiagnosticsResult>::fromResult(Diagnostics));
@@ -1679,7 +1703,7 @@ static void resolveName(
     void handlePrimaryAST(ASTUnitRef AstUnit) override {
       auto &CompIns = AstUnit->getCompilerInstance();
 
-      unsigned BufferID = AstUnit->getPrimarySourceFile().getBufferID().getValue();
+      unsigned BufferID = AstUnit->getPrimarySourceFile().getBufferID().value();
       SourceLoc Loc =
         Lexer::getLocForStartOfToken(CompIns.getSourceMgr(), BufferID, Offset);
       if (Loc.isInvalid()) {
@@ -1689,11 +1713,11 @@ static void resolveName(
       }
 
       auto *File = &AstUnit->getPrimarySourceFile();
-      ResolvedCursorInfo CursorInfo =
-        evaluateOrDefault(File->getASTContext().evaluator,
-                          CursorInfoRequest{CursorInfoOwner(File, Loc)},
-                          ResolvedCursorInfo());
-      if (CursorInfo.isInvalid()) {
+      ResolvedCursorInfoPtr CursorInfo =
+          evaluateOrDefault(File->getASTContext().evaluator,
+                            CursorInfoRequest{CursorInfoOwner(File, Loc)},
+                            new ResolvedCursorInfo());
+      if (CursorInfo->isInvalid()) {
         NameTranslatingInfo Info;
         Info.InternalDiagnostic = "Unable to resolve cursor info.";
         Receiver(RequestResult<NameTranslatingInfo>::fromResult(Info));
@@ -1703,14 +1727,15 @@ static void resolveName(
       CompilerInvocation CompInvok;
       ASTInvok->applyTo(CompInvok);
 
-      switch(CursorInfo.Kind) {
+      switch (CursorInfo->getKind()) {
       case CursorInfoKind::ModuleRef:
         return;
 
       case CursorInfoKind::ValueRef: {
         std::string Diagnostic;
-        bool Success = passNameInfoForDecl(CursorInfo, Input, Diagnostic,
-                                           Receiver);
+        bool Success =
+            passNameInfoForDecl(*cast<ResolvedValueRefCursorInfo>(CursorInfo),
+                                Input, Diagnostic, Receiver);
         if (!Success) {
           if (!getPreviousASTSnaps().empty()) {
             // Attempt again using the up-to-date AST.
@@ -1851,6 +1876,33 @@ resolveRange(SwiftLangSupport &Lang, StringRef InputFile, unsigned Offset,
                                         llvm::vfs::getRealFileSystem());
 }
 
+static void deliverCursorInfoResults(
+    std::function<void(const RequestResult<CursorInfoData> &)> Receiver,
+    CancellableResult<CursorInfoResults> Results, SwiftLangSupport &Lang,
+    const CompilerInvocation &Invoc, bool AddRefactorings,
+    bool AddSymbolGraph) {
+  switch (Results.getKind()) {
+  case CancellableResultKind::Success: {
+    // TODO: Implement delivery of other result types as more cursor info kinds
+    // are migrated to be completion-like.
+    if (auto Result = dyn_cast_or_null<ResolvedValueRefCursorInfo>(
+            Results.getResult().Result)) {
+      std::string Diagnostic; // Unused
+      passCursorInfoForDecl(Result, AddRefactorings, AddSymbolGraph, {}, Lang,
+                            Invoc, Diagnostic, /*PreviousSnaps=*/{},
+                            Results->DidReuseAST, Receiver);
+    }
+    break;
+  }
+  case CancellableResultKind::Failure:
+    Receiver(RequestResult<CursorInfoData>::fromError(Results.getError()));
+    break;
+  case CancellableResultKind::Cancelled:
+    Receiver(RequestResult<CursorInfoData>::cancelled());
+    break;
+  }
+}
+
 void SwiftLangSupport::getCursorInfo(
     StringRef InputFile, unsigned Offset, unsigned Length, bool Actionables,
     bool SymbolGraph, bool CancelOnSubsequentRequest,
@@ -1875,13 +1927,23 @@ void SwiftLangSupport::getCursorInfo(
           passCursorInfoForModule(Entity.Mod, IFaceGenContexts, Invok,
                                   Receiver);
         } else {
-          std::string Diagnostic;  // Unused.
-          ModuleDecl *MainModule = IFaceGenRef->getModuleDecl();
-          ResolvedCursorInfo Info;
-          Info.ValueD = const_cast<ValueDecl *>(Entity.Dcl);
-          Info.IsRef = Entity.IsRef;
-          passCursorInfoForDecl(Info, MainModule, Actionables, SymbolGraph, {},
-                                *this, Invok, Diagnostic, {}, Receiver);
+          std::string Diagnostic; // Unused.
+          ResolvedValueRefCursorInfoPtr Info = new ResolvedValueRefCursorInfo(
+              /*SourcFile=*/nullptr, SourceLoc(),
+              const_cast<ValueDecl *>(Entity.Dcl),
+              /*CtorTyRef=*/nullptr,
+              /*ExtTyRef=*/nullptr, Entity.IsRef,
+              /*Ty=*/Type(),
+              /*ContainerType=*/Type(),
+              /*CustomAttrRef=*/None,
+              /*IsKeywordArgument=*/false,
+              /*IsDynamic=*/false,
+              /*ReceiverTypes=*/{},
+              /*ShorthandShadowedDecls=*/{});
+          passCursorInfoForDecl(
+              Info, Actionables, SymbolGraph, {}, *this, Invok, Diagnostic,
+              /*PreviousSnaps=*/{},
+              /*DidReuseAST=*/false, Receiver);
         }
       } else {
         CursorInfoData Info;
@@ -1904,9 +1966,46 @@ void SwiftLangSupport::getCursorInfo(
     return;
   }
 
-  resolveCursor(*this, InputFile, Offset, Length, Actionables, SymbolGraph,
-                Invok, /*TryExistingAST=*/true, CancelOnSubsequentRequest,
-                fileSystem, CancellationToken, Receiver);
+  bool SolverBasedProducedResult = false;
+  std::string InputFileError;
+  llvm::SmallString<64> RealInputFilePath;
+  fileSystem->getRealPath(InputFile, RealInputFilePath);
+  std::unique_ptr<llvm::MemoryBuffer> UnresolvedInputFile =
+      getASTManager()->getMemoryBuffer(RealInputFilePath, fileSystem,
+                                       InputFileError);
+  if (UnresolvedInputFile) {
+    auto SolverBasedReceiver = [&](const RequestResult<CursorInfoData> &Res) {
+      SolverBasedProducedResult = true;
+      Receiver(Res);
+    };
+
+    CompilerInvocation CompInvok;
+    Invok->applyTo(CompInvok);
+
+    performWithParamsToCompletionLikeOperation(
+        UnresolvedInputFile.get(), Offset,
+        /*InsertCodeCompletionToken=*/false, Args, fileSystem,
+        CancellationToken,
+        [&](CancellableResult<CompletionLikeOperationParams> ParmsResult) {
+          ParmsResult.mapAsync<CursorInfoResults>(
+              [&](auto &Params, auto DeliverTransformed) {
+                getIDEInspectionInstance()->cursorInfo(
+                    Params.Invocation, Args, fileSystem,
+                    Params.completionBuffer, Offset, Params.DiagC,
+                    Params.CancellationFlag, DeliverTransformed);
+              },
+              [&](auto Result) {
+                deliverCursorInfoResults(SolverBasedReceiver, Result, *this,
+                                         CompInvok, Actionables, SymbolGraph);
+              });
+        });
+  }
+
+  if (!SolverBasedProducedResult) {
+    resolveCursor(*this, InputFile, Offset, Length, Actionables, SymbolGraph,
+                  Invok, /*TryExistingAST=*/true, CancelOnSubsequentRequest,
+                  fileSystem, CancellationToken, Receiver);
+  }
 }
 
 void SwiftLangSupport::getDiagnostics(
@@ -2055,7 +2154,6 @@ static void resolveCursorFromUSR(
 
     void handlePrimaryAST(ASTUnitRef AstUnit) override {
       auto &CompIns = AstUnit->getCompilerInstance();
-      ModuleDecl *MainModule = CompIns.getMainModule();
 
       if (USR.startswith("c:")) {
         LOG_WARN_FUNC("lookup for C/C++/ObjC USRs not implemented");
@@ -2082,23 +2180,35 @@ static void resolveCursorFromUSR(
         passCursorInfoForModule(M, Lang.getIFaceGenContexts(), CompInvok,
                                 Receiver);
       } else {
-        ResolvedCursorInfo Info;
-        Info.ValueD = D;
-        Info.IsRef = false;
-
         auto *DC = D->getDeclContext();
-        Type selfTy;
+
+        Type ContainerType;
         if (DC->isTypeContext()) {
-          Info.ContainerType = DC->getSelfInterfaceType();
-          Info.ContainerType = D->getInnermostDeclContext()->mapTypeIntoContext(
-              Info.ContainerType);
+          auto ContainerType = DC->getSelfInterfaceType();
+          ContainerType =
+              D->getInnermostDeclContext()->mapTypeIntoContext(ContainerType);
         }
 
+        ResolvedValueRefCursorInfoPtr Info = new ResolvedValueRefCursorInfo(
+            /*SourceFile=*/nullptr, SourceLoc(), D,
+            /*CtorTyRef=*/nullptr,
+            /*ExtTyRef=*/nullptr,
+            /*IsRef=*/false,
+            /*Ty=*/Type(), ContainerType,
+            /*CustomAttrRef=*/None,
+            /*IsKeywordArgument=*/false,
+            /*IsDynamic=*/false,
+            /*ReceiverTypes=*/{},
+            /*ShorthandShadowedDecls=*/{});
+
+        Type selfTy;
+
         std::string Diagnostic;
-        bool Success =
-            passCursorInfoForDecl(Info, MainModule, /*AddRefactorings*/ false,
-                                  /*AddSymbolGraph*/ false, {}, Lang, CompInvok,
-                                  Diagnostic, PreviousASTSnaps, Receiver);
+        bool Success = passCursorInfoForDecl(
+            Info, /*AddRefactorings*/ false,
+            /*AddSymbolGraph*/ false, {}, Lang, CompInvok, Diagnostic,
+            PreviousASTSnaps,
+            /*DidReuseAST=*/false, Receiver);
         if (!Success) {
           if (!PreviousASTSnaps.empty()) {
             // Attempt again using the up-to-date AST.
@@ -2345,29 +2455,30 @@ void SwiftLangSupport::findRelatedIdentifiersInFile(
       SmallVector<std::pair<unsigned, unsigned>, 8> Ranges;
 
       auto Action = [&]() {
-        unsigned BufferID = SrcFile.getBufferID().getValue();
+        unsigned BufferID = SrcFile.getBufferID().value();
         SourceLoc Loc =
           Lexer::getLocForStartOfToken(CompInst.getSourceMgr(), BufferID, Offset);
         if (Loc.isInvalid())
           return;
 
-        ResolvedCursorInfo CursorInfo =
-          evaluateOrDefault(SrcFile.getASTContext().evaluator,
-                            CursorInfoRequest{CursorInfoOwner(&SrcFile, Loc)},
-                            ResolvedCursorInfo());
-        if (CursorInfo.isInvalid())
+        ResolvedCursorInfoPtr CursorInfo =
+            evaluateOrDefault(SrcFile.getASTContext().evaluator,
+                              CursorInfoRequest{CursorInfoOwner(&SrcFile, Loc)},
+                              new ResolvedCursorInfo());
+        auto ValueRefCursorInfo =
+            dyn_cast<ResolvedValueRefCursorInfo>(CursorInfo);
+        if (!ValueRefCursorInfo)
           return;
-        if (CursorInfo.IsKeywordArgument)
+        if (ValueRefCursorInfo->isKeywordArgument())
           return;
 
-        ValueDecl *VD = CursorInfo.typeOrValue();
+        ValueDecl *VD = ValueRefCursorInfo->typeOrValue();
         if (!VD)
           return; // This was a module reference.
 
         // Only accept pointing to an identifier.
-        if (!CursorInfo.IsRef &&
-            (isa<ConstructorDecl>(VD) ||
-             isa<DestructorDecl>(VD) ||
+        if (!ValueRefCursorInfo->isRef() &&
+            (isa<ConstructorDecl>(VD) || isa<DestructorDecl>(VD) ||
              isa<SubscriptDecl>(VD)))
           return;
         if (VD->isOperator())
@@ -2456,6 +2567,101 @@ void SwiftLangSupport::findRelatedIdentifiersInFile(
 }
 
 //===----------------------------------------------------------------------===//
+// SwiftLangSupport::findActiveRegionsInFile
+//===----------------------------------------------------------------------===//
+
+namespace {
+class IfConfigScanner : public SourceEntityWalker {
+  SmallVectorImpl<IfConfigInfo> &Infos;
+  SourceManager &SourceMgr;
+  unsigned BufferID = -1;
+  bool Cancelled = false;
+
+public:
+  explicit IfConfigScanner(SourceFile &SrcFile, unsigned BufferID,
+                           SmallVectorImpl<IfConfigInfo> &Infos)
+      : Infos(Infos), SourceMgr(SrcFile.getASTContext().SourceMgr),
+        BufferID(BufferID) {}
+
+private:
+  bool walkToDeclPre(Decl *D, CharSourceRange Range) override {
+    if (Cancelled)
+      return false;
+
+    if (auto *IfDecl = dyn_cast<IfConfigDecl>(D)) {
+      for (auto &Clause : IfDecl->getClauses()) {
+        unsigned Offset = SourceMgr.getLocOffsetInBuffer(Clause.Loc, BufferID);
+        Infos.emplace_back(Offset, Clause.isActive);
+      }
+    }
+
+    return true;
+  }
+};
+
+} // end anonymous namespace
+
+void SwiftLangSupport::findActiveRegionsInFile(
+    StringRef InputFile, ArrayRef<const char *> Args,
+    SourceKitCancellationToken CancellationToken,
+    std::function<void(const RequestResult<ActiveRegionsInfo> &)> Receiver) {
+
+  std::string Error;
+  SwiftInvocationRef Invok =
+      ASTMgr->getTypecheckInvocation(Args, InputFile, Error);
+  if (!Invok) {
+    LOG_WARN_FUNC("failed to create an ASTInvocation: " << Error);
+    Receiver(RequestResult<ActiveRegionsInfo>::fromError(Error));
+    return;
+  }
+
+  class IfConfigConsumer : public SwiftASTConsumer {
+    std::function<void(const RequestResult<ActiveRegionsInfo> &)> Receiver;
+    SwiftInvocationRef Invok;
+
+  public:
+    IfConfigConsumer(
+        std::function<void(const RequestResult<ActiveRegionsInfo> &)> Receiver,
+        SwiftInvocationRef Invok)
+        : Receiver(std::move(Receiver)), Invok(Invok) {}
+
+    void handlePrimaryAST(ASTUnitRef AstUnit) override {
+      auto &SrcFile = AstUnit->getPrimarySourceFile();
+      SmallVector<IfConfigInfo> Configs;
+      auto BufferID = SrcFile.getBufferID();
+      if (!BufferID)
+        return;
+      IfConfigScanner Scanner(SrcFile, *BufferID, Configs);
+      Scanner.walk(SrcFile);
+
+      // Sort by offset so nested decls are reported
+      // in source order (not tree order).
+      llvm::sort(Configs,
+                 [](const IfConfigInfo &LHS, const IfConfigInfo &RHS) -> bool {
+                   return LHS.Offset < RHS.Offset;
+                 });
+      ActiveRegionsInfo Info;
+      Info.Configs = Configs;
+      Receiver(RequestResult<ActiveRegionsInfo>::fromResult(Info));
+    }
+
+    void cancelled() override {
+      Receiver(RequestResult<ActiveRegionsInfo>::cancelled());
+    }
+
+    void failed(StringRef Error) override {
+      LOG_WARN_FUNC("inactive ranges failed: " << Error);
+      Receiver(RequestResult<ActiveRegionsInfo>::fromError(Error));
+    }
+  };
+
+  auto Consumer = std::make_shared<IfConfigConsumer>(Receiver, Invok);
+  ASTMgr->processASTAsync(Invok, std::move(Consumer),
+                          /*OncePerASTToken=*/nullptr, CancellationToken,
+                          llvm::vfs::getRealFileSystem());
+}
+
+//===----------------------------------------------------------------------===//
 // SwiftLangSupport::semanticRefactoring
 //===----------------------------------------------------------------------===//
 
@@ -2469,12 +2675,12 @@ static RefactoringKind getIDERefactoringKind(SemanticRefactoringInfo Info) {
 }
 
 void SwiftLangSupport::semanticRefactoring(
-    StringRef Filename, SemanticRefactoringInfo Info,
+    StringRef PrimaryFile, SemanticRefactoringInfo Info,
     ArrayRef<const char *> Args, SourceKitCancellationToken CancellationToken,
     CategorizedEditsReceiver Receiver) {
   std::string Error;
   SwiftInvocationRef Invok =
-      ASTMgr->getTypecheckInvocation(Args, Filename, Error);
+      ASTMgr->getTypecheckInvocation(Args, PrimaryFile, Error);
   if (!Invok) {
     LOG_WARN_FUNC("failed to create an ASTInvocation: " << Error);
     Receiver(RequestResult<ArrayRef<CategorizedEdits>>::fromError(Error));
@@ -2492,18 +2698,30 @@ void SwiftLangSupport::semanticRefactoring(
                                                 Receiver(std::move(Receiver)) {}
 
     void handlePrimaryAST(ASTUnitRef AstUnit) override {
+      RequestRefactoringEditConsumer EditConsumer(Receiver);
+
       auto &CompIns = AstUnit->getCompilerInstance();
-      ModuleDecl *MainModule = CompIns.getMainModule();
+      auto &SM = CompIns.getSourceMgr();
+
       RefactoringOptions Opts(getIDERefactoringKind(Info));
-      Opts.Range.BufferId =  AstUnit->getPrimarySourceFile().getBufferID().
-        getValue();
+
+      Optional<unsigned> BufferID;
+      if (Info.SourceFile.empty()) {
+        BufferID = AstUnit->getPrimarySourceFile().getBufferID();
+      } else {
+        BufferID = SM.getIDForBufferIdentifier(Info.SourceFile);
+      }
+      if (!BufferID)
+        return;
+
+      Opts.Range.BufferID = *BufferID;
       Opts.Range.Line = Info.Line;
       Opts.Range.Column = Info.Column;
       Opts.Range.Length = Info.Length;
       Opts.PreferredName = Info.PreferredName.str();
 
-      RequestRefactoringEditConsumer EditConsumer(Receiver);
-      refactorSwiftModule(MainModule, Opts, EditConsumer, EditConsumer);
+      refactorSwiftModule(CompIns.getMainModule(), Opts, EditConsumer,
+                          EditConsumer);
     }
 
     void cancelled() override {
@@ -2628,9 +2846,9 @@ void SwiftLangSupport::collectVariableTypes(
       // offset/length are unset, the (default) range will be used, which
       // corresponds to the entire document.
       SourceRange Range;
-      if (Offset.hasValue() && Length.hasValue()) {
+      if (Offset.has_value() && Length.has_value()) {
         auto &SM = CompInst.getSourceMgr();
-        unsigned BufferID = SF->getBufferID().getValue();
+        unsigned BufferID = SF->getBufferID().value();
         SourceLoc Start = Lexer::getLocForStartOfToken(SM, BufferID, *Offset);
         SourceLoc End =
             Lexer::getLocForStartOfToken(SM, BufferID, *Offset + *Length);

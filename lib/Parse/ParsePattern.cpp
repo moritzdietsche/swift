@@ -23,16 +23,12 @@
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeRepr.h"
 #include "swift/Basic/StringExtras.h"
-#include "swift/Parse/CodeCompletionCallbacks.h"
-#include "swift/Parse/ParsedSyntaxRecorder.h"
-#include "swift/Parse/SyntaxParsingContext.h"
-#include "swift/Syntax/SyntaxKind.h"
+#include "swift/Parse/IDEInspectionCallbacks.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/SaveAndRestore.h"
 
 using namespace swift;
-using namespace swift::syntax;
 
 /// Determine the kind of a default argument given a parsed
 /// expression that has not yet been type-checked.
@@ -70,8 +66,6 @@ static ParserStatus parseDefaultArgument(
     Parser &P, Parser::DefaultArgumentInfo *defaultArgs, unsigned argIndex,
     Expr *&init, bool &hasInheritedDefaultArg,
     Parser::ParameterContextKind paramContext) {
-  SyntaxParsingContext DefaultArgContext(P.SyntaxContext,
-                                         SyntaxKind::InitializerClause);
   assert(P.Tok.is(tok::equal) ||
        (P.Tok.isBinaryOperator() && P.Tok.getText() == "=="));
   SourceLoc equalLoc = P.consumeToken();
@@ -88,7 +82,6 @@ static ParserStatus parseDefaultArgument(
     if (P.Tok.is(tok::kw_super) && P.peekToken().isAny(tok::comma, tok::r_paren)) {
       hasInheritedDefaultArg = true;
       P.consumeToken(tok::kw_super);
-      P.SyntaxContext->createNodeInPlace(SyntaxKind::SuperRefExpr);
       defaultArgs->HasDefaultArgument = true;
       return ParserStatus();
     }
@@ -122,6 +115,9 @@ static ParserStatus parseDefaultArgument(
     break;
   case Parser::ParameterContextKind::Curried:
     diagID = diag::no_default_arg_curried;
+    break;
+  case Parser::ParameterContextKind::Macro:
+    diagID = diag::no_default_arg_macro;
     break;
   }
   
@@ -163,20 +159,26 @@ bool Parser::startsParameterName(bool isClosure) {
 
   // If the next token can be an argument label, we might have a name.
   if (nextTok.canBeArgumentLabel()) {
-    // If the first name wasn't "isolated", we're done.
+    // If the first name wasn't a contextual keyword, we're done.
     if (!Tok.isContextualKeyword("isolated") &&
         !Tok.isContextualKeyword("some") &&
-        !Tok.isContextualKeyword("any"))
+        !Tok.isContextualKeyword("any") &&
+        !Tok.isContextualKeyword("each") &&
+        !Tok.isContextualKeyword("__shared") &&
+        !Tok.isContextualKeyword("__owned") &&
+        !Tok.isContextualKeyword("borrowing") &&
+        !Tok.isContextualKeyword("consuming") &&
+        !Tok.is(tok::kw_repeat))
       return true;
 
-    // "isolated" can be an argument label, but it's also a contextual keyword,
-    // so look ahead one more token (two total) see if we have a ':' that would
+    // Parameter specifiers can be an argument label, but they're also
+    // contextual keywords, so look ahead one more token (two total) and see
+    // if we have a ':' that would
     // indicate that this is an argument label.
     return lookahead<bool>(2, [&](CancellableBacktrackingScope &) {
       if (Tok.is(tok::colon))
         return true; // isolated :
 
-      // isolated x :
       return Tok.canBeArgumentLabel() && nextTok.is(tok::colon);
     });
   }
@@ -199,17 +201,12 @@ Parser::parseParameterClause(SourceLoc &leftParenLoc,
                              ParameterContextKind paramContext) {
   assert(params.empty() && leftParenLoc.isInvalid() &&
          rightParenLoc.isInvalid() && "Must start with empty state");
-  SyntaxParsingContext ParamClauseCtx(SyntaxContext, SyntaxKind::ParameterClause);
 
   // Consume the starting '(';
   leftParenLoc = consumeToken(tok::l_paren);
 
   // Trivial case: empty parameter list.
   if (Tok.is(tok::r_paren)) {
-    {
-      SyntaxParsingContext EmptyPLContext(SyntaxContext,
-                                          SyntaxKind::FunctionParameterList);
-    }
     rightParenLoc = consumeToken(tok::r_paren);
 
     // Per SE-0155, enum elements may not have empty parameter lists.
@@ -237,7 +234,6 @@ Parser::parseParameterClause(SourceLoc &leftParenLoc,
   return parseList(tok::r_paren, leftParenLoc, rightParenLoc,
                       /*AllowSepAfterLast=*/false,
                       diag::expected_rparen_parameter,
-                      SyntaxKind::FunctionParameterList,
                       [&]() -> ParserStatus {
     ParsedParameter param;
     ParserStatus status;
@@ -249,24 +245,37 @@ Parser::parseParameterClause(SourceLoc &leftParenLoc,
     if (paramContext != ParameterContextKind::EnumElement) {
       auto AttrStatus = parseDeclAttributeList(param.Attrs);
       if (AttrStatus.hasCodeCompletion()) {
-        if (CodeCompletion)
-          CodeCompletion->setAttrTargetDeclKind(DeclKind::Param);
+        if (IDECallbacks)
+          IDECallbacks->setAttrTargetDeclKind(DeclKind::Param);
         status.setHasCodeCompletionAndIsError();
       }
     }
 
     {
-      SyntaxParsingContext ModifiersContext(SyntaxContext, SyntaxKind::ModifierList);
-
       // ('inout' | '__shared' | '__owned' | isolated)?
       bool hasSpecifier = false;
-      while (Tok.is(tok::kw_inout) ||
-             Tok.isContextualKeyword("__shared") ||
-             Tok.isContextualKeyword("__owned") ||
-             Tok.isContextualKeyword("isolated") ||
-             Tok.isContextualKeyword("_const")) {
-        SyntaxParsingContext ModContext(SyntaxContext, SyntaxKind::DeclModifier);
+      while (Tok.is(tok::kw_inout)
+             || (canHaveParameterSpecifierContextualKeyword()
+                 && (Tok.isContextualKeyword("__shared")
+                     || Tok.isContextualKeyword("__owned")
+                     || Tok.isContextualKeyword("borrowing")
+                     || Tok.isContextualKeyword("consuming")
+                     || Tok.isContextualKeyword("isolated")
+                     || Tok.isContextualKeyword("_const")))) {
+        // is this token the identifier of an argument label? `inout` is a
+        // reserved keyword but the other modifiers are not.
+        if (!Tok.is(tok::kw_inout)) {
+          bool partOfArgumentLabel = lookahead<bool>(1, [&](CancellableBacktrackingScope &) {
+            if (Tok.is(tok::colon))
+              return true;  // isolated :
 
+            return Tok.canBeArgumentLabel() && peekToken().is(tok::colon);
+          });
+
+          if (partOfArgumentLabel)
+            break;
+        }
+        
         if (Tok.isContextualKeyword("isolated")) {
           // did we already find an 'isolated' type modifier?
           if (param.IsolatedLoc.isValid()) {
@@ -275,18 +284,6 @@ Parser::parseParameterClause(SourceLoc &leftParenLoc,
             consumeToken();
             continue;
           }
-
-          // is this 'isolated' token the identifier of an argument label?
-          bool partOfArgumentLabel = lookahead<bool>(1, [&](CancellableBacktrackingScope &) {
-            if (Tok.is(tok::colon))
-              return true;  // isolated :
-
-            // isolated x :
-            return Tok.canBeArgumentLabel() && peekToken().is(tok::colon);
-          });
-
-          if (partOfArgumentLabel)
-            break;
 
           // consume 'isolated' as type modifier
           param.IsolatedLoc = consumeToken();
@@ -299,20 +296,22 @@ Parser::parseParameterClause(SourceLoc &leftParenLoc,
         }
 
         if (!hasSpecifier) {
+          // These cases are handled later when mapping to ParamDecls for
+          // better fixits.
           if (Tok.is(tok::kw_inout)) {
-            // This case is handled later when mapping to ParamDecls for
-            // better fixits.
             param.SpecifierKind = ParamDecl::Specifier::InOut;
             param.SpecifierLoc = consumeToken();
+          } else if (Tok.isContextualKeyword("borrowing")) {
+            param.SpecifierKind = ParamDecl::Specifier::Borrowing;
+            param.SpecifierLoc = consumeToken();
+          } else if (Tok.isContextualKeyword("consuming")) {
+            param.SpecifierKind = ParamDecl::Specifier::Consuming;
+            param.SpecifierLoc = consumeToken();
           } else if (Tok.isContextualKeyword("__shared")) {
-            // This case is handled later when mapping to ParamDecls for
-            // better fixits.
-            param.SpecifierKind = ParamDecl::Specifier::Shared;
+            param.SpecifierKind = ParamDecl::Specifier::LegacyShared;
             param.SpecifierLoc = consumeToken();
           } else if (Tok.isContextualKeyword("__owned")) {
-            // This case is handled later when mapping to ParamDecls for
-            // better fixits.
-            param.SpecifierKind = ParamDecl::Specifier::Owned;
+            param.SpecifierKind = ParamDecl::Specifier::LegacyOwned;
             param.SpecifierLoc = consumeToken();
           }
           hasSpecifier = true;
@@ -328,7 +327,10 @@ Parser::parseParameterClause(SourceLoc &leftParenLoc,
     
     // If let or var is being used as an argument label, allow it but
     // generate a warning.
-    if (!isClosure && Tok.isAny(tok::kw_let, tok::kw_var)) {
+    if (!isClosure &&
+        (Tok.isAny(tok::kw_let, tok::kw_var) ||
+         (Context.LangOpts.hasFeature(Feature::ReferenceBindings) &&
+          Tok.isAny(tok::kw_inout)))) {
       diagnose(Tok, diag::parameter_let_var_as_attr, Tok.getText())
         .fixItReplace(Tok.getLoc(), "`" + Tok.getText().str() + "`");
     }
@@ -498,11 +500,11 @@ Parser::parseParameterClause(SourceLoc &leftParenLoc,
     return status;
   });
 }
-template <typename T>
+
 static TypeRepr *
-validateParameterWithSpecifier(Parser &parser,
+validateParameterWithOwnership(Parser &parser,
                                Parser::ParsedParameter &paramInfo,
-                               StringRef specifierName,
+                               ParamSpecifier specifier,
                                bool parsingEnumElt) {
   auto type = paramInfo.Type;
   auto loc = paramInfo.SpecifierLoc;
@@ -510,12 +512,13 @@ validateParameterWithSpecifier(Parser &parser,
   // at all - Sema will catch this for us.  In all other contexts, we
   // assume the user put 'inout' in the wrong place and offer a fixit.
   if (parsingEnumElt) {
-    return new (parser.Context) T(type, loc);
+    return new (parser.Context) OwnershipTypeRepr(type, specifier, loc);
   }
   
   if (isa<SpecifierTypeRepr>(type)) {
     parser.diagnose(loc, diag::parameter_specifier_repeated).fixItRemove(loc);
   } else {
+    auto specifierName = ParamDecl::getSpecifierSpelling(specifier);
     llvm::SmallString<128> replacement(specifierName);
     replacement += " ";
     parser
@@ -523,7 +526,7 @@ validateParameterWithSpecifier(Parser &parser,
                   specifierName)
         .fixItRemove(loc)
         .fixItInsert(type->getStartLoc(), replacement);
-    type = new (parser.Context) T(type, loc);
+    type = new (parser.Context) OwnershipTypeRepr(type, specifier, loc);
   }
 
   return type;
@@ -570,18 +573,10 @@ mapParsedParameters(Parser &parser,
     // If a type was provided, create the type for the parameter.
     if (auto type = paramInfo.Type) {
       // If 'inout' was specified, turn the type into an in-out type.
-      if (paramInfo.SpecifierKind == ParamDecl::Specifier::InOut) {
-        type = validateParameterWithSpecifier<InOutTypeRepr>(parser, paramInfo,
-                                                             "inout",
-                                                             parsingEnumElt);
-      } else if (paramInfo.SpecifierKind == ParamDecl::Specifier::Shared) {
-        type = validateParameterWithSpecifier<SharedTypeRepr>(parser, paramInfo,
-                                                              "__shared",
-                                                              parsingEnumElt);
-      } else if (paramInfo.SpecifierKind == ParamDecl::Specifier::Owned) {
-        type = validateParameterWithSpecifier<OwnedTypeRepr>(parser, paramInfo,
-                                                             "__owned",
-                                                             parsingEnumElt);
+      if (paramInfo.SpecifierKind != ParamDecl::Specifier::Default) {
+        type = validateParameterWithOwnership(parser, paramInfo,
+                                              paramInfo.SpecifierKind,
+                                              parsingEnumElt);
       }
 
       if (paramInfo.IsolatedLoc.isValid()) {
@@ -619,13 +614,10 @@ mapParsedParameters(Parser &parser,
           if (auto *STR = dyn_cast<SpecifierTypeRepr>(unwrappedType)) {
             if (isa<IsolatedTypeRepr>(STR))
               param->setIsolated(true);
-            unwrappedType = STR->getBase();
-            continue;
-          }
+            else if (isa<CompileTimeConstTypeRepr>(STR))
+              param->setCompileTimeConst(true);
 
-          if (auto *CTR = dyn_cast<CompileTimeConstTypeRepr>(unwrappedType)) {
-            param->setCompileTimeConst(true);
-            unwrappedType = CTR->getBase();
+            unwrappedType = STR->getBase();
             continue;
           }
 
@@ -633,20 +625,12 @@ mapParsedParameters(Parser &parser,
         }
       }
     } else if (paramInfo.SpecifierLoc.isValid()) {
-      StringRef specifier;
-      switch (paramInfo.SpecifierKind) {
-      case ParamDecl::Specifier::InOut:
-        specifier = "'inout'";
-        break;
-      case ParamDecl::Specifier::Shared:
-        specifier = "'shared'";
-        break;
-      case ParamDecl::Specifier::Owned:
-        specifier = "'owned'";
-        break;
-      case ParamDecl::Specifier::Default:
-        llvm_unreachable("can't have default here");
-        break;
+      llvm::SmallString<16> specifier;
+      {
+        llvm::raw_svector_ostream ss(specifier);
+        
+        ss << '\'' << ParamDecl::getSpecifierSpelling(paramInfo.SpecifierKind)
+           << '\'';
       }
       parser.diagnose(paramInfo.SpecifierLoc, diag::specifier_must_have_type,
                       specifier);
@@ -679,6 +663,7 @@ mapParsedParameters(Parser &parser,
     case Parser::ParameterContextKind::Curried:
     case Parser::ParameterContextKind::Initializer:
     case Parser::ParameterContextKind::Function:
+    case Parser::ParameterContextKind::Macro:
       isKeywordArgumentByDefault = true;
       break;
     }
@@ -757,6 +742,9 @@ Parser::parseSingleParameterClause(ParameterContextKind paramContext,
       break;
     case ParameterContextKind::Initializer:
       diagID = diag::expected_lparen_initializer;
+      break;
+    case ParameterContextKind::Macro:
+      diagID = diag::expected_lparen_macro;
       break;
     case ParameterContextKind::EnumElement:
     case ParameterContextKind::Closure:
@@ -841,7 +829,6 @@ Parser::parseFunctionSignature(DeclBaseName SimpleName,
                                SourceLoc &throwsLoc,
                                bool &rethrows,
                                TypeRepr *&retType) {
-  SyntaxParsingContext SigContext(SyntaxContext, SyntaxKind::FunctionSignature);
   SmallVector<Identifier, 4> NamePieces;
   ParserStatus Status;
 
@@ -864,7 +851,6 @@ Parser::parseFunctionSignature(DeclBaseName SimpleName,
   // If there's a trailing arrow, parse the rest as the result type.
   SourceLoc arrowLoc;
   if (Tok.isAny(tok::arrow, tok::colon)) {
-    SyntaxParsingContext ReturnCtx(SyntaxContext, SyntaxKind::ReturnClause);
     if (!consumeIf(tok::arrow, arrowLoc)) {
       // FixIt ':' to '->'.
       diagnose(Tok, diag::func_decl_expected_arrow)
@@ -1001,8 +987,8 @@ ParserStatus Parser::parseEffectsSpecifiers(SourceLoc existingArrowLoc,
     // Code completion.
     if (Tok.is(tok::code_complete) && !Tok.isAtStartOfLine() &&
         !existingArrowLoc.isValid()) {
-      if (CodeCompletion)
-        CodeCompletion->completeEffectsSpecifier(asyncLoc.isValid(),
+      if (IDECallbacks)
+        IDECallbacks->completeEffectsSpecifier(asyncLoc.isValid(),
                                                  throwsLoc.isValid());
       consumeToken(tok::code_complete);
       status.setHasCodeCompletionAndIsError();
@@ -1023,7 +1009,6 @@ ParserResult<Pattern> Parser::parseTypedPattern() {
   
   // Now parse an optional type annotation.
   if (Tok.is(tok::colon)) {
-    SyntaxParsingContext TypeAnnoCtx(SyntaxContext, SyntaxKind::TypeAnnotation);
     SourceLoc colonLoc = consumeToken(tok::colon);
     
     if (result.isNull()) {
@@ -1040,18 +1025,12 @@ ParserResult<Pattern> Parser::parseTypedPattern() {
     if (!Ty.isNull()) {
       // Attempt to diagnose initializer calls incorrectly written
       // as typed patterns, such as "var x: [Int]()".
-      // Disable this tentative parse when in code-completion mode, otherwise
+      // Disable this tentative parse when in IDE inspection mode, otherwise
       // code-completion may enter the delayed-decl state twice.
-      if (Tok.isFollowingLParen() && !L->isCodeCompletion()) {
+      if (Tok.isFollowingLParen() &&
+          !SourceMgr.hasIDEInspectionTargetBuffer()) {
         CancellableBacktrackingScope backtrack(*this);
 
-        // Create a local context if needed so we can parse trailing closures.
-        LocalContext dummyContext;
-        Optional<ContextChange> contextChange;
-        if (!CurLocalContext) {
-          contextChange.emplace(*this, CurDeclContext, &dummyContext);
-        }
-        
         SmallVector<ExprListElt, 2> elts;
         auto argListResult = parseArgumentList(tok::l_paren, tok::r_paren,
                                                /*isExprBasic*/ false);
@@ -1085,10 +1064,8 @@ ParserResult<Pattern> Parser::parseTypedPattern() {
 ///   pattern ::= 'let' pattern
 ///
 ParserResult<Pattern> Parser::parsePattern() {
-  SyntaxParsingContext PatternCtx(SyntaxContext, SyntaxContextKind::Pattern);
-  auto introducer = (InVarOrLetPattern != IVOLP_InVar
-                     ? VarDecl::Introducer::Let
-                     : VarDecl::Introducer::Var);
+  auto introducer =
+      InBindingPattern.getIntroducer().getValueOr(VarDecl::Introducer::Let);
   switch (Tok.getKind()) {
   case tok::l_paren:
     return parsePatternTuple();
@@ -1100,13 +1077,11 @@ ParserResult<Pattern> Parser::parsePattern() {
     // VarDecl inside.
     if (CurDeclContext->isTypeContext() &&
         SF.Kind == SourceFileKind::Interface) {
-      PatternCtx.setCreateSyntax(SyntaxKind::IdentifierPattern);
       auto VD = new (Context) VarDecl(
         /*IsStatic*/false, introducer,
         consumeToken(tok::kw__), Identifier(), CurDeclContext);
       return makeParserResult(NamedPattern::createImplicit(Context, VD));
     }
-    PatternCtx.setCreateSyntax(SyntaxKind::WildcardPattern);
 
     const auto isAsyncLet =
         InPatternWithAsyncAttribute && introducer == VarDecl::Introducer::Let;
@@ -1114,7 +1089,6 @@ ParserResult<Pattern> Parser::parsePattern() {
         new (Context) AnyPattern(consumeToken(tok::kw__), isAsyncLet));
   }
   case tok::identifier: {
-    PatternCtx.setCreateSyntax(SyntaxKind::IdentifierPattern);
     Identifier name;
     SourceLoc loc = consumeIdentifier(name, /*diagnoseDollarPrefix=*/true);
     if (Tok.isIdentifierOrUnderscore() && !Tok.isContextualDeclKeyword() &&
@@ -1133,25 +1107,38 @@ ParserResult<Pattern> Parser::parsePattern() {
       consumeToken(tok::code_complete);
     }
     return makeParserCodeCompletionStatus();
-    
+  case tok::kw_inout:
+    // If we don't have the reference binding feature, break if we have
+    // inout. Otherwise, go below.
+    if (!Context.LangOpts.hasFeature(Feature::ReferenceBindings))
+      break;
+    LLVM_FALLTHROUGH;
   case tok::kw_var:
   case tok::kw_let: {
-    PatternCtx.setCreateSyntax(SyntaxKind::ValueBindingPattern);
-    bool isLet = Tok.is(tok::kw_let);
+    auto newBindingState = PatternBindingState(Tok);
     SourceLoc varLoc = consumeToken();
-    
-    // 'var' and 'let' patterns shouldn't nest.
-    if (InVarOrLetPattern == IVOLP_InLet ||
-        InVarOrLetPattern == IVOLP_InVar)
-      diagnose(varLoc, diag::var_pattern_in_var, unsigned(isLet));
-    
+
+    // 'var', 'let', 'inout' patterns shouldn't nest.
+    if (InBindingPattern.getIntroducer().hasValue()) {
+      auto diag = diag::var_pattern_in_var;
+      unsigned index = *newBindingState.getSelectIndexForIntroducer();
+      if (Context.LangOpts.hasFeature(Feature::ReferenceBindings)) {
+        diag = diag::var_pattern_in_var_inout;
+      }
+      diagnose(varLoc, diag, index);
+    }
+
     // 'let' isn't valid inside an implicitly immutable context, but var is.
-    if (isLet && InVarOrLetPattern == IVOLP_ImplicitlyImmutable)
+    if (newBindingState.isLet() &&
+        InBindingPattern == PatternBindingState::ImplicitlyImmutable)
       diagnose(varLoc, diag::let_pattern_in_immutable_context);
-    
-    // In our recursive parse, remember that we're in a var/let pattern.
-    llvm::SaveAndRestore<decltype(InVarOrLetPattern)>
-    T(InVarOrLetPattern, isLet ? IVOLP_InLet : IVOLP_InVar);
+
+    // In our recursive parse, remember that we're in a let/var/inout
+    // pattern. We default to var if we don't have an immediate pattern bidning
+    // state.
+    llvm::SaveAndRestore<decltype(InBindingPattern)> T(
+        InBindingPattern, newBindingState.getPatternBindingStateForIntroducer(
+                              VarDecl::Introducer::Var));
 
     // Reset async attribute in parser context.
     llvm::SaveAndRestore<bool> AsyncAttr(InPatternWithAsyncAttribute, false);
@@ -1161,23 +1148,28 @@ ParserResult<Pattern> Parser::parsePattern() {
       return makeParserCodeCompletionResult<Pattern>();
     if (subPattern.isNull())
       return nullptr;
-    return makeParserResult(
-        new (Context) BindingPattern(varLoc, isLet, subPattern.get()));
+    return makeParserResult(new (Context) BindingPattern(
+        varLoc,
+        newBindingState.getIntroducer().getValueOr(VarDecl::Introducer::Var),
+        subPattern.get()));
   }
       
   default:
-    if (Tok.isKeyword() &&
-        (peekToken().is(tok::colon) || peekToken().is(tok::equal))) {
-      diagnose(Tok, diag::keyword_cant_be_identifier, Tok.getText());
-      diagnose(Tok, diag::backticks_to_escape)
-        .fixItReplace(Tok.getLoc(), "`" + Tok.getText().str() + "`");
-      SourceLoc Loc = Tok.getLoc();
-      consumeToken();
-      return makeParserErrorResult(new (Context) AnyPattern(Loc));
-    }
-    diagnose(Tok, diag::expected_pattern);
-    return nullptr;
+    break;
   }
+
+  // Handle the default case.
+  if (Tok.isKeyword() &&
+      (peekToken().is(tok::colon) || peekToken().is(tok::equal))) {
+    diagnose(Tok, diag::keyword_cant_be_identifier, Tok.getText());
+    diagnose(Tok, diag::backticks_to_escape)
+      .fixItReplace(Tok.getLoc(), "`" + Tok.getText().str() + "`");
+    SourceLoc Loc = Tok.getLoc();
+    consumeToken();
+    return makeParserErrorResult(new (Context) AnyPattern(Loc));
+  }
+  diagnose(Tok, diag::expected_pattern);
+  return nullptr;
 }
 
 Pattern *Parser::createBindingFromPattern(SourceLoc loc, Identifier name,
@@ -1221,8 +1213,6 @@ Parser::parsePatternTupleElement() {
 ///   pattern-tuple-body:
 ///     pattern-tuple-element (',' pattern-tuple-body)*
 ParserResult<Pattern> Parser::parsePatternTuple() {
-  SyntaxParsingContext TuplePatternCtxt(SyntaxContext,
-                                        SyntaxKind::TuplePattern);
   StructureMarkerRAII ParsingPatternTuple(*this, Tok);
   SourceLoc LPLoc = consumeToken(tok::l_paren);
   SourceLoc RPLoc;
@@ -1233,7 +1223,6 @@ ParserResult<Pattern> Parser::parsePatternTuple() {
     parseList(tok::r_paren, LPLoc, RPLoc,
               /*AllowSepAfterLast=*/false,
               diag::expected_rparen_tuple_pattern_list,
-              SyntaxKind::TuplePatternElementList,
               [&] () -> ParserStatus {
     // Parse the pattern tuple element.
     ParserStatus EltStatus;
@@ -1264,8 +1253,6 @@ parseOptionalPatternTypeAnnotation(ParserResult<Pattern> result) {
     return result;
 
   // Parse an optional type annotation.
-  SyntaxParsingContext TypeAnnotationCtxt(SyntaxContext,
-                                          SyntaxKind::TypeAnnotation);
   consumeToken(tok::colon);
 
   if (result.isNull())
@@ -1300,21 +1287,21 @@ ParserResult<Pattern> Parser::parseMatchingPattern(bool isExprBasic) {
   // parse pattern nodes for productions shared by pattern and expression
   // grammar. For short-term ease of initial implementation, we always go
   // through the expr parser for ambiguous productions.
-  SyntaxParsingContext PatternCtx(SyntaxContext, SyntaxContextKind::Pattern);
 
   // Parse productions that can only be patterns.
-  if (Tok.isAny(tok::kw_var, tok::kw_let)) {
-    PatternCtx.setCreateSyntax(SyntaxKind::ValueBindingPattern);
-    assert(Tok.isAny(tok::kw_let, tok::kw_var) && "expects var or let");
-    bool isLet = Tok.is(tok::kw_let);
+  if (Tok.isAny(tok::kw_var, tok::kw_let) ||
+      (Context.LangOpts.hasFeature(Feature::ReferenceBindings) &&
+       Tok.isAny(tok::kw_inout))) {
+    assert(Tok.isAny(tok::kw_let, tok::kw_var, tok::kw_inout) && "expects var or let");
+    auto newPatternBindingState = PatternBindingState(Tok);
     SourceLoc varLoc = consumeToken();
-    
-    return parseMatchingPatternAsLetOrVar(isLet, varLoc, isExprBasic);
+
+    return parseMatchingPatternAsBinding(newPatternBindingState, varLoc,
+                                         isExprBasic);
   }
-  
+
   // matching-pattern ::= 'is' type
   if (Tok.is(tok::kw_is)) {
-    PatternCtx.setCreateSyntax(SyntaxKind::IsTypePattern);
     SourceLoc isLoc = consumeToken(tok::kw_is);
     ParserResult<TypeRepr> castType = parseType();
     if (castType.isNull() || castType.hasCodeCompletion())
@@ -1333,37 +1320,50 @@ ParserResult<Pattern> Parser::parseMatchingPattern(bool isExprBasic) {
   if (subExpr.isNull())
     return status;
 
-  if (SyntaxContext->isEnabled()) {
-    if (auto UPES = PatternCtx.popIf<ParsedUnresolvedPatternExprSyntax>()) {
-      PatternCtx.addSyntax(UPES->getDeferredPattern(SyntaxContext));
-    } else {
-      PatternCtx.setCreateSyntax(SyntaxKind::ExpressionPattern);
-    }
+  if (isa<CodeCompletionExpr>(subExpr.get()) && Tok.isFollowingLParen()) {
+    // We are in the case like the following of parsing a pattern with the code
+    // completion token as base and associated value matches:
+    // #^COMPLETE^#(let a)
+    // We will have not consumed the `(let a)` in `parseExprPostfixSuffix`
+    // because usually suffixes don't influence the code completion's type and
+    // the suffix might be unrelated. But the trailing `(let a)` that is left
+    // prevents us from forming a valid pattern.
+    // Consume and discard the `(let a)`, which just leaves us with the base
+    // of the pattern.
+    (void)parseExprCallSuffix(subExpr, isExprBasic);
   }
+
   // The most common case here is to parse something that was a lexically
   // obvious pattern, which will come back wrapped in an immediate
   // UnresolvedPatternExpr.  Transform this now to simplify later code.
   if (auto *UPE = dyn_cast<UnresolvedPatternExpr>(subExpr.get()))
     return makeParserResult(status, UPE->getSubPattern());
-  
-  return makeParserResult(status, new (Context) ExprPattern(subExpr.get()));
+
+  auto *EP = ExprPattern::createParsed(Context, subExpr.get(), CurDeclContext);
+  return makeParserResult(status, EP);
 }
 
-ParserResult<Pattern> Parser::parseMatchingPatternAsLetOrVar(bool isLet,
-                                                             SourceLoc varLoc,
-                                                             bool isExprBasic) {
-  // 'var' and 'let' patterns shouldn't nest.
-  if (InVarOrLetPattern == IVOLP_InLet ||
-      InVarOrLetPattern == IVOLP_InVar)
-    diagnose(varLoc, diag::var_pattern_in_var, unsigned(isLet));
-  
+ParserResult<Pattern>
+Parser::parseMatchingPatternAsBinding(PatternBindingState newState,
+                                      SourceLoc varLoc, bool isExprBasic) {
+  // 'var', 'let', 'inout' patterns shouldn't nest.
+  if (InBindingPattern.getIntroducer().hasValue()) {
+    auto diag = diag::var_pattern_in_var;
+    if (Context.LangOpts.hasFeature(Feature::ReferenceBindings))
+      diag = diag::var_pattern_in_var_inout;
+    diagnose(varLoc, diag,
+             *newState.getSelectIndexForIntroducer());
+  }
+
   // 'let' isn't valid inside an implicitly immutable context, but var is.
-  if (isLet && InVarOrLetPattern == IVOLP_ImplicitlyImmutable)
+  if (newState.isLet() &&
+      InBindingPattern == PatternBindingState::ImplicitlyImmutable)
     diagnose(varLoc, diag::let_pattern_in_immutable_context);
 
   // In our recursive parse, remember that we're in a var/let pattern.
-  llvm::SaveAndRestore<decltype(InVarOrLetPattern)>
-    T(InVarOrLetPattern, isLet ? IVOLP_InLet : IVOLP_InVar);
+  llvm::SaveAndRestore<decltype(InBindingPattern)> T(
+      InBindingPattern,
+      newState.getPatternBindingStateForIntroducer(VarDecl::Introducer::Var));
 
   // Reset async attribute in parser context.
   llvm::SaveAndRestore<bool> AsyncAttr(InPatternWithAsyncAttribute, false);
@@ -1371,13 +1371,16 @@ ParserResult<Pattern> Parser::parseMatchingPatternAsLetOrVar(bool isLet,
   ParserResult<Pattern> subPattern = parseMatchingPattern(isExprBasic);
   if (subPattern.isNull())
     return nullptr;
-  auto *varP = new (Context) BindingPattern(varLoc, isLet, subPattern.get());
+  auto *varP = new (Context) BindingPattern(
+      varLoc, newState.getIntroducer().getValueOr(VarDecl::Introducer::Var),
+      subPattern.get());
   return makeParserResult(ParserStatus(subPattern), varP);
 }
 
-
 bool Parser::isOnlyStartOfMatchingPattern() {
-  return Tok.isAny(tok::kw_var, tok::kw_let, tok::kw_is);
+  return Tok.isAny(tok::kw_var, tok::kw_let, tok::kw_is) ||
+         (Context.LangOpts.hasFeature(Feature::ReferenceBindings) &&
+          Tok.isAny(tok::kw_inout));
 }
 
 
@@ -1394,6 +1397,10 @@ static bool canParsePattern(Parser &P) {
   case tok::kw__:
     P.consumeToken();
     return true;
+  case tok::kw_inout:
+    if (!P.Context.LangOpts.hasFeature(Feature::ReferenceBindings))
+      return false;
+    LLVM_FALLTHROUGH;
   case tok::kw_let:
   case tok::kw_var:
     P.consumeToken();

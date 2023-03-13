@@ -53,6 +53,7 @@ enum ContextualTypePurpose : uint8_t {
   CTP_YieldByValue,     ///< By-value yield operand.
   CTP_YieldByReference, ///< By-reference yield operand.
   CTP_ThrowStmt,        ///< Value specified to a 'throw' statement.
+  CTP_ForgetStmt,        ///< Value specified to a 'forget' statement.
   CTP_EnumCaseRawValue, ///< Raw value specified for "case X = 42" in enum.
   CTP_DefaultParameter, ///< Default value in parameter 'foo(a : Int = 42)'.
 
@@ -85,6 +86,9 @@ enum ContextualTypePurpose : uint8_t {
   CTP_ComposedPropertyWrapper, ///< Composed wrapper type expected to match
                                ///< former 'wrappedValue' type
 
+  CTP_SingleValueStmtBranch, ///< The contextual type for a branch in a single
+                             ///< value statement expression.
+
   CTP_ExprPattern,      ///< `~=` operator application associated with expression
                         /// pattern.
 
@@ -95,6 +99,12 @@ namespace constraints {
 
 class ConstraintSystem;
 enum class ConversionRestrictionKind;
+
+/// The kind of SingleValueStmtExpr branch the locator identifies.
+enum class SingleValueStmtBranchKind {
+  Regular,
+  InSingleExprClosure
+};
 
 /// Locates a given constraint within the expression being
 /// type-checked, which may refer down into subexpressions and parts of
@@ -291,6 +301,17 @@ public:
 
   /// Determine whether this locator is for a result builder body result type.
   bool isForResultBuilderBodyResult() const;
+
+  /// Determine whether this locator is for a macro expansion.
+  bool isForMacroExpansion() const;
+
+  /// Whether this locator identifies a conjunction for the branches of a
+  /// SingleValueStmtExpr.
+  bool isForSingleValueStmtConjunction() const;
+
+  /// Whether this locator identifies a conversion for a SingleValueStmtExpr
+  /// branch, and if so, the kind of branch.
+  Optional<SingleValueStmtBranchKind> isForSingleValueStmtBranch() const;
 
   /// Determine whether this locator points directly to a given expression.
   template <typename E> bool directlyAt() const {
@@ -622,6 +643,20 @@ public:
   }
 };
 
+class LocatorPathElt::GenericType : public StoredPointerElement<TypeBase> {
+public:
+  GenericType(Type type)
+      : StoredPointerElement(PathElementKind::GenericType, type.getPointer()) {
+    assert(type->getDesugaredType()->is<BoundGenericType>());
+  }
+
+  Type getType() const { return getStoredPointer(); }
+
+  static bool classof(const LocatorPathElt *elt) {
+    return elt->getKind() == PathElementKind::GenericType;
+  }
+};
+
 /// Abstract superclass for any kind of tuple element.
 class LocatorPathElt::AnyTupleElement : public StoredIntegerElement<1> {
 protected:
@@ -880,6 +915,22 @@ public:
 
   static bool classof(const LocatorPathElt *elt) {
     return elt->getKind() == ConstraintLocator::TernaryBranch;
+  }
+};
+
+/// The branch of a SingleValueStmtExpr. Note the stored index corresponds to
+/// the expression branches, i.e it skips statement branch indices.
+class LocatorPathElt::SingleValueStmtBranch final
+    : public StoredIntegerElement<1> {
+public:
+  SingleValueStmtBranch(unsigned exprIdx)
+      : StoredIntegerElement(ConstraintLocator::SingleValueStmtBranch,
+                             exprIdx) {}
+
+  unsigned getExprBranchIndex() const { return getValue(); }
+
+  static bool classof(const LocatorPathElt *elt) {
+    return elt->getKind() == ConstraintLocator::SingleValueStmtBranch;
   }
 };
 

@@ -22,14 +22,16 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/Attr.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/Types.h"
 #include "swift/IRGen/Linking.h"
 #include "swift/SIL/TypeLowering.h"
 #include "llvm/ADT/SmallString.h"
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalVariable.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include "ConstantBuilder.h"
 #include "Explosion.h"
@@ -40,6 +42,7 @@
 #include "GenPointerAuth.h"
 #include "IRGenDebugInfo.h"
 #include "IRGenFunction.h"
+#include "IRGenMangler.h"
 #include "IRGenModule.h"
 #include "MetadataLayout.h"
 #include "StructLayout.h"
@@ -417,6 +420,23 @@ CanType irgen::getFormalTypeInPrimaryContext(CanType abstractType) {
   return abstractType;
 }
 
+SILType irgen::getLoweredTypeInPrimaryContext(IRGenModule &IGM,
+                                              CanType abstractType) {
+  if (auto boundGenericType = dyn_cast<BoundGenericType>(abstractType)) {
+    CanType concreteFormalType = getFormalTypeInPrimaryContext(abstractType);
+
+    auto concreteLoweredType = IGM.getLoweredType(concreteFormalType);
+    const auto *boundConcreteTI = &IGM.getTypeInfo(concreteLoweredType);
+    auto packing = boundConcreteTI->getFixedPacking(IGM);
+
+    abstractType =
+        boundGenericType->getDecl()->getDeclaredType()->getCanonicalType();
+  }
+  CanType concreteFormalType = getFormalTypeInPrimaryContext(abstractType);
+
+  return IGM.getLoweredType(concreteFormalType);
+}
+
 void irgen::getArgAsLocalSelfTypeMetadata(IRGenFunction &IGF, llvm::Value *arg,
                                           CanType abstractType) {
   assert(arg->getType() == IGF.IGM.TypeMetadataPtrTy &&
@@ -440,7 +460,8 @@ conditionallyGetTypeLayoutEntry(IRGenModule &IGM, SILType concreteType) {
   if (!IGM.getOptions().UseTypeLayoutValueHandling)
     return nullptr;
 
-  auto &typeLayoutEntry = IGM.getTypeLayoutEntry(concreteType);
+  auto &typeLayoutEntry = IGM.getTypeLayoutEntry(
+    concreteType, IGM.getOptions().ForceStructTypeLayouts);
 
   // Don't use type layout based generation for layouts that contain a resilient
   // field but no archetype. We don't expect a speedup by using type layout
@@ -482,7 +503,6 @@ static void buildValueWitnessFunction(IRGenModule &IGM,
     Address dest = getArgAs(IGF, argv, type, "dest");
     Address src = getArgAs(IGF, argv, type, "src");
     getArgAsLocalSelfTypeMetadata(IGF, argv, abstractType);
-
     if (auto *typeLayoutEntry =
             conditionallyGetTypeLayoutEntry(IGM, concreteType)) {
       typeLayoutEntry->assignWithCopy(IGF, dest, src);
@@ -711,6 +731,17 @@ static llvm::Constant *getNoOpVoidFunction(IRGenModule &IGM) {
   });
 }
 
+/// Return a function that traps because of an attempt to copy a noncopyable
+/// type.
+static llvm::Constant *getNoncopyableTrapFunction(IRGenModule &IGM) {
+  return IGM.getOrCreateHelperFunction("__swift_cannot_copy_noncopyable_type",
+                                       IGM.VoidTy, {},
+                                       [&](IRGenFunction &IGF) {
+    IGF.Builder.CreateNonMergeableTrap(IGM, "attempt to copy a value of a type that cannot be copied");
+    IGF.Builder.CreateUnreachable();
+  });
+}
+
 /// Return a function which takes three pointer arguments and does a
 /// retaining assignWithCopy on the first two: it loads a pointer from
 /// the second, retains it, loads a pointer from the first, stores the
@@ -848,7 +879,8 @@ ValueWitnessFlags getValueWitnessFlags(const TypeInfo *TI, SILType concreteType,
         fixedTI->isBitwiseTakable(ResilienceExpansion::Maximal);
     assert(isBitwiseTakable || !isInline);
     flags = flags.withAlignment(fixedTI->getFixedAlignment().getValue())
-                .withPOD(fixedTI->isPOD(ResilienceExpansion::Maximal))
+                .withPOD(fixedTI->isTriviallyDestroyable(ResilienceExpansion::Maximal))
+                .withCopyable(fixedTI->isCopyable(ResilienceExpansion::Maximal))
                 .withInlineStorage(isInline)
                 .withBitwiseTakable(isBitwiseTakable);
   } else {
@@ -885,6 +917,45 @@ void addStride(ConstantStructBuilder &B, const TypeInfo *TI, IRGenModule &IGM) {
 }
 } // end anonymous namespace
 
+bool isRuntimeInstatiatedLayoutString(IRGenModule &IGM,
+                                      const TypeLayoutEntry *typeLayoutEntry) {
+  if (IGM.Context.LangOpts.hasFeature(Feature::LayoutStringValueWitnesses) &&
+      IGM.Context.LangOpts.hasFeature(
+          Feature::LayoutStringValueWitnessesInstantiation)) {
+    return (typeLayoutEntry->isAlignedGroup() &&
+            !typeLayoutEntry->isFixedSize(IGM));
+  }
+
+  return false;
+}
+
+static bool
+valueWitnessRequiresCopyability(ValueWitness index) {
+  switch (index) {
+  case ValueWitness::InitializeBufferWithCopyOfBuffer:
+  case ValueWitness::InitializeWithCopy:
+  case ValueWitness::AssignWithCopy:
+    return true;
+  
+  case ValueWitness::Destroy:
+  case ValueWitness::InitializeWithTake:
+  case ValueWitness::AssignWithTake:
+  case ValueWitness::GetEnumTagSinglePayload:
+  case ValueWitness::StoreEnumTagSinglePayload:
+  case ValueWitness::Size:
+  case ValueWitness::Stride:
+  case ValueWitness::Flags:
+  case ValueWitness::ExtraInhabitantCount:
+  case ValueWitness::GetEnumTag:
+  case ValueWitness::DestructiveProjectEnumData:
+  case ValueWitness::DestructiveInjectEnumTag:
+    return false;
+  }
+  llvm_unreachable("not all value witnesses covered");
+}
+
+
+
 /// Find a witness to the fact that a type is a value type.
 /// Always adds an i8*.
 static void addValueWitness(IRGenModule &IGM, ConstantStructBuilder &B,
@@ -898,19 +969,40 @@ static void addValueWitness(IRGenModule &IGM, ConstantStructBuilder &B,
     B.addSignedPointer(fn, IGM.getOptions().PointerAuth.ValueWitnesses, index);
   };
 
+  // Copyable and noncopyable types share a value witness table layout. It
+  // should normally be statically impossible to generate a call to a copy
+  // value witness, but if somebody manages to dynamically get hold of metadata
+  // for a noncopyable type, and tries to use it to copy values of that type,
+  // we should trap to prevent the attempt.
+  if (!concreteTI.isCopyable(ResilienceExpansion::Maximal)
+      && valueWitnessRequiresCopyability(index)) {
+    return addFunction(getNoncopyableTrapFunction(IGM));
+  }
+
   // Try to use a standard function.
   switch (index) {
   case ValueWitness::Destroy:
-    if (concreteTI.isPOD(ResilienceExpansion::Maximal)) {
+    if (concreteTI.isTriviallyDestroyable(ResilienceExpansion::Maximal)) {
       return addFunction(getNoOpVoidFunction(IGM));
     } else if (concreteTI.isSingleSwiftRetainablePointer(ResilienceExpansion::Maximal)) {
       return addFunction(getDestroyStrongFunction(IGM));
+    } else if (IGM.Context.LangOpts.hasFeature(Feature::LayoutStringValueWitnesses)) {
+      if (auto *typeLayoutEntry =
+            concreteTI.buildTypeLayoutEntry(IGM, concreteType,
+                                            /*useStructLayouts*/true)) {
+        auto genericSig = concreteType.getNominalOrBoundGenericNominal()
+                              ->getGenericSignature();
+        if (typeLayoutEntry->layoutString(IGM, genericSig) ||
+            isRuntimeInstatiatedLayoutString(IGM, typeLayoutEntry)) {
+          return addFunction(IGM.getGenericDestroyFn());
+        }
+      }
     }
     goto standard;
 
   case ValueWitness::InitializeBufferWithCopyOfBuffer:
     if (packing == FixedPacking::OffsetZero) {
-      if (concreteTI.isPOD(ResilienceExpansion::Maximal)) {
+      if (concreteTI.isTriviallyDestroyable(ResilienceExpansion::Maximal)) {
         return addFunction(getMemCpyFunction(IGM, concreteTI));
       } else if (concreteTI.isSingleSwiftRetainablePointer(ResilienceExpansion::Maximal)) {
         return addFunction(getInitWithCopyStrongFunction(IGM));
@@ -921,30 +1013,74 @@ static void addValueWitness(IRGenModule &IGM, ConstantStructBuilder &B,
   case ValueWitness::InitializeWithTake:
     if (concreteTI.isBitwiseTakable(ResilienceExpansion::Maximal)) {
       return addFunction(getMemCpyFunction(IGM, concreteTI));
+    } else if (IGM.Context.LangOpts.hasFeature(Feature::LayoutStringValueWitnesses)) {
+      if (auto *typeLayoutEntry =
+            concreteTI.buildTypeLayoutEntry(IGM, concreteType,
+                                            /*useStructLayouts*/true)) {
+        auto genericSig = concreteType.getNominalOrBoundGenericNominal()
+                              ->getGenericSignature();
+        if (typeLayoutEntry->layoutString(IGM, genericSig) ||
+            isRuntimeInstatiatedLayoutString(IGM, typeLayoutEntry)) {
+          return addFunction(IGM.getGenericInitWithTakeFn());
+        }
+      }
     }
     goto standard;
 
   case ValueWitness::AssignWithCopy:
-    if (concreteTI.isPOD(ResilienceExpansion::Maximal)) {
+    if (concreteTI.isTriviallyDestroyable(ResilienceExpansion::Maximal)) {
       return addFunction(getMemCpyFunction(IGM, concreteTI));
     } else if (concreteTI.isSingleSwiftRetainablePointer(ResilienceExpansion::Maximal)) {
       return addFunction(getAssignWithCopyStrongFunction(IGM));
+    } else if (IGM.Context.LangOpts.hasFeature(Feature::LayoutStringValueWitnesses)) {
+      if (auto *typeLayoutEntry =
+            concreteTI.buildTypeLayoutEntry(IGM, concreteType,
+                                            /*useStructLayouts*/true)) {
+        auto genericSig = concreteType.getNominalOrBoundGenericNominal()
+                              ->getGenericSignature();
+        if (typeLayoutEntry->layoutString(IGM, genericSig) ||
+            isRuntimeInstatiatedLayoutString(IGM, typeLayoutEntry)) {
+          return addFunction(IGM.getGenericAssignWithCopyFn());
+        }
+      }
     }
     goto standard;
 
   case ValueWitness::AssignWithTake:
-    if (concreteTI.isPOD(ResilienceExpansion::Maximal)) {
+    if (concreteTI.isTriviallyDestroyable(ResilienceExpansion::Maximal)) {
       return addFunction(getMemCpyFunction(IGM, concreteTI));
     } else if (concreteTI.isSingleSwiftRetainablePointer(ResilienceExpansion::Maximal)) {
       return addFunction(getAssignWithTakeStrongFunction(IGM));
+    } else if (IGM.Context.LangOpts.hasFeature(Feature::LayoutStringValueWitnesses)) {
+      if (auto *typeLayoutEntry =
+            concreteTI.buildTypeLayoutEntry(IGM, concreteType,
+                                            /*useStructLayouts*/true)) {
+        auto genericSig = concreteType.getNominalOrBoundGenericNominal()
+                              ->getGenericSignature();
+        if (typeLayoutEntry->layoutString(IGM, genericSig) ||
+            isRuntimeInstatiatedLayoutString(IGM, typeLayoutEntry)) {
+          return addFunction(IGM.getGenericAssignWithTakeFn());
+        }
+      }
     }
     goto standard;
 
   case ValueWitness::InitializeWithCopy:
-    if (concreteTI.isPOD(ResilienceExpansion::Maximal)) {
+    if (concreteTI.isTriviallyDestroyable(ResilienceExpansion::Maximal)) {
       return addFunction(getMemCpyFunction(IGM, concreteTI));
     } else if (concreteTI.isSingleSwiftRetainablePointer(ResilienceExpansion::Maximal)) {
       return addFunction(getInitWithCopyStrongFunction(IGM));
+    } else if (IGM.Context.LangOpts.hasFeature(Feature::LayoutStringValueWitnesses)) {
+      if (auto *typeLayoutEntry =
+            concreteTI.buildTypeLayoutEntry(IGM, concreteType,
+                                            /*useStructLayouts*/true)) {
+        auto genericSig = concreteType.getNominalOrBoundGenericNominal()
+                              ->getGenericSignature();
+        if (typeLayoutEntry->layoutString(IGM, genericSig) ||
+            isRuntimeInstatiatedLayoutString(IGM, typeLayoutEntry)) {
+          return addFunction(IGM.getGenericInitWithCopyFn());
+        }
+      }
     }
     goto standard;
 
@@ -1116,6 +1252,11 @@ getAddrOfKnownValueWitnessTable(IRGenModule &IGM, CanType type,
   
   auto &ti = IGM.getTypeInfoForUnlowered(AbstractionPattern::getOpaque(), type);
 
+    // We only have known value witness tables for copyable types currently.
+  if (!ti.isCopyable(ResilienceExpansion::Maximal)) {
+    return {};
+  }
+  
   // We only have witnesses for fixed type info.
   auto *fixedTI = dyn_cast<FixedTypeInfo>(&ti);
   if (!fixedTI)
@@ -1128,7 +1269,7 @@ getAddrOfKnownValueWitnessTable(IRGenModule &IGM, CanType type,
   if (ti.isKnownEmpty(ResilienceExpansion::Maximal)) {
     witnessSurrogate = TupleType::getEmpty(C);
   // Handle common POD type layouts.
-  } else if (fixedTI->isPOD(ResilienceExpansion::Maximal)
+  } else if (fixedTI->isTriviallyDestroyable(ResilienceExpansion::Maximal)
       && fixedTI->getFixedExtraInhabitantCount(IGM) == 0) {
     // Reuse one of the integer witnesses if applicable.
     switch (sizeAndAlignment(fixedTI->getFixedSize(),
@@ -1248,7 +1389,7 @@ llvm::Constant *IRGenModule::emitFixedTypeLayout(CanType t,
   unsigned size = ti.getFixedSize().getValue();
   unsigned align = ti.getFixedAlignment().getValue();
 
-  bool pod = ti.isPOD(ResilienceExpansion::Maximal);
+  bool pod = ti.isTriviallyDestroyable(ResilienceExpansion::Maximal);
   bool bt = ti.isBitwiseTakable(ResilienceExpansion::Maximal);
   unsigned numExtraInhabitants = ti.getFixedExtraInhabitantCount(*this);
 
@@ -1354,7 +1495,7 @@ bool TypeInfo::canValueWitnessExtraInhabitantsUpTo(IRGenModule &IGM,
                                                    unsigned index) const {
   // If this type is POD, then its value witnesses are trivial, so can handle
   // any bit pattern.
-  if (isPOD(ResilienceExpansion::Maximal)) {
+  if (isTriviallyDestroyable(ResilienceExpansion::Maximal)) {
     return true;
   }
   
@@ -1421,7 +1562,7 @@ Address TypeInfo::roundUpToTypeAlignment(IRGenFunction &IGF, Address base,
 
 void TypeInfo::destroyArray(IRGenFunction &IGF, Address array,
                             llvm::Value *count, SILType T) const {
-  if (isPOD(ResilienceExpansion::Maximal))
+  if (isTriviallyDestroyable(ResilienceExpansion::Maximal))
     return;
 
  emitDestroyArrayCall(IGF, T, array, count);
@@ -1430,7 +1571,7 @@ void TypeInfo::destroyArray(IRGenFunction &IGF, Address array,
 void TypeInfo::initializeArrayWithCopy(IRGenFunction &IGF,
                                        Address dest, Address src,
                                        llvm::Value *count, SILType T) const {
-  if (isPOD(ResilienceExpansion::Maximal)) {
+  if (isTriviallyDestroyable(ResilienceExpansion::Maximal)) {
     llvm::Value *stride = getStride(IGF, T);
     llvm::Value *byteCount = IGF.Builder.CreateNUWMul(stride, count);
     IGF.Builder.CreateMemCpy(
@@ -1496,7 +1637,7 @@ const {
 void TypeInfo::assignArrayWithCopyNoAlias(IRGenFunction &IGF, Address dest,
                                           Address src, llvm::Value *count,
                                           SILType T) const {
-  if (isPOD(ResilienceExpansion::Maximal)) {
+  if (isTriviallyDestroyable(ResilienceExpansion::Maximal)) {
     llvm::Value *stride = getStride(IGF, T);
     llvm::Value *byteCount = IGF.Builder.CreateNUWMul(stride, count);
     IGF.Builder.CreateMemCpy(
@@ -1512,7 +1653,7 @@ void TypeInfo::assignArrayWithCopyNoAlias(IRGenFunction &IGF, Address dest,
 void TypeInfo::assignArrayWithCopyFrontToBack(IRGenFunction &IGF, Address dest,
                                               Address src, llvm::Value *count,
                                               SILType T) const {
-  if (isPOD(ResilienceExpansion::Maximal)) {
+  if (isTriviallyDestroyable(ResilienceExpansion::Maximal)) {
     llvm::Value *stride = getStride(IGF, T);
     llvm::Value *byteCount = IGF.Builder.CreateNUWMul(stride, count);
     IGF.Builder.CreateMemMove(
@@ -1528,7 +1669,7 @@ void TypeInfo::assignArrayWithCopyFrontToBack(IRGenFunction &IGF, Address dest,
 void TypeInfo::assignArrayWithCopyBackToFront(IRGenFunction &IGF, Address dest,
                                               Address src, llvm::Value *count,
                                               SILType T) const {
-  if (isPOD(ResilienceExpansion::Maximal)) {
+  if (isTriviallyDestroyable(ResilienceExpansion::Maximal)) {
     llvm::Value *stride = getStride(IGF, T);
     llvm::Value *byteCount = IGF.Builder.CreateNUWMul(stride, count);
     IGF.Builder.CreateMemMove(
@@ -1544,7 +1685,7 @@ void TypeInfo::assignArrayWithCopyBackToFront(IRGenFunction &IGF, Address dest,
 void TypeInfo::assignArrayWithTake(IRGenFunction &IGF, Address dest,
                                               Address src, llvm::Value *count,
                                               SILType T) const {
-  if (isPOD(ResilienceExpansion::Maximal)) {
+  if (isTriviallyDestroyable(ResilienceExpansion::Maximal)) {
     llvm::Value *stride = getStride(IGF, T);
     llvm::Value *byteCount = IGF.Builder.CreateNUWMul(stride, count);
     IGF.Builder.CreateMemCpy(

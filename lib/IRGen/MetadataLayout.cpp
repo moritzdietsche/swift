@@ -70,7 +70,7 @@ public:
   }
 
   MetadataSize getMetadataSize() const {
-    assert(AddressPoint.hasValue() && !AddressPoint->isInvalid()
+    assert(AddressPoint.has_value() && !AddressPoint->isInvalid()
            && "did not find address point?!");
     assert(*AddressPoint < this->NextOffset
            && "address point is after end?!");
@@ -217,9 +217,23 @@ llvm::Value *irgen::emitArgumentMetadataRef(IRGenFunction &IGF,
                                       const GenericTypeRequirements &reqts,
                                             unsigned reqtIndex,
                                             llvm::Value *metadata) {
-  assert(reqts.getRequirements()[reqtIndex].Protocol == nullptr);
+  assert(reqts.getRequirements()[reqtIndex].getKind()
+           == GenericRequirement::Kind::Metadata);
   return emitLoadOfGenericRequirement(IGF, metadata, decl, reqtIndex,
                                       IGF.IGM.TypeMetadataPtrTy);
+}
+
+/// Given a reference to nominal type metadata of the given type,
+/// derive a reference to the nth argument metadata pack.  The type must
+/// have generic arguments.
+llvm::Value *irgen::emitArgumentMetadataPackRef(IRGenFunction &IGF,
+                                                NominalTypeDecl *decl,
+                                      const GenericTypeRequirements &reqts,
+                                                unsigned reqtIndex,
+                                                llvm::Value *metadata) {
+  assert(reqts.getRequirements()[reqtIndex].isMetadataPack());
+  return emitLoadOfGenericRequirement(IGF, metadata, decl, reqtIndex,
+                                      IGF.IGM.TypeMetadataPtrPtrTy);
 }
 
 /// Given a reference to nominal type metadata of the given type,
@@ -230,9 +244,36 @@ llvm::Value *irgen::emitArgumentWitnessTableRef(IRGenFunction &IGF,
                                           const GenericTypeRequirements &reqts,
                                                 unsigned reqtIndex,
                                                 llvm::Value *metadata) {
-  assert(reqts.getRequirements()[reqtIndex].Protocol != nullptr);
+  assert(reqts.getRequirements()[reqtIndex].getKind()
+           == GenericRequirement::Kind::WitnessTable);
   return emitLoadOfGenericRequirement(IGF, metadata, decl, reqtIndex,
                                       IGF.IGM.WitnessTablePtrTy);
+}
+
+/// Given a reference to nominal type metadata of the given type,
+/// derive a reference to a protocol witness table pack for the nth
+/// argument metadata.  The type must have generic arguments.
+llvm::Value *irgen::emitArgumentWitnessTablePackRef(IRGenFunction &IGF,
+                                                    NominalTypeDecl *decl,
+                                          const GenericTypeRequirements &reqts,
+                                                    unsigned reqtIndex,
+                                                    llvm::Value *metadata) {
+  assert(reqts.getRequirements()[reqtIndex].isWitnessTablePack());
+  return emitLoadOfGenericRequirement(IGF, metadata, decl, reqtIndex,
+                                      IGF.IGM.WitnessTablePtrPtrTy);
+}
+
+/// Given a reference to nominal type metadata of the given type,
+/// derive a reference to the pack shape for the nth argument
+/// metadata.  The type must have generic arguments.
+llvm::Value *irgen::emitArgumentPackShapeRef(IRGenFunction &IGF,
+                                             NominalTypeDecl *decl,
+                                       const GenericTypeRequirements &reqts,
+                                             unsigned reqtIndex,
+                                             llvm::Value *metadata) {
+  assert(reqts.getRequirements()[reqtIndex].isShape());
+  return emitLoadOfGenericRequirement(IGF, metadata, decl, reqtIndex,
+                                      IGF.IGM.SizeTy);
 }
 
 Address irgen::emitAddressOfFieldOffsetVector(IRGenFunction &IGF,
@@ -317,20 +358,12 @@ ClassMetadataLayout::ClassMetadataLayout(IRGenModule &IGM, ClassDecl *decl)
       super::noteStartOfGenericRequirements(forClass);
     }
 
-    void addGenericWitnessTable(GenericRequirement requirement,
-                                ClassDecl *forClass) {
+    void addGenericRequirement(GenericRequirement requirement,
+                               ClassDecl *forClass) {
       if (forClass == Target) {
         ++Layout.NumImmediateMembers;
       }
-      super::addGenericWitnessTable(requirement, forClass);
-    }
-
-    void addGenericArgument(GenericRequirement requirement,
-                            ClassDecl *forClass) {
-      if (forClass == Target) {
-        ++Layout.NumImmediateMembers;
-      }
-      super::addGenericArgument(requirement, forClass);
+      super::addGenericRequirement(requirement, forClass);
     }
 
     void addReifiedVTableEntry(SILDeclRef fn) {

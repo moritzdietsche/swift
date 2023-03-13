@@ -45,6 +45,9 @@ enum class RestrictedImportKind {
   None // No restriction, i.e. the module is imported publicly.
 };
 
+/// Import that limits the access level of imported entities.
+using ImportAccessLevel = Optional<AttributedImport<ImportedModule>>;
+
 /// A file containing Swift source code.
 ///
 /// This is a .swift or .sil file (or a virtual file, such as the contents of
@@ -78,18 +81,15 @@ public:
     /// and the associated language option.
     DisablePoundIfEvaluation = 1 << 1,
 
-    /// Whether to build a syntax tree.
-    BuildSyntaxTree = 1 << 2,
-
     /// Whether to save the file's parsed tokens.
-    CollectParsedTokens = 1 << 3,
+    CollectParsedTokens = 1 << 2,
 
     /// Whether to compute the interface hash of the file.
-    EnableInterfaceHash = 1 << 4,
+    EnableInterfaceHash = 1 << 3,
 
     /// Whether to suppress warnings when parsing. This is set for secondary
     /// files, as they get parsed multiple times.
-    SuppressWarnings = 1 << 5,
+    SuppressWarnings = 1 << 4,
   };
   using ParsingOptions = OptionSet<ParsingFlags>;
 
@@ -146,12 +146,23 @@ private:
   /// The scope map that describes this source file.
   NullablePtr<ASTScope> Scope = nullptr;
 
+   /// The set of parsed decls with opaque return types that have not yet
+   /// been validated.
+   llvm::SetVector<ValueDecl *> UnvalidatedDeclsWithOpaqueReturnTypes;
+  
   /// The set of validated opaque return type decls in the source file.
   llvm::SmallVector<OpaqueTypeDecl *, 4> OpaqueReturnTypes;
   llvm::StringMap<OpaqueTypeDecl *> ValidatedOpaqueReturnTypes;
-  /// The set of parsed decls with opaque return types that have not yet
-  /// been validated.
-  llvm::SetVector<ValueDecl *> UnvalidatedDeclsWithOpaqueReturnTypes;
+  /// The set of opaque type decls that have not yet been validated.
+  ///
+  /// \note This is populated as opaque type decls are created. Validation
+  /// requires mangling the naming decl, which would lead to circularity
+  /// if it were done from OpaqueResultTypeRequest.
+  llvm::SetVector<OpaqueTypeDecl *> UnvalidatedOpaqueReturnTypes;
+
+  /// The set of declarations with valid runtime discoverable attributes
+  /// located in the source file.
+  llvm::SetVector<ValueDecl *> DeclsWithRuntimeDiscoverableAttrs;
 
   /// The list of top-level items in the source file. This is \c None if
   /// they have not yet been parsed.
@@ -197,15 +208,6 @@ private:
   friend ASTContext;
 
 public:
-  /// For source files created to hold the source code created by expanding
-  /// a macro, this is the AST node that describes the macro expansion.
-  ///
-  /// The source location of this AST node is the place in the source that
-  /// triggered the creation of the macro expansion whose resulting source
-  /// code is in this source file. This field is only valid when
-  /// the \c SourceFileKind is \c MacroExpansion.
-  const ASTNode macroExpansion;
-
   /// Appends the given declaration to the end of the top-level decls list. Do
   /// not add any additional uses of this function.
   void addTopLevelDecl(Decl *d);
@@ -221,6 +223,10 @@ public:
   /// Add a hoisted declaration. See Decl::isHoisted().
   void addHoistedDecl(Decl *d);
 
+  /// Add a declaration with any number of runtime disoverable attributes
+  /// associated with it.
+  void addDeclWithRuntimeDiscoverableAttrs(ValueDecl *);
+
   /// Retrieves an immutable view of the list of top-level items in this file.
   ArrayRef<ASTNode> getTopLevelItems() const;
 
@@ -232,6 +238,10 @@ public:
   /// Retrieves an immutable view of the list of hoisted decls in this file.
   /// See Decl::isHoisted().
   ArrayRef<Decl *> getHoistedDecls() const;
+
+  /// Retrieves an immutable view of the set of all declaration with runtime
+  /// discoverable attributes located in this file.
+  ArrayRef<ValueDecl *> getDeclsWithRuntimeDiscoverableAttrs() const;
 
   /// Retrieves an immutable view of the top-level items if they have already
   /// been parsed, or \c None if they haven't. Should only be used for dumping.
@@ -247,10 +257,6 @@ public:
   /// Whether this source file is a primary file, meaning that we're generating
   /// code for it. Note this method returns \c false in WMO.
   bool isPrimary() const { return IsPrimary; }
-
-  /// A cache of syntax nodes that can be reused when creating the syntax tree
-  /// for this file.
-  swift::SyntaxParsingCache *SyntaxParsingCache = nullptr;
 
   /// The list of local type declarations in the source file.
   llvm::SetVector<TypeDecl *> LocalTypeDecls;
@@ -334,13 +340,12 @@ public:
   llvm::StringMap<SourceFilePathInfo> getInfoForUsedFilePaths() const;
 
   SourceFile(ModuleDecl &M, SourceFileKind K, Optional<unsigned> bufferID,
-             ParsingOptions parsingOpts = {}, bool isPrimary = false,
-             ASTNode macroExpansion = ASTNode());
+             ParsingOptions parsingOpts = {}, bool isPrimary = false);
 
   ~SourceFile();
 
   bool hasImports() const {
-    return Imports.hasValue();
+    return Imports.has_value();
   }
 
   /// Retrieve an immutable view of the source file's imports.
@@ -379,6 +384,10 @@ public:
 
   /// Get the most permissive restriction applied to the imports of \p module.
   RestrictedImportKind getRestrictedImportKind(const ModuleDecl *module) const;
+
+  /// Return the import of \p targetModule from this file with the most
+  /// permissive access level.
+  ImportAccessLevel getImportAccessLevel(const ModuleDecl *targetModule) const;
 
   /// Find all SPI names imported from \p importedModule by this file,
   /// collecting the identifiers in \p spiGroups.
@@ -495,6 +504,33 @@ public:
       return None;
     return BufferID;
   }
+
+  /// For source files created to hold the source code created by expanding
+  /// a macro, this is the AST node that describes the macro expansion.
+  ///
+  /// The source location of this AST node is the place in the source that
+  /// triggered the creation of the macro expansion whose resulting source
+  /// code is in this source file. This will only produce a non-null value when
+  /// the \c SourceFileKind is \c MacroExpansion.
+  ASTNode getMacroExpansion() const;
+
+  /// For source files created to hold the source code created by expanding
+  /// an attached macro, this is the custom attribute that describes the macro
+  /// expansion.
+  ///
+  /// The source location of this attribute is the place in the source that
+  /// triggered the creation of the macro expansion whose resulting source
+  /// code is in this source file. This will only produce a non-null value when
+  /// the \c SourceFileKind is \c MacroExpansion , and the macro is an attached
+  /// macro.
+  CustomAttr *getAttachedMacroAttribute() const;
+
+  /// For source files created to hold the source code created by expanding
+  /// an attached macro, this is the macro role that the expansion fulfills.
+  ///
+  /// \Returns the fulfilled macro role, or \c None if this source file is not
+  /// for a macro expansion.
+  Optional<MacroRole> getFulfilledMacroRole() const;
 
   /// When this source file is enclosed within another source file, for example
   /// because it describes a macro expansion, return the source file it was
@@ -633,13 +669,9 @@ public:
   /// them to be accessed from \c getAllTokens.
   bool shouldCollectTokens() const;
 
-  bool shouldBuildSyntaxTree() const;
-
   /// Whether the bodies of types and functions within this file can be lazily
   /// parsed.
   bool hasDelayedBodyParsing() const;
-
-  syntax::SourceFileSyntax getSyntaxRoot() const;
 
   OpaqueTypeDecl *lookupOpaqueResultType(StringRef MangledName) override;
 
@@ -648,6 +680,10 @@ public:
   /// to something that won't be in the ASTScope tree.
   void addUnvalidatedDeclWithOpaqueResultType(ValueDecl *vd) {
     UnvalidatedDeclsWithOpaqueReturnTypes.insert(vd);
+  }
+
+  void addOpaqueResultTypeDecl(OpaqueTypeDecl *decl) {
+    UnvalidatedOpaqueReturnTypes.insert(decl);
   }
 
   ArrayRef<OpaqueTypeDecl *> getOpaqueReturnTypeDecls();
@@ -660,9 +696,6 @@ private:
   /// If not \c None, the underlying vector contains the parsed tokens of this
   /// source file.
   Optional<ArrayRef<Token>> AllCollectedTokens;
-
-  /// The root of the syntax tree representing the source file.
-  std::unique_ptr<syntax::SourceFileSyntax> SyntaxRoot;
 };
 
 inline SourceFile::ParsingOptions operator|(SourceFile::ParsingFlags lhs,

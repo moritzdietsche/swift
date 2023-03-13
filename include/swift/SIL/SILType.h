@@ -50,6 +50,7 @@ namespace swift {
 /// this is the task of the type visitor invoking it.
 /// \returns The found opened archetype or empty type otherwise.
 CanOpenedArchetypeType getOpenedArchetypeOf(CanType Ty);
+CanLocalArchetypeType getLocalArchetypeOf(CanType Ty);
 
 /// How an existential type container is represented.
 enum class ExistentialRepresentation {
@@ -404,6 +405,12 @@ public:
   bool hasOpenedExistential() const {
     return getASTType()->hasOpenedExistential();
   }
+
+  /// Returns true if the referenced type is expressed in terms of one
+  /// or more local archetypes.
+  bool hasLocalArchetype() const {
+    return getASTType()->hasLocalArchetype();
+  }
   
   /// Returns the representation used by an existential type. If the concrete
   /// type is provided, this may return a specialized representation kind that
@@ -441,6 +448,13 @@ public:
   /// True if the type is a class type or class metatype type.
   bool isClassOrClassMetatype() {
     return isObject() && isClassOrClassMetatype(getASTType());
+  }
+
+  bool isFunctionTypeWithContext() const {
+    if (auto *fTy = getASTType()->getAs<SILFunctionType>()) {
+      return fTy->getExtInfo().hasContext();
+    }
+    return false;
   }
 
   /// True if the type involves any archetypes.
@@ -494,6 +508,8 @@ public:
   SILType getFieldType(VarDecl *field, SILModule &M,
                        TypeExpansionContext context) const;
 
+  SILType getFieldType(VarDecl *field, SILFunction *fn) const;
+
   /// Given that this is an enum type, return the lowered type of the
   /// data for the given element.  Applies substitutions as necessary.
   /// The result will have the same value category as the base type.
@@ -519,6 +535,14 @@ public:
   /// category as the base type.
   SILType getTupleElementType(unsigned index) const {
     return SILType(castTo<TupleType>().getElementType(index), getCategory());
+  }
+
+  /// Given that this is a pack expansion type, return the lowered type
+  /// of the pattern type.  The result will have the same value category
+  /// as the base type.
+  SILType getPackExpansionPatternType() const {
+    return SILType(castTo<PackExpansionType>().getPatternType(),
+                   getCategory());
   }
 
   /// Return the immediate superclass type of this type, or null if
@@ -628,7 +652,7 @@ public:
 
   /// Returns true if and only if this type is a first class move only
   /// type. NOTE: Returns false if the type is a move only wrapped type.
-  bool isMoveOnlyType() const;
+  bool isMoveOnlyNominalType() const;
 
   /// Returns true if this SILType is a move only wrapper type.
   ///
@@ -692,7 +716,7 @@ public:
   ///
   /// \p field Return the type of the ith field of the box. Default set to 0
   /// since we only support one field today. This is just future proofing.
-  SILType getSILBoxFieldType(const SILFunction *f, unsigned field = 0);
+  SILType getSILBoxFieldType(const SILFunction *f, unsigned field = 0) const;
 
   /// Returns the hash code for the SILType.
   llvm::hash_code getHashCode() const {
@@ -704,6 +728,17 @@ public:
   /// type of its field, which it is guaranteed to have identical layout to.
   SILType getSingletonAggregateFieldType(SILModule &M,
                                          ResilienceExpansion expansion) const;
+
+  /// \returns true if this is a SILBoxType containing a noncopyable type.
+  bool isBoxedNonCopyableType(const SILFunction *fn) const {
+    if (!this->is<SILBoxType>())
+      return false;
+    return getSILBoxFieldType(fn).isMoveOnly();
+  }
+
+  bool isBoxedNonCopyableType(const SILFunction &fn) const {
+    return isBoxedNonCopyableType(&fn);
+  }
 
   //
   // Accessors for types used in SIL instructions:
@@ -733,6 +768,9 @@ public:
 
   /// Get the SIL token type.
   static SILType getSILTokenType(const ASTContext &C);
+
+  /// Get the type for pack indexes.
+  static SILType getPackIndexType(const ASTContext &C);
 
   /// Return '()'
   static SILType getEmptyTupleType(const ASTContext &C);
@@ -791,6 +829,13 @@ inline llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, SILType T) {
 
 inline SILType SILBlockStorageType::getCaptureAddressType() const {
   return SILType::getPrimitiveAddressType(getCaptureType());
+}
+
+inline SILType SILPackType::getSILElementType(unsigned index) const {
+  return SILType::getPrimitiveType(getElementType(index),
+                                   isElementAddress()
+                                     ? SILValueCategory::Address
+                                     : SILValueCategory::Object);
 }
 
 /// The hash of a SILType is the hash of its opaque value.

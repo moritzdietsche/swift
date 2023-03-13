@@ -51,6 +51,7 @@
 #include "ProtocolInfo.h"
 #include "ResilientTypeInfo.h"
 #include "TypeInfo.h"
+#include "TypeLayout.h"
 
 using namespace swift;
 using namespace irgen;
@@ -59,6 +60,8 @@ MetadataResponse
 irgen::emitArchetypeTypeMetadataRef(IRGenFunction &IGF,
                                     CanArchetypeType archetype,
                                     DynamicMetadataRequest request) {
+  assert(!isa<PackArchetypeType>(archetype));
+
   // Check for an existing cache entry.
   if (auto response = IGF.tryGetLocalTypeMetadata(archetype, request))
     return response;
@@ -99,7 +102,7 @@ class OpaqueArchetypeTypeInfo
   : public ResilientTypeInfo<OpaqueArchetypeTypeInfo>
 {
   OpaqueArchetypeTypeInfo(llvm::Type *type, IsABIAccessible_t abiAccessible)
-      : ResilientTypeInfo(type, abiAccessible) {}
+      : ResilientTypeInfo(type, IsCopyable, abiAccessible) {}
 
 public:
   static const OpaqueArchetypeTypeInfo *
@@ -113,8 +116,10 @@ public:
     collector.collectTypeMetadataForLayout(T);
   }
 
-  TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
-                                        SILType T) const override {
+  TypeLayoutEntry
+  *buildTypeLayoutEntry(IRGenModule &IGM,
+                        SILType T,
+                        bool useStructLayouts) const override {
     return IGM.typeLayoutCache.getOrCreateArchetypeEntry(T.getObjectType());
   }
 };
@@ -133,7 +138,7 @@ class ClassArchetypeTypeInfo
                          Size size, const SpareBitVector &spareBits,
                          Alignment align,
                          ReferenceCounting refCount)
-    : HeapTypeInfo(storageType, size, spareBits, align),
+    : HeapTypeInfo(refCount, storageType, size, spareBits, align),
       RefCount(refCount)
   {}
 
@@ -257,6 +262,7 @@ llvm::Value *irgen::emitArchetypeWitnessTableRef(IRGenFunction &IGF,
                                        /*request*/ MetadataState::Complete,
                                        nullptr).getMetadata();
 
+  IGF.setScopedLocalTypeData(archetype, localDataKind, wtable);
   return wtable;
 }
 
@@ -434,14 +440,15 @@ withOpaqueTypeGenericArgs(IRGenFunction &IGF,
     enumerateGenericSignatureRequirements(
         opaqueDecl->getGenericSignature().getCanonicalSignature(),
         [&](GenericRequirement reqt) {
-          auto ty = reqt.TypeParameter.subst(archetype->getSubstitutions())
+          auto ty = reqt.getTypeParameter().subst(archetype->getSubstitutions())
                         ->getReducedType(opaqueDecl->getGenericSignature());
-          if (reqt.Protocol) {
+          if (reqt.isAnyWitnessTable()) {
             auto ref =
-                ProtocolConformanceRef(reqt.Protocol)
-                    .subst(reqt.TypeParameter, archetype->getSubstitutions());
+                ProtocolConformanceRef(reqt.getProtocol())
+                    .subst(reqt.getTypeParameter(), archetype->getSubstitutions());
             args.push_back(emitWitnessTableRef(IGF, ty, ref));
           } else {
+            assert(reqt.isAnyMetadata());
             args.push_back(IGF.emitAbstractTypeMetadataRef(ty));
           }
           types.push_back(args.back()->getType());

@@ -20,7 +20,7 @@ import SIL
 ///
 /// This pass is used for testing `AccessUtils`.
 let accessDumper = FunctionPass(name: "dump-access", {
-  (function: Function, context: PassContext) in
+  (function: Function, context: FunctionPassContext) in
   print("Accesses for \(function.name)")
 
   for block in function.blocks {
@@ -29,7 +29,7 @@ let accessDumper = FunctionPass(name: "dump-access", {
       case let st as StoreInst:
         printAccessInfo(address: st.destination)
       case let load as LoadInst:
-        printAccessInfo(address: load.operand)
+        printAccessInfo(address: load.address)
       case let apply as ApplyInst:
         guard let callee = apply.referencedFunction else {
           break
@@ -91,6 +91,6 @@ private func checkAliasInfo(forArgumentsOf apply: ApplyInst, expectDistinct: Boo
   }
   
   print("in function")
-  print(apply.function)
+  print(apply.parentFunction)
   fatalError()
 }

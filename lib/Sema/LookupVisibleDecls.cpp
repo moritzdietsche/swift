@@ -347,6 +347,10 @@ static void doDynamicLookup(VisibleDeclConsumer &Consumer,
       case DeclKind::BuiltinTuple:
         return;
 
+      // Macros cannot be found by dynamic lookup.
+      case DeclKind::Macro:
+        return;
+
       // Initializers cannot be found by dynamic lookup.
       case DeclKind::Constructor:
       case DeclKind::Destructor:
@@ -599,6 +603,20 @@ static void synthesizeMemberDeclsForLookup(NominalTypeDecl *NTD,
         /*useResolver=*/true);
     NormalConformance->forEachValueWitness([](ValueDecl *, Witness) {},
                                            /*useResolver=*/true);
+  }
+
+  // Expand synthesized member macros.
+  auto &ctx = NTD->getASTContext();
+  (void)evaluateOrDefault(ctx.evaluator,
+                          ExpandSynthesizedMemberMacroRequest{NTD},
+                          false);
+
+  // Expand peer macros.
+  for (auto *member : NTD->getMembers()) {
+    (void)evaluateOrDefault(
+        ctx.evaluator,
+        ExpandPeerMacroRequest{member},
+        {});
   }
 
   synthesizePropertyWrapperVariables(NTD);

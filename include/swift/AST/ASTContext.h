@@ -79,6 +79,7 @@ namespace swift {
   class DifferentiableAttr;
   class ExtensionDecl;
   struct ExternalSourceLocs;
+  class LoadedExecutablePlugin;
   class ForeignRepresentationInfo;
   class FuncDecl;
   class GenericContext;
@@ -87,9 +88,11 @@ namespace swift {
   class LazyContextData;
   class LazyIterableDeclContextData;
   class LazyMemberLoader;
-  class ModuleDependencies;
+  struct MacroDiscriminatorContext;
+  class ModuleDependencyInfo;
   class PatternBindingDecl;
   class PatternBindingInitializer;
+  class PluginRegistry;
   class SourceFile;
   class SourceLoc;
   class Type;
@@ -100,6 +103,7 @@ namespace swift {
   class Identifier;
   class InheritedNameSet;
   class ModuleDecl;
+  class PackageUnit;
   class ModuleDependenciesCache;
   class ModuleLoader;
   class NominalTypeDecl;
@@ -132,7 +136,6 @@ namespace swift {
   class IndexSubset;
   struct SILAutoDiffDerivativeFunctionKey;
   struct InterfaceSubContextDelegate;
-  class CompilerPlugin;
 
   enum class KnownProtocolKind : uint8_t;
 
@@ -142,10 +145,6 @@ namespace namelookup {
 
 namespace rewriting {
   class RewriteContext;
-}
-
-namespace syntax {
-  class SyntaxArena;
 }
 
 namespace ide {
@@ -293,6 +292,11 @@ public:
 
   ide::TypeCheckCompletionCallback *CompletionCallback = nullptr;
 
+  /// A callback that will be called when the constraint system found a
+  /// solution. Called multiple times if the constraint system has ambiguous
+  /// solutions.
+  ide::TypeCheckCompletionCallback *SolutionCallback = nullptr;
+
   /// The request-evaluator that is used to process various requests.
   Evaluator evaluator;
 
@@ -352,11 +356,8 @@ public:
       llvm::SmallPtrSet<DerivativeAttr *, 1>>
       DerivativeAttrs;
 
-  /// Cache of compiler plugins keyed by their name.
-  llvm::StringMap<CompilerPlugin> LoadedPlugins;
-
-  /// Cache of loaded symbols.
-  llvm::StringMap<void *> LoadedSymbols;
+  /// The Swift module currently being compiled.
+  ModuleDecl *MainModule = nullptr;
 
 private:
   /// The current generation number, which reflects the number of
@@ -503,9 +504,6 @@ public:
                                               arena),
                               setVector.size());
   }
-
-  /// Retrieve the syntax node memory manager for this context.
-  llvm::IntrusiveRefCntPtr<syntax::SyntaxArena> getSyntaxArena() const;
 
   /// Set a new stats reporter.
   void setStatsReporter(UnifiedStatsReporter *stats);
@@ -1000,18 +998,20 @@ public:
 
   /// Retrieve the module dependencies for the module with the given name.
   ///
-  /// \param isUnderlyingClangModule When true, only look for a Clang module
-  /// with the given name, ignoring any Swift modules.
-  Optional<ModuleDependencies> getModuleDependencies(
+  Optional<const ModuleDependencyInfo*> getModuleDependencies(
       StringRef moduleName,
-      bool isUnderlyingClangModule,
       ModuleDependenciesCache &cache,
       InterfaceSubContextDelegate &delegate,
-      bool cacheOnly = false,
-      llvm::Optional<std::pair<std::string, swift::ModuleDependenciesKind>> dependencyOf = None);
+      llvm::Optional<std::pair<std::string, swift::ModuleDependencyKind>> dependencyOf = None);
+
+  /// Retrieve the module dependencies for the Clang module with the given name.
+  Optional<const ModuleDependencyInfo*> getClangModuleDependencies(
+      StringRef moduleName,
+      ModuleDependenciesCache &cache,
+      InterfaceSubContextDelegate &delegate);
 
   /// Retrieve the module dependencies for the Swift module with the given name.
-  Optional<ModuleDependencies> getSwiftModuleDependencies(
+  Optional<const ModuleDependencyInfo*> getSwiftModuleDependencies(
       StringRef moduleName,
       ModuleDependenciesCache &cache,
       InterfaceSubContextDelegate &delegate);
@@ -1076,6 +1076,11 @@ public:
   void loadDerivativeFunctionConfigurations(
       AbstractFunctionDecl *originalAFD, unsigned previousGeneration,
       llvm::SetVector<AutoDiffConfig> &results);
+
+  /// Retrieve the next macro expansion discriminator within the given
+  /// name and context.
+  unsigned getNextMacroDiscriminator(MacroDiscriminatorContext context,
+                                     DeclBaseName baseName);
 
   /// Retrieve the Clang module loader for this ASTContext.
   ///
@@ -1376,7 +1381,8 @@ public:
   ///
   /// This drops the parameter pack bit from each generic parameter,
   /// and converts same-element requirements to same-type requirements.
-  CanGenericSignature getOpenedElementSignature(CanGenericSignature baseGenericSig);
+  CanGenericSignature getOpenedElementSignature(CanGenericSignature baseGenericSig,
+                                                CanType shapeClass);
 
   GenericSignature getOverrideGenericSignature(const ValueDecl *base,
                                                const ValueDecl *derived);
@@ -1452,12 +1458,21 @@ public:
   /// The declared interface type of Builtin.TheTupleType.
   BuiltinTupleType *getBuiltinTupleType();
 
-  /// Finds the loaded compiler plugin given its name.
-  CompilerPlugin *getLoadedPlugin(StringRef name);
-
   /// Finds the address of the given symbol. If `libraryHandleHint` is non-null,
   /// search within the library.
   void *getAddressOfSymbol(const char *name, void *libraryHandleHint = nullptr);
+  
+  Type getNamedSwiftType(ModuleDecl *module, StringRef name);
+
+  LoadedExecutablePlugin *
+  lookupExecutablePluginByModuleName(Identifier moduleName);
+
+  /// Get the plugin registry this ASTContext is using.
+  PluginRegistry *getPluginRegistry() const;
+
+  /// Set the plugin registory this ASTContext should use.
+  /// This should be called before any plugin is loaded.
+  void setPluginRegistry(PluginRegistry *newValue);
 
 private:
   friend Decl;

@@ -92,7 +92,7 @@ func f4(_ j: Wibble) { } // expected-error{{cannot find type 'Wibble' in scope}}
 f4(5)
 
 func f1() {
-  var c : Class // expected-error{{cannot find type 'Class' in scope}}
+  var c : Klass // expected-error{{cannot find type 'Klass' in scope}}
   markUsed(c.x) // make sure error does not cascade here
 }
 
@@ -285,3 +285,9 @@ func rdar97396399() {
     }
   }
 }
+
+// https://github.com/apple/swift/issues/63834
+func f63834(int: Int, string: String) {} // expected-note{{found candidate with type '(Int, String) -> ()'}}
+func f63834(int: Int, string: Bool) {} // expected-note{{found candidate with type '(Int, Bool) -> ()'}}
+
+let a = f63834(int:string:) as (Int, Int) -> Void // expected-error{{no exact matches in reference to global function 'f63834'}}

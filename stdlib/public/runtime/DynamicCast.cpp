@@ -425,6 +425,23 @@ tryCastUnwrappingObjCSwiftValueSource(
       destFailureType, srcFailureType,
       /*takeOnSuccess=*/ false, mayDeferChecks);
 }
+#else
+static DynamicCastResult
+tryCastUnwrappingSwiftValueSource(
+  OpaqueValue *destLocation, const Metadata *destType,
+  OpaqueValue *srcValue, const Metadata *srcType,
+  const Metadata *&destFailureType, const Metadata *&srcFailureType,
+  bool takeOnSuccess, bool mayDeferChecks)
+{
+  assert(srcType->getKind() == MetadataKind::Class);
+
+  // unboxFromSwiftValueWithType is really just a recursive casting operation...
+  if (swift_unboxFromSwiftValueWithType(srcValue, destLocation, destType)) {
+    return DynamicCastResult::SuccessViaCopy;
+  } else {
+    return DynamicCastResult::Failure;
+  }
+}
 #endif
 
 /******************************************************************************/
@@ -1474,6 +1491,18 @@ tryCastToClassExistential(
   }
 
   case MetadataKind::ObjCClassWrapper:
+#if SWIFT_OBJC_INTEROP
+    id srcObject;
+    memcpy(&srcObject, srcValue, sizeof(id));
+    if (!runtime::bincompat::useLegacySwiftValueUnboxingInCasting()) {
+      if (getAsSwiftValue(srcObject) != nullptr) {
+	// Do not directly cast a `__SwiftValue` box
+	// Return failure so our caller will unwrap and try again
+	return DynamicCastResult::Failure;
+      }
+    }
+#endif
+    SWIFT_FALLTHROUGH;
   case MetadataKind::Class:
   case MetadataKind::ForeignClass: {
     auto srcObject = getNonNullSrcObject(srcValue, srcType, destType);
@@ -1836,7 +1865,8 @@ static DynamicCastResult tryCastToExtendedExistential(
         destExistentialShape->getRequirementSignature().getRequirements(),
         allGenericArgsVec,
         [&substitutions](unsigned depth, unsigned index) {
-          return substitutions.getMetadata(depth, index);
+          // FIXME: Variadic generics
+          return substitutions.getMetadata(depth, index).getMetadata();
         },
         [](const Metadata *type, unsigned index) -> const WitnessTable * {
           swift_unreachable("Resolution of witness tables is not supported");
@@ -2285,8 +2315,11 @@ tryCast(
   case MetadataKind::Class: {
 #if !SWIFT_OBJC_INTEROP
     // Try unwrapping native __SwiftValue implementation
-    if (swift_unboxFromSwiftValueWithType(srcValue, destLocation, destType)) {
-      return DynamicCastResult::SuccessViaCopy;
+    auto subcastResult = tryCastUnwrappingSwiftValueSource(
+      destLocation, destType, srcValue, srcType,
+      destFailureType, srcFailureType, takeOnSuccess, mayDeferChecks);
+    if (isSuccess(subcastResult)) {
+      return subcastResult;
     }
 #endif
     break;

@@ -439,7 +439,7 @@ static ValueDecl *importMacro(ClangImporter::Implementation &impl,
       auto builtinType = builtinTypeForToken(tokenI[1],
                                              impl.getClangASTContext());
       if (builtinType) {
-        castType = builtinType.getValue();
+        castType = builtinType.value();
       } else {
         // TODO(https://github.com/apple/swift/issues/57735): Add diagnosis.
         return nullptr;
@@ -471,6 +471,15 @@ static ValueDecl *importMacro(ClangImporter::Implementation &impl,
 
     if (tok.is(clang::tok::identifier)) {
       auto clangID = tok.getIdentifierInfo();
+
+      if (clangID->isOutOfDate())
+        // Update the identifier with macro definitions subsequently loaded from
+        // a module/AST file. We're supposed to use
+        // Preprocessor::HandleIdentifier() to do that, but that method does too
+        // much to call it here. Instead, we call getLeafModuleMacros() for its
+        // side effect of calling updateOutOfDateIdentifier().
+        // FIXME: clang should give us a better way to do this.
+        (void)impl.getClangPreprocessor().getLeafModuleMacros(clangID);
 
       // If it's an identifier that is itself a macro, look into that macro.
       if (clangID->hasMacroDefinition()) {

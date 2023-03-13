@@ -1489,6 +1489,7 @@ namespace  {
     UNINTERESTING_ATTR(Alignment)
     UNINTERESTING_ATTR(AlwaysEmitIntoClient)
     UNINTERESTING_ATTR(Borrowed)
+    UNINTERESTING_ATTR(Borrowing)
     UNINTERESTING_ATTR(CDecl)
     UNINTERESTING_ATTR(Consuming)
     UNINTERESTING_ATTR(Documentation)
@@ -1519,6 +1520,7 @@ namespace  {
     UNINTERESTING_ATTR(MoveOnly)
     UNINTERESTING_ATTR(FixedLayout)
     UNINTERESTING_ATTR(Lazy)
+    UNINTERESTING_ATTR(LegacyConsuming)
     UNINTERESTING_ATTR(LLDBDebuggerFunction)
     UNINTERESTING_ATTR(Mutating)
     UNINTERESTING_ATTR(NonMutating)
@@ -1587,8 +1589,6 @@ namespace  {
     UNINTERESTING_ATTR(SPIOnly)
     UNINTERESTING_ATTR(Custom)
     UNINTERESTING_ATTR(PropertyWrapper)
-    UNINTERESTING_ATTR(TypeWrapper)
-    UNINTERESTING_ATTR(TypeWrapperIgnored)
     UNINTERESTING_ATTR(DisfavoredOverload)
     UNINTERESTING_ATTR(ResultBuilder)
     UNINTERESTING_ATTR(ProjectedValueProperty)
@@ -1614,7 +1614,7 @@ namespace  {
     UNINTERESTING_ATTR(NoMetadata)
     UNINTERESTING_ATTR(CompileTimeConst)
 
-    UNINTERESTING_ATTR(BackDeploy)
+    UNINTERESTING_ATTR(BackDeployed)
     UNINTERESTING_ATTR(KnownToBeLocal)
 
     UNINTERESTING_ATTR(UnsafeInheritExecutor)
@@ -1623,6 +1623,11 @@ namespace  {
 
     UNINTERESTING_ATTR(EagerMove)
     UNINTERESTING_ATTR(NoEagerMove)
+
+    UNINTERESTING_ATTR(RuntimeMetadata)
+
+    UNINTERESTING_ATTR(MacroRole)
+    UNINTERESTING_ATTR(LexicalLifetimes)
 #undef UNINTERESTING_ATTR
 
     void visitAvailableAttr(AvailableAttr *attr) {

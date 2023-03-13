@@ -3198,7 +3198,7 @@ protocol someProtocol {
 // XHECK-NEXT: copy_addr
 // XHECK-NEXT: destroy_addr
 // XHECK-NEXT: [[T0:%.*]] = witness_method $T
-// XHECK_NEXT: apply [[T0]]<T>
+// XHECK-NEXT: apply [[T0]]<T>
 // XHECK: return
 sil [ossa] @witness_archetype : $@convention(thin) <T where T : someProtocol> (@in T) -> () {
 bb0(%0 : $*T):
@@ -4375,6 +4375,7 @@ bb0:
   %1 = thin_to_thick_function %0 : $@convention(thin) () -> Builtin.Int32 to $@callee_guaranteed () -> Builtin.Int32
   %2 = convert_escape_to_noescape %1 : $@callee_guaranteed () -> Builtin.Int32 to $@noescape @callee_guaranteed () -> Builtin.Int32
   %4 = apply %2() : $@noescape @callee_guaranteed () -> Builtin.Int32
+  destroy_value %2 : $@noescape @callee_guaranteed () -> Builtin.Int32
   return %4 : $Builtin.Int32
 }
 

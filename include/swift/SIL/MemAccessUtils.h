@@ -206,7 +206,12 @@ SILValue findOwnershipReferenceRoot(SILValue ref);
 
 /// Look through all ownership forwarding instructions to find the values which
 /// were originally borrowed.
-void findGuaranteedReferenceRoots(SILValue value,
+///
+/// Note: This treats guaranteed forwarding phis like roots even though they do
+/// not introduce the borrow scope. This ensures that all roots dominate \p
+/// reference Value. But the client will need to handle forwarding phis.
+void findGuaranteedReferenceRoots(SILValue referenceValue,
+                                  bool lookThroughNestedBorrows,
                                   SmallVectorImpl<SILValue> &roots);
 
 /// Find the aggregate containing the first owned root of the
@@ -1127,6 +1132,8 @@ public:
     // Precondition: this != subNode
     PathNode findPrefix(PathNode subNode) const;
 
+    bool isPrefixOf(PathNode other) { return node->isPrefixOf(other.node); }
+
     bool operator==(PathNode other) const { return node == other.node; }
     bool operator!=(PathNode other) const { return node != other.node; }
   };
@@ -1246,6 +1253,8 @@ struct AccessPathWithBase {
   AccessBase getAccessBase() const {
     return AccessBase(base, accessPath.getStorage().getKind());
   }
+
+  bool isValid() const { return base && accessPath.isValid(); }
 
   bool operator==(AccessPathWithBase other) const {
     return accessPath == other.accessPath && base == other.base;
@@ -1389,6 +1398,12 @@ bool visitAccessStorageUses(AccessUseVisitor &visitor, AccessStorage storage,
 /// visitor's visitUse method returns true.
 bool visitAccessPathUses(AccessUseVisitor &visitor, AccessPath accessPath,
                          SILFunction *function);
+
+/// Similar to visitAccessPathUses, but the visitor is restricted to a specific
+/// access base, such as a particular ref_element_addr.
+bool visitAccessPathBaseUses(AccessUseVisitor &visitor,
+                             AccessPathWithBase accessPathWithBase,
+                             SILFunction *function);
 
 } // end namespace swift
 
@@ -1617,6 +1632,7 @@ inline bool isAccessStorageIdentityCast(SingleValueInstruction *svi) {
   // Simply pass-thru the incoming address.
   case SILInstructionKind::MarkUninitializedInst:
   case SILInstructionKind::MarkMustCheckInst:
+  case SILInstructionKind::MarkUnresolvedReferenceBindingInst:
   case SILInstructionKind::MarkDependenceInst:
   case SILInstructionKind::CopyValueInst:
     return true;

@@ -75,13 +75,9 @@ namespace swift {
   class ValueDecl;
   class VarDecl;
   class VisibleDeclConsumer;
-  class SyntaxParsingCache;
   class ASTScope;
   class SourceLookupCache;
 
-  namespace syntax {
-  class SourceFileSyntax;
-}
 namespace ast_scope {
 class ASTSourceFileScope;
 }
@@ -163,6 +159,35 @@ class OverlayFile;
 /// location.
 class ModuleSourceFileLocationMap;
 
+/// Package unit used to allow grouping of modules by a package name.
+/// ModuleDecl can set PackageUnit as a parent in its DeclContext
+/// See \c ModuleDecl
+class PackageUnit: public DeclContext {
+
+  Identifier PackageName;
+
+  PackageUnit(Identifier name);
+
+public:
+  static PackageUnit *
+  create(Identifier name, ASTContext &ctx) {
+    return new (ctx) PackageUnit(name);
+  }
+
+  static bool classof(const DeclContext *DC) {
+    return DC->getContextKind() == DeclContextKind::Package;
+  }
+
+  static bool classof(const PackageUnit *PU) {
+    // FIXME: add a correct check
+    return true;
+  }
+
+  Identifier getName() const {
+    return PackageName;
+  }
+};
+
 /// The minimum unit of compilation.
 ///
 /// A module is made up of several file-units, which are all part of the same
@@ -176,6 +201,12 @@ class ModuleDecl
 
   /// The ABI name of the module, if it differs from the module name.
   mutable Identifier ModuleABIName;
+
+  /// The name of the package this module belongs to
+  mutable Identifier PackageName;
+
+  /// Module name to use when referenced in clients module interfaces.
+  mutable Identifier ExportAsName;
 
 public:
   /// Produces the components of a given module's full name in reverse order.
@@ -244,6 +275,8 @@ private:
   llvm::SmallDenseMap<Identifier, SmallVector<OverlayFile *, 1>>
     declaredCrossImports;
 
+  llvm::DenseMap<Identifier, SmallVector<Decl *, 2>> ObjCNameLookupCache;
+
   /// A description of what should be implicitly imported by each file of this
   /// module.
   const ImplicitImportInfo ImportInfo;
@@ -282,7 +315,7 @@ private:
   /// Used by the debugger to bypass resilient access to fields.
   bool BypassResilience = false;
 
-  ModuleDecl(Identifier name, ASTContext &ctx, ImplicitImportInfo importInfo);
+  ModuleDecl(Identifier name, ASTContext &ctx, ImplicitImportInfo importInfo, PackageUnit *pkg);
 
 public:
   /// Creates a new module with a given \p name.
@@ -291,13 +324,14 @@ public:
   /// imported by each file of this module.
   static ModuleDecl *
   create(Identifier name, ASTContext &ctx,
-         ImplicitImportInfo importInfo = ImplicitImportInfo()) {
-    return new (ctx) ModuleDecl(name, ctx, importInfo);
+         ImplicitImportInfo importInfo = ImplicitImportInfo(),
+         PackageUnit *pkg = nullptr) {
+    return new (ctx) ModuleDecl(name, ctx, importInfo, pkg);
   }
 
   static ModuleDecl *
-  createMainModule(ASTContext &ctx, Identifier name, ImplicitImportInfo iinfo) {
-    auto *Mod = ModuleDecl::create(name, ctx, iinfo);
+  createMainModule(ASTContext &ctx, Identifier name, ImplicitImportInfo iinfo, PackageUnit *pkg = nullptr) {
+    auto *Mod = ModuleDecl::create(name, ctx, iinfo, pkg);
     Mod->Bits.ModuleDecl.IsMainModule = true;
     return Mod;
   }
@@ -346,6 +380,10 @@ public:
   /// Produces the source file that contains the given source location, or
   /// \c nullptr if the source location isn't in this module.
   SourceFile *getSourceFileContainingLocation(SourceLoc loc);
+
+  /// Whether the given location is inside a generated buffer, \c false if
+  /// the given location isn't in this module.
+  bool isInGeneratedBuffer(SourceLoc loc);
 
   /// Creates a map from \c #filePath strings to corresponding \c #fileID
   /// strings, diagnosing any conflicts.
@@ -404,6 +442,24 @@ public:
     ModuleABIName = name;
   }
 
+  /// Get the package name of the module
+  Identifier getPackageName() const { return PackageName; }
+
+  /// Set the name of the package this module belongs to
+  void setPackageName(Identifier name) {
+    PackageName = name;
+    // TODO: uncomment when PackageUnit gets passed to constructor
+//    PackageUnit *pkgUnit = PackageUnit::create(name, getASTContext());
+//    DeclContext newContext = DeclContext(DeclContextKind::Module, pkgUnit);
+//    setDeclContext(&newContext);
+  }
+
+  Identifier getExportAsName() const { return ExportAsName; }
+
+  void setExportAsName(Identifier name) {
+    ExportAsName = name;
+  }
+
   /// Retrieve the actual module name of an alias used for this module (if any).
   ///
   /// For example, if '-module-alias Foo=Bar' is passed in when building the main module,
@@ -422,7 +478,19 @@ public:
     return UserModuleVersion;
   }
 
+  void addAllowableClientName(Identifier name) {
+    allowableClientNames.push_back(name);
+  }
+  ArrayRef<Identifier> getAllowableClientNames() const {
+    return allowableClientNames;
+  }
+  bool allowImportedBy(ModuleDecl *importer) const;
 private:
+
+  /// An array of module names that are allowed to import this one.
+  /// Any module can import this one if empty.
+  std::vector<Identifier> allowableClientNames;
+
   /// A cache of this module's underlying module and required bystander if it's
   /// an underscored cross-import overlay.
   Optional<std::pair<ModuleDecl *, Identifier>> declaringModuleAndBystander;
@@ -601,6 +669,14 @@ public:
     Bits.ModuleDecl.IsConcurrencyChecked = value;
   }
 
+  bool isObjCNameLookupCachePopulated() const {
+    return Bits.ModuleDecl.ObjCNameLookupCachePopulated;
+  }
+
+  void setIsObjCNameLookupCachePopulated(bool value) {
+    Bits.ModuleDecl.ObjCNameLookupCachePopulated = value;
+  }
+
   /// For the main module, retrieves the list of primary source files being
   /// compiled, that is, the files we're generating code for.
   ArrayRef<SourceFile *> getPrimarySourceFiles() const;
@@ -637,6 +713,24 @@ public:
   void lookupVisibleDecls(ImportPath::Access AccessPath,
                           VisibleDeclConsumer &Consumer,
                           NLKind LookupKind) const;
+
+private:
+  void populateObjCNameLookupCache();
+
+public:
+  /// Finds top-levels decls of this module by @objc provided name.
+  /// Decls that have no @objc attribute are not considered.
+  ///
+  /// This does a simple local lookup, not recursively looking through imports.
+  /// The order of the results is not guaranteed to be meaningful.
+  ///
+  /// \param Results Vector collecting the decls.
+  ///
+  /// \param name The @objc simple name to look for. Declarations with matching
+  /// name and "anonymous" @objc attribute, as well a matching named @objc
+  /// attribute will be added to Results.
+  void lookupTopLevelDeclsByObjCName(SmallVectorImpl<Decl *> &Results,
+                                     DeclName name);
 
   /// This is a hack for 'main' file parsing and the integrated REPL.
   ///
@@ -723,12 +817,13 @@ public:
   enum class ImportFilterKind {
     /// Include imports declared with `@_exported`.
     Exported = 1 << 0,
-    /// Include "regular" imports with no special annotation.
+    /// Include "regular" imports with an access-level of `public`.
     Default = 1 << 1,
-    /// Include imports declared with `@_implementationOnly`.
+    /// Include imports declared with `@_implementationOnly` or with an
+    /// access-level of `package` or less.
     ImplementationOnly = 1 << 2,
-    /// Include imports of SPIs declared with `@_spi`.
-    SPIAccessControl = 1 << 3,
+    /// Include imports declared with `package import`.
+    PackageOnly = 1 << 3,
     /// Include imports declared with `@_spiOnly`.
     SPIOnly = 1 << 4,
     /// Include imports shadowed by a cross-import overlay. Unshadowed imports
@@ -840,6 +935,21 @@ public:
   /// string if this is not applicable.
   StringRef getModuleFilename() const;
 
+  /// Get the path to the file defining this module, what we consider the
+  /// source of truth about the module. Usually a swiftinterface file for a
+  /// resilient module, a swiftmodule for a non-resilient module, or the
+  /// modulemap for a clang module. Returns an empty string if not applicable.
+  StringRef getModuleSourceFilename() const;
+
+  /// Get the path to the file loaded by the compiler. Usually the binary
+  /// swiftmodule file or a pcm in the cache. Returns an empty string if not
+  /// applicable.
+  StringRef getModuleLoadedFilename() const;
+
+  /// \returns true if this module is defined under the SDK path.
+  /// If no SDK path is defined, this always returns false.
+  bool isSDKModule() const;
+
   /// \returns true if this module is the "swift" standard library module.
   bool isStdlibModule() const;
 
@@ -876,6 +986,10 @@ public:
 
   /// Returns the associated clang module if one exists.
   const clang::Module *findUnderlyingClangModule() const;
+
+  /// Does this module or the underlying clang module defines export_as with
+  /// a value corresponding to the \p other module?
+  bool isExportedAs(const ModuleDecl *other) const;
 
   /// Returns a generator with the components of this module's full,
   /// hierarchical name.
@@ -982,6 +1096,10 @@ inline bool DeclContext::isModuleScopeContext() const {
   if (ParentAndKind.getInt() == ASTHierarchy::FileUnit)
     return true;
   return isModuleContext();
+}
+
+inline bool DeclContext::isPackageScopeContext() const {
+  return ParentAndKind.getInt() == ASTHierarchy::Package;
 }
 
 /// Extract the source location from the given module declaration.

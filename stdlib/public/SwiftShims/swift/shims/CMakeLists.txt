@@ -1,6 +1,7 @@
 set(sources
   AssertionReporting.h
   CoreFoundationShims.h
+  CrashInfo.h
   FoundationShims.h
   GlobalObjects.h
   HeapObject.h
@@ -21,8 +22,10 @@ set(sources
   ThreadLocalStorage.h
   UnicodeData.h
   Visibility.h
+  _SwiftBacktracing.h
   _SwiftConcurrency.h
   _SwiftDistributed.h
+  _SwiftRuntime.h
 
   module.modulemap
   )

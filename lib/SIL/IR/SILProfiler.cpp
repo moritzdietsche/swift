@@ -99,7 +99,7 @@ static bool shouldProfile(SILDeclRef Constant) {
   // Do not profile AST nodes in unavailable contexts.
   auto *DC = Constant.getInnermostDeclContext();
   if (auto *D = DC->getInnermostDeclarationDeclContext()) {
-    if (D->isSemanticallyUnavailable()) {
+    if (D->getSemanticUnavailableAttr()) {
       LLVM_DEBUG(llvm::dbgs() << "Skipping ASTNode: unavailable context\n");
       return false;
     }
@@ -191,8 +191,8 @@ namespace {
 template <typename F>
 ASTWalker::PreWalkAction
 visitFunctionDecl(ASTWalker &Walker, AbstractFunctionDecl *AFD, F Func) {
-  assert(AFD->hasBody());
   if (Walker.Parent.isNull()) {
+    assert(AFD->hasBody());
     Func();
     return ASTWalker::Action::Continue();
   }
@@ -207,8 +207,6 @@ shouldWalkIntoExpr(Expr *E, ASTWalker::ParentTy Parent, SILDeclRef Constant) {
   // Profiling for closures should be handled separately. Do not visit
   // closure expressions twice.
   if (auto *CE = dyn_cast<AbstractClosureExpr>(E)) {
-    assert(CE->hasBody());
-
     // A non-null parent means we have a closure child, which we will visit
     // separately. Even if the parent is null, don't walk into a closure if the
     // SILDeclRef is not for a closure, as it could be for a property
@@ -269,6 +267,10 @@ struct MapRegionCounters : public ASTWalker {
     });
 
     ++NextCounter;
+  }
+
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::Expansion;
   }
 
   PreWalkAction walkToDeclPre(Decl *D) override {
@@ -525,7 +527,7 @@ public:
     return Iter->second;
   }
 
-  bool hasStartLoc() const { return StartLoc.hasValue(); }
+  bool hasStartLoc() const { return StartLoc.has_value(); }
 
   void setStartLoc(SourceLoc Loc) {
     assert(Loc.isValid());
@@ -537,7 +539,7 @@ public:
     return *StartLoc;
   }
 
-  bool hasEndLoc() const { return EndLoc.hasValue(); }
+  bool hasEndLoc() const { return EndLoc.has_value(); }
 
   void setEndLoc(SourceLoc Loc) {
     assert(Loc.isValid());
@@ -679,6 +681,10 @@ struct PGOMapping : public ASTWalker {
     // We want to walk lazy initializers present in the synthesized getter for
     // a lazy variable.
     return LazyInitializerWalking::InAccessor;
+  }
+
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::Expansion;
   }
 
   PreWalkResult<Stmt *> walkToStmtPre(Stmt *S) override {
@@ -1028,12 +1034,16 @@ public:
     return LazyInitializerWalking::InAccessor;
   }
 
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::Expansion;
+  }
+
   /// Generate the coverage counter mapping regions from collected
   /// source regions.
   SILCoverageMap *emitSourceRegions(
       SILModule &M, StringRef Name, StringRef PGOFuncName, uint64_t Hash,
       llvm::DenseMap<ProfileCounterRef, unsigned> &CounterIndices,
-      StringRef Filename) {
+      SourceFile *SF, StringRef Filename) {
     if (SourceRegions.empty())
       return nullptr;
 
@@ -1051,8 +1061,8 @@ public:
       Regions.emplace_back(Start.first, Start.second, End.first, End.second,
                            Counter.expand(Builder, CounterIndices));
     }
-    return SILCoverageMap::create(M, Filename, Name, PGOFuncName, Hash, Regions,
-                                  Builder.getExpressions());
+    return SILCoverageMap::create(M, SF, Filename, Name, PGOFuncName, Hash,
+                                  Regions, Builder.getExpressions());
   }
 
   PreWalkAction walkToDeclPre(Decl *D) override {
@@ -1331,13 +1341,6 @@ getEquivalentPGOLinkage(FormalLinkage Linkage) {
   llvm_unreachable("Unhandled FormalLinkage in switch.");
 }
 
-static StringRef getCurrentFileName(SILDeclRef forDecl) {
-  auto *DC = forDecl.getInnermostDeclContext();
-  if (auto *ParentFile = DC->getParentSourceFile())
-    return ParentFile->getFilename();
-  return {};
-}
-
 static void walkNode(NodeToProfile Node, ASTWalker &Walker) {
   if (auto N = Node.getAsNode()) {
     N.walk(Walker);
@@ -1350,8 +1353,11 @@ static void walkNode(NodeToProfile Node, ASTWalker &Walker) {
 
 void SILProfiler::assignRegionCounters() {
   const auto &SM = M.getASTContext().SourceMgr;
+  auto *DC = forDecl.getInnermostDeclContext();
+  auto *SF = DC->getParentSourceFile();
+  assert(SF && "Not within a SourceFile?");
 
-  CurrentFileName = getCurrentFileName(forDecl);
+  CurrentFileName = SF->getFilename();
 
   MapRegionCounters Mapper(forDecl, RegionCounterMap);
 
@@ -1387,7 +1393,7 @@ void SILProfiler::assignRegionCounters() {
     walkNode(Root, Coverage);
     CovMap =
         Coverage.emitSourceRegions(M, CurrentFuncName, PGOFuncName, PGOFuncHash,
-                                   RegionCounterMap, CurrentFileName);
+                                   RegionCounterMap, SF, CurrentFileName);
   }
 
   if (llvm::IndexedInstrProfReader *IPR = M.getPGOReader()) {

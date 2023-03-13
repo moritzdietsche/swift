@@ -24,6 +24,7 @@
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/PropertyWrappers.h"
 #include "swift/AST/SynthesizedFileUnit.h"
+#include "swift/Basic/Defer.h"
 #include "swift/SIL/FormalLinkage.h"
 #include "swift/SIL/SILLinkage.h"
 #include "swift/SIL/SILModule.h"
@@ -37,7 +38,7 @@ static bool requiresLinkerDirective(Decl *D) {
   for (auto *attr : D->getAttrs()) {
     if (auto *ODA = dyn_cast<OriginallyDefinedInAttr>(attr)) {
       auto Active = ODA->isActivePlatform(D->getASTContext());
-      if (Active.hasValue())
+      if (Active.has_value())
         return true;
     }
   }
@@ -63,6 +64,7 @@ static Optional<DynamicKind> getDynamicKind(ValueDecl *VD) {
 class SILSymbolVisitorImpl : public ASTVisitor<SILSymbolVisitorImpl> {
   SILSymbolVisitor &Visitor;
   const SILSymbolVisitorContext &Ctx;
+  llvm::SmallVector<Decl *, 4> DeclStack;
 
   /// A set of original function and derivative configuration pairs for which
   /// derivative symbols have been emitted.
@@ -318,21 +320,10 @@ class SILSymbolVisitorImpl : public ASTVisitor<SILSymbolVisitorImpl> {
     // Metaclasses and ObjC classes (duh) are an ObjC thing, and so are not
     // needed in build artifacts/for classes which can't touch ObjC.
     if (objCCompatible) {
-      bool addObjCClass = false;
-      if (isObjC) {
-        addObjCClass = true;
-        Visitor.addObjCClass(CD);
-      }
-
-      if (CD->getMetaclassKind() == ClassDecl::MetaclassKind::ObjC) {
-        addObjCClass = true;
-        Visitor.addObjCMetaclass(CD);
-      } else
-        Visitor.addSwiftMetaclassStub(CD);
-
-      if (addObjCClass) {
+      if (isObjC || CD->getMetaclassKind() == ClassDecl::MetaclassKind::ObjC)
         Visitor.addObjCInterface(CD);
-      }
+      else
+        Visitor.addSwiftMetaclassStub(CD);
     }
 
     // Some members of classes get extra handling, beyond members of
@@ -356,13 +347,42 @@ class SILSymbolVisitorImpl : public ASTVisitor<SILSymbolVisitorImpl> {
     return true;
   }
 
+  void addMethodIfNecessary(FuncDecl *FD) {
+    auto CD = dyn_cast<ClassDecl>(FD->getDeclContext());
+    if (!CD)
+      return;
+
+    // If we're already visiting the parent ClassDecl then this was handled by
+    // its vtable visitor.
+    if (llvm::find(DeclStack, CD) != DeclStack.end())
+      return;
+
+    SILDeclRef method = SILDeclRef(FD);
+    if (Ctx.getOpts().VirtualFunctionElimination ||
+        CD->hasResilientMetadata()) {
+      Visitor.addDispatchThunk(method);
+    }
+    Visitor.addMethodDescriptor(method);
+  }
+
+  void addRuntimeDiscoverableAttrGenerators(ValueDecl *D) {
+    for (auto *attr : D->getRuntimeDiscoverableAttrs()) {
+      addFunction(SILDeclRef::getRuntimeAttributeGenerator(attr, D),
+                  /*ignoreLinkage=*/true);
+    }
+  }
+
 public:
   SILSymbolVisitorImpl(SILSymbolVisitor &Visitor,
                        const SILSymbolVisitorContext &Ctx)
       : Visitor{Visitor}, Ctx{Ctx} {}
 
   void visit(Decl *D) {
-    Visitor.willVisitDecl(D);
+    DeclStack.push_back(D);
+    SWIFT_DEFER { DeclStack.pop_back(); };
+
+    if (!Visitor.willVisitDecl(D))
+      return;
     ASTVisitor::visit(D);
     Visitor.didVisitDecl(D);
   }
@@ -408,12 +428,6 @@ public:
   }
 
   void visitAbstractFunctionDecl(AbstractFunctionDecl *AFD) {
-    // A @_silgen_name("...") function without a body only exists to
-    // forward-declare a symbol from another library.
-    if (!AFD->hasBody() && AFD->getAttrs().hasAttribute<SILGenNameAttr>()) {
-      return;
-    }
-
     // Add exported prespecialized symbols.
     for (auto *attr : AFD->getAttrs().getAttributes<SpecializeAttr>()) {
       if (!attr->isExported())
@@ -466,6 +480,8 @@ public:
                          IndexSubset::get(AFD->getASTContext(), 1, {0}),
                          AFD->getGenericSignature()));
 
+    addRuntimeDiscoverableAttrGenerators(AFD);
+
     visitDefaultArguments(AFD, AFD->getParameters());
 
     if (AFD->hasAsync()) {
@@ -483,6 +499,7 @@ public:
     // If there's an opaque return type, its descriptor is exported.
     addOpaqueResultIfNecessary(FD);
     visitAbstractFunctionDecl(FD);
+    addMethodIfNecessary(FD);
   }
 
   void visitAccessorDecl(AccessorDecl *AD) {
@@ -547,11 +564,27 @@ public:
     }
 
     visitAbstractStorageDecl(VD);
+
+    addRuntimeDiscoverableAttrGenerators(VD);
   }
 
   void visitSubscriptDecl(SubscriptDecl *SD) {
     visitDefaultArguments(SD, SD->getIndices());
     visitAbstractStorageDecl(SD);
+  }
+
+  template<typename NominalOrExtension>
+  void visitMembers(NominalOrExtension *D) {
+    if (!Ctx.getOpts().VisitMembers)
+      return;
+
+    for (auto member : D->getMembers()) {
+      member->visitAuxiliaryDecls([&](Decl *decl) {
+        visit(decl);
+      });
+
+      visit(member);
+    }
   }
 
   void visitNominalTypeDecl(NominalTypeDecl *NTD) {
@@ -570,9 +603,9 @@ public:
     // There are symbols associated with any protocols this type conforms to.
     addConformances(NTD);
 
-    if (Ctx.getOpts().VisitMembers)
-      for (auto member : NTD->getMembers())
-        visit(member);
+    addRuntimeDiscoverableAttrGenerators(NTD);
+
+    visitMembers(NTD);
   }
 
   void visitClassDecl(ClassDecl *CD) {
@@ -661,9 +694,7 @@ public:
       addConformances(ED);
     }
 
-    if (Ctx.getOpts().VisitMembers)
-      for (auto member : ED->getMembers())
-        visit(member);
+    visitMembers(ED);
   }
 
 #ifndef NDEBUG
@@ -699,8 +730,11 @@ public:
     case DeclKind::InfixOperator:
     case DeclKind::PrefixOperator:
     case DeclKind::PostfixOperator:
+    case DeclKind::Macro:
     case DeclKind::MacroExpansion:
       return false;
+    case DeclKind::Missing:
+      llvm_unreachable("missing decl should not show up here");
     case DeclKind::BuiltinTuple:
       llvm_unreachable("BuiltinTupleDecl should not show up here");
     }
@@ -792,6 +826,7 @@ public:
   UNINTERESTING_DECL(IfConfig)
   UNINTERESTING_DECL(Import)
   UNINTERESTING_DECL(MacroExpansion)
+  UNINTERESTING_DECL(Missing)
   UNINTERESTING_DECL(MissingMember)
   UNINTERESTING_DECL(Operator)
   UNINTERESTING_DECL(PatternBinding)

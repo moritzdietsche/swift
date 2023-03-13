@@ -41,6 +41,7 @@ public:
   BAD_MEMBER(TopLevelCode)
   BAD_MEMBER(Operator)
   BAD_MEMBER(PrecedenceGroup)
+  BAD_MEMBER(Macro)
 
   // The children of these are automatically inserted into the
   // surrounding context.
@@ -53,9 +54,17 @@ public:
     return RetTy();
   }
 
+  RetTy visitMacroExpansionDecl(MacroExpansionDecl *D) {
+    // Expansion already visited as auxiliary decls.
+    return RetTy();
+  }
+
   /// A convenience method to visit all the members.
   void visitMembers(NominalTypeDecl *D) {
     for (Decl *member : D->getMembers()) {
+      member->visitAuxiliaryDecls([&](Decl *decl) {
+        asImpl().visit(decl);
+      });
       asImpl().visit(member);
     }
   }

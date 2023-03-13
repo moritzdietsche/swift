@@ -27,7 +27,7 @@
 using namespace swift;
 using namespace swift::Lowering;
 
-/// Find an opened archetype represented by this type.
+/// Find a local archetype represented by this type.
 /// It is assumed by this method that the type contains
 /// at most one opened archetype.
 /// Typically, it would be called from a type visitor.
@@ -36,13 +36,14 @@ using namespace swift::Lowering;
 /// this is the task of the type visitor invoking it.
 /// \returns The found archetype or empty type otherwise.
 CanOpenedArchetypeType swift::getOpenedArchetypeOf(CanType Ty) {
+  return dyn_cast_or_null<OpenedArchetypeType>(getLocalArchetypeOf(Ty));
+}
+CanLocalArchetypeType swift::getLocalArchetypeOf(CanType Ty) {
   if (!Ty)
-    return CanOpenedArchetypeType();
+    return CanLocalArchetypeType();
   while (auto MetaTy = dyn_cast<AnyMetatypeType>(Ty))
     Ty = MetaTy.getInstanceType();
-  if (Ty->isOpenedExistential())
-    return cast<OpenedArchetypeType>(Ty);
-  return CanOpenedArchetypeType();
+  return dyn_cast<LocalArchetypeType>(Ty);
 }
 
 SILType SILType::getExceptionType(const ASTContext &C) {
@@ -102,6 +103,10 @@ SILType SILType::getSILTokenType(const ASTContext &C) {
   return getPrimitiveObjectType(C.TheSILTokenType);
 }
 
+SILType SILType::getPackIndexType(const ASTContext &C) {
+  return getPrimitiveObjectType(C.ThePackIndexType);
+}
+
 bool SILType::isTrivial(const SILFunction &F) const {
   auto contextType = hasTypeParameter() ? F.mapTypeIntoContext(*this) : *this;
   
@@ -116,7 +121,10 @@ bool SILType::isOrContainsRawPointer(const SILFunction &F) const {
 bool SILType::isNonTrivialOrContainsRawPointer(const SILFunction &F) const {
   auto contextType = hasTypeParameter() ? F.mapTypeIntoContext(*this) : *this;
   const TypeLowering &tyLowering = F.getTypeLowering(contextType);
-  return !tyLowering.isTrivial() || tyLowering.isOrContainsRawPointer();
+  bool result = !tyLowering.isTrivial() || tyLowering.isOrContainsRawPointer();
+  assert((result || !isFunctionTypeWithContext()) &&
+         "a function type with context must either be non trivial or marked as containing a pointer");
+  return result;
 }
 
 bool SILType::isEmpty(const SILFunction &F) const {
@@ -319,6 +327,10 @@ SILType SILType::getFieldType(VarDecl *field, SILModule &M,
   return getFieldType(field, M.Types, context);
 }
 
+SILType SILType::getFieldType(VarDecl *field, SILFunction *fn) const {
+  return getFieldType(field, fn->getModule(), fn->getTypeExpansionContext());
+}
+
 SILType SILType::getEnumElementType(EnumElementDecl *elt, TypeConverter &TC,
                                     TypeExpansionContext context) const {
   assert(elt->getDeclContext() == getEnumOrBoundGenericEnum());
@@ -440,6 +452,12 @@ bool SILType::aggregateContainsRecord(SILType Record, SILModule &Mod,
 bool SILType::aggregateHasUnreferenceableStorage() const {
   if (auto s = getStructOrBoundGenericStruct()) {
     return s->hasUnreferenceableStorage();
+  }
+  // Tuples with pack expansions don't *actually* have unreferenceable
+  // storage, but the optimizer needs to be taught how to handle them,
+  // and it won't do that correctly in the short term.
+  if (auto t = getAs<TupleType>()) {
+    return t.containsPackExpansionType();
   }
   return false;
 }
@@ -593,6 +611,7 @@ SILResultInfo::getOwnershipKind(SILFunction &F,
       getSILStorageType(M, FTy, TypeExpansionContext::minimal()).isTrivial(F);
   switch (getConvention()) {
   case ResultConvention::Indirect:
+  case ResultConvention::Pack:
     return SILModuleConventions(M).isSILIndirect(*this) ? OwnershipKind::None
                                                         : OwnershipKind::Owned;
   case ResultConvention::Autoreleased:
@@ -783,7 +802,7 @@ bool SILType::isLoweringOf(TypeExpansionContext context, SILModule &Mod,
 bool SILType::isDifferentiable(SILModule &M) const {
   return getASTType()
       ->getAutoDiffTangentSpace(LookUpConformanceInModule(M.getSwiftModule()))
-      .hasValue();
+      .has_value();
 }
 
 Type
@@ -851,7 +870,7 @@ bool SILType::isEffectivelyExhaustiveEnumType(SILFunction *f) {
                                        f->getResilienceExpansion());
 }
 
-SILType SILType::getSILBoxFieldType(const SILFunction *f, unsigned field) {
+SILType SILType::getSILBoxFieldType(const SILFunction *f, unsigned field) const {
   auto *boxTy = getASTType()->getAs<SILBoxType>();
   if (!boxTy)
     return SILType();
@@ -936,13 +955,26 @@ SILType::getSingletonAggregateFieldType(SILModule &M,
 }
 
 bool SILType::isMoveOnly() const {
-  if (auto *nom = getNominalOrBoundGenericNominal())
-    if (nom->isMoveOnly())
-      return true;
+  // Nominal types are move-only if declared as such.
+  if (isMoveOnlyNominalType())
+    return true;
+
+
+  // TODO: Nonescaping closures ought to be treated as move-only in SIL.
+  // They aren't marked move-only now, because the necessary move-only passes
+  // haven't yet been enabled. We can get away without this because we don't
+  // ever copy them after SILGen and any incidental copies we emit are always
+  // optimized out, but we ought to enforce this once move-only type support
+  // is robust.
+  /*
+  if (auto fnTy = getAs<SILFunctionType>()) {
+    return fnTy->isTrivialNoEscape();
+  }
+   */
   return isMoveOnlyWrapped();
 }
 
-bool SILType::isMoveOnlyType() const {
+bool SILType::isMoveOnlyNominalType() const {
   if (auto *nom = getNominalOrBoundGenericNominal())
     if (nom->isMoveOnly())
       return true;

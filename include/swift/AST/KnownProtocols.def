@@ -74,6 +74,7 @@ PROTOCOL(CaseIterable)
 PROTOCOL(SIMD)
 PROTOCOL(SIMDScalar)
 PROTOCOL(BinaryInteger)
+PROTOCOL(FixedWidthInteger)
 PROTOCOL(RangeReplaceableCollection)
 PROTOCOL(SerialExecutor)
 PROTOCOL(GlobalActor)
@@ -105,6 +106,12 @@ PROTOCOL(DistributedTargetInvocationDecoder)
 PROTOCOL(DistributedTargetInvocationResultHandler)
 
 // C++ Standard Library Overlay:
+PROTOCOL(CxxConvertibleToCollection)
+PROTOCOL(CxxDictionary)
+PROTOCOL(CxxOptional)
+PROTOCOL(CxxPair)
+PROTOCOL(CxxSet)
+PROTOCOL(CxxRandomAccessCollection)
 PROTOCOL(CxxSequence)
 PROTOCOL(UnsafeCxxInputIterator)
 PROTOCOL(UnsafeCxxRandomAccessIterator)
@@ -114,8 +121,7 @@ PROTOCOL(AsyncIteratorProtocol)
 
 PROTOCOL(FloatingPoint)
 
-// Compiler Plugins
-PROTOCOL_(CompilerPlugin)
+PROTOCOL_(Copyable)
 
 EXPRESSIBLE_BY_LITERAL_PROTOCOL(ExpressibleByArrayLiteral, "Array", false)
 EXPRESSIBLE_BY_LITERAL_PROTOCOL(ExpressibleByBooleanLiteral, "BooleanLiteralType", true)

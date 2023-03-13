@@ -36,6 +36,21 @@ class Controller {
     0
   }
   
+  subscript<T>(array: [T]) -> T? {
+    array.first
+  }
+
+  subscript<T, U>(array: [T], array2: [U]) -> T? {
+    array.first
+  }
+
+  subscript<T>(array array: [T]) -> T? {
+    array.first
+  }
+
+  subscript<T, U>(array array: [T], array2 array2: [U]) -> T? {
+    array.first
+  }
 }
 
 struct S {
@@ -93,3 +108,16 @@ print(\Controller[int: 0, str: "", 0])
 print(\Controller.thirdLabel)
 // CHECK: {{\\Controller\.subscript\(\)|\\Controller\.<computed 0x.* \(Int\)>}}
 print(\Controller.[])
+// CHECK: \Controller.self
+print(\Controller.self)
+
+// Subscripts with dependent generic types don't produce good output currently,
+// so we're just checking to make sure they don't crash.
+// CHECK: \Controller.
+print(\Controller[[42]])
+// CHECK: Controller.
+print(\Controller[[42], [42]])
+// CHECK: \Controller.
+print(\Controller[array: [42]])
+// CHECK: \Controller.
+print(\Controller[array: [42], array2: [42]])

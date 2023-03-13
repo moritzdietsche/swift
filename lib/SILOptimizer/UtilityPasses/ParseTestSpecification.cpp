@@ -29,8 +29,8 @@ void findAndDeleteTraceValues(SILFunction *function,
                               SmallVectorImpl<SILValue> &values) {
   InstructionDeleter deleter;
   for (auto &block : *function) {
-    for (SILInstruction *inst : deleter.updatingRange(&block)) {
-      if (auto *debugValue = dyn_cast<DebugValueInst>(inst)) {
+    for (SILInstruction &inst : block.deletableInstructions()) {
+      if (auto *debugValue = dyn_cast<DebugValueInst>(&inst)) {
         if (!debugValue->hasTrace())
           continue;
         values.push_back(debugValue->getOperand());
@@ -399,7 +399,7 @@ private:
       }
       auto index = subscript->get<unsigned long long>();
       return getInstructionAtIndex(index,
-                                   within.getValueOr(context->getFunction()));
+                                   within.value_or(context->getFunction()));
     }
     llvm_unreachable("bad suffix after 'instruction'!?");
   }
@@ -544,7 +544,6 @@ static TraceValueMap traceValues;
 
 class ParseTestSpecification {
   friend class ParseArgumentSpecification;
-  SILFunction *function;
   SmallVectorImpl<StringRef> &components;
 
   SILValue getTraceValue(unsigned index, SILFunction *function) {
@@ -561,9 +560,8 @@ class ParseTestSpecification {
   }
 
 public:
-  ParseTestSpecification(SILFunction *function,
-                         SmallVectorImpl<StringRef> &components)
-      : function(function), components(components) {}
+  ParseTestSpecification(SmallVectorImpl<StringRef> &components)
+      : components(components) {}
 
   void parse(UnparsedSpecification const &specification, Arguments &arguments) {
     StringRef specificationString = specification.string;
@@ -586,6 +584,46 @@ SILValue ParseArgumentSpecification::getTraceValue(unsigned index,
 
 } // anonymous namespace
 
+// Member function implementations
+
+void Argument::print(llvm::raw_ostream &os) {
+  switch (kind) {
+  case Kind::Value:
+    llvm::errs() << "value:\n";
+    cast<ValueArgument>(*this).getValue()->print(os);
+    break;
+  case Kind::Operand:
+    os << "operand:\n";
+    cast<OperandArgument>(*this).getValue()->print(os);
+    break;
+  case Kind::Instruction:
+    os << "instruction:\n";
+    cast<InstructionArgument>(*this).getValue()->print(os);
+    break;
+  case Kind::BlockArgument:
+    os << "block argument:\n";
+    cast<BlockArgumentArgument>(*this).getValue()->print(os);
+    break;
+  case Kind::Block:
+    os << "block:\n";
+    cast<BlockArgument>(*this).getValue()->print(os);
+    break;
+  case Kind::Function:
+    os << "function:\n";
+    cast<FunctionArgument>(*this).getValue()->print(os);
+    break;
+  case Kind::Bool:
+    os << "bool: " << cast<BoolArgument>(*this).getValue() << "\n";
+    break;
+  case Kind::UInt:
+    os << "uint: " << cast<UIntArgument>(*this).getValue() << "\n";
+    break;
+  case Kind::String:
+    os << "string: " << cast<StringArgument>(*this).getValue() << "\n";
+    break;
+  }
+}
+
 // API
 
 void swift::test::getTestSpecifications(
@@ -593,8 +631,8 @@ void swift::test::getTestSpecifications(
     SmallVectorImpl<UnparsedSpecification> &specifications) {
   InstructionDeleter deleter;
   for (auto &block : *function) {
-    for (SILInstruction *inst : deleter.updatingRange(&block)) {
-      if (auto *tsi = dyn_cast<TestSpecificationInst>(inst)) {
+    for (SILInstruction &inst : block.deletableInstructions()) {
+      if (auto *tsi = dyn_cast<TestSpecificationInst>(&inst)) {
         auto ref = tsi->getArgumentsSpecification();
         auto *anchor = findAnchorInstructionAfter(tsi);
         specifications.push_back({std::string(ref.begin(), ref.end()), anchor});
@@ -607,6 +645,6 @@ void swift::test::getTestSpecifications(
 void swift::test::parseTestArgumentsFromSpecification(
     SILFunction *function, UnparsedSpecification const &specification,
     Arguments &arguments, SmallVectorImpl<StringRef> &argumentStrings) {
-  ParseTestSpecification parser(function, argumentStrings);
+  ParseTestSpecification parser(argumentStrings);
   parser.parse(specification, arguments);
 }

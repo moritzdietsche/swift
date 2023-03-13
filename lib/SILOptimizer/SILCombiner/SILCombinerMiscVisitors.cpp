@@ -1338,6 +1338,16 @@ SILCombiner::visitInjectEnumAddrInst(InjectEnumAddrInst *IEAI) {
   // can't handle the payload case here due to the flow problems caused by the
   // dependency in between the enum and its data.
 
+  // Disable this for empty typle type because empty tuple stack locations maybe
+  // uninitialized. And converting to value form loses tag information.
+  if (IEAI->getElement()->hasAssociatedValues()) {
+    SILType elemType = IEAI->getOperand()->getType().getEnumElementType(
+        IEAI->getElement(), IEAI->getFunction());
+    if (elemType.isEmpty(*IEAI->getFunction())) {
+      return nullptr;
+    }
+  }
+
   assert(IEAI->getOperand()->getType().isAddress() && "Must be an address");
   Builder.setCurrentDebugScope(IEAI->getDebugScope());
 
@@ -2337,4 +2347,47 @@ SILCombiner::legacyVisitGlobalValueInst(GlobalValueInst *globalValue) {
     eraseInstFromFunction(*inst);
   }
   return nullptr;
+
+}
+
+// Simplify `differentiable_function_extract` of `differentiable_function`.
+//
+// Before:
+// %diff_func = differentiable_function(%orig, %jvp, %vjp)
+// %orig' = differentiable_function_extract [original] %diff_func
+// %jvp'  = differentiable_function_extract [jvp]      %diff_func
+// %vjp'  = differentiable_function_extract [vjp]      %diff_func
+//
+// After:
+// %orig' = %orig
+// %jvp' = %jvp
+// %vjp' = %vjp
+SILInstruction *
+SILCombiner::visitDifferentiableFunctionExtractInst(DifferentiableFunctionExtractInst *DFEI) {
+  auto *DFI = dyn_cast<DifferentiableFunctionInst>(DFEI->getOperand());
+  if (!DFI)
+    return nullptr;
+
+  if (!DFI->hasExtractee(DFEI->getExtractee()))
+    return nullptr;
+
+  SILValue newValue = DFI->getExtractee(DFEI->getExtractee());
+
+  // If the type of the `differentiable_function` operand does not precisely
+  // match the type of the original `differentiable_function_extract`,
+  // create a `convert_function`.
+  if (newValue->getType() != DFEI->getType()) {
+    CanSILFunctionType opTI = newValue->getType().castTo<SILFunctionType>();
+    CanSILFunctionType resTI = DFEI->getType().castTo<SILFunctionType>();
+    if (!opTI->isABICompatibleWith(resTI, *DFEI->getFunction()).isCompatible())
+      return nullptr;
+
+    std::tie(newValue, std::ignore) =
+      castValueToABICompatibleType(&Builder, DFEI->getLoc(),
+                                   newValue,
+                                   newValue->getType(), DFEI->getType(), {});
+  }
+
+  replaceInstUsesWith(*DFEI, newValue);
+  return eraseInstFromFunction(*DFEI);
 }

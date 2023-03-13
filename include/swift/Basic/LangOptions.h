@@ -85,6 +85,10 @@ namespace swift {
     /// all decls in the module are considered to be SPI including public ones.
     SPI,
 
+    /// Internal Programming Interface that is not distributed and only usable
+    /// from within a project.
+    IPI,
+
     /// The library has some other undefined distribution.
     Other
   };
@@ -278,6 +282,8 @@ namespace swift {
     /// disabled because it is not complete.
     bool EnableCXXInterop = false;
 
+    bool CForeignReferenceTypes = false;
+
     /// Imports getters and setters as computed properties.
     bool CxxInteropGettersSettersAsProperties = false;
 
@@ -325,7 +331,7 @@ namespace swift {
     bool UseMalloc = false;
 
     /// Specifies how strict concurrency checking will be.
-    StrictConcurrency StrictConcurrencyLevel = StrictConcurrency::Targeted;
+    StrictConcurrency StrictConcurrencyLevel = StrictConcurrency::Minimal;
 
     /// Enable experimental concurrency model.
     bool EnableExperimentalConcurrency = false;
@@ -346,15 +352,26 @@ namespace swift {
     /// Disable the implicit import of the _StringProcessing module.
     bool DisableImplicitStringProcessingModuleImport = false;
 
+    /// Disable the implicit import of the _Backtracing module.
+    bool DisableImplicitBacktracingModuleImport =
+        !SWIFT_IMPLICIT_BACKTRACING_IMPORT;
+
     /// Should we check the target OSs of serialized modules to see that they're
     /// new enough?
     bool EnableTargetOSChecking = true;
 
-    /// Whether to attempt to recover from missing cross-references and other
-    /// errors when deserializing from a Swift module.
+    /// Whether to attempt to recover from missing cross-references,
+    /// differences in APIs between language versions, and other
+    /// errors when deserializing from a binary swiftmodule file.
     ///
-    /// This is a staging flag; eventually it will be removed.
+    /// This feature should only be disabled for testing as regular builds
+    /// rely heavily on it.
     bool EnableDeserializationRecovery = true;
+
+    /// Enable early skipping deserialization of decls that are marked as
+    /// unsafe to read.
+    bool EnableDeserializationSafety =
+      ::getenv("SWIFT_ENABLE_DESERIALIZATION_SAFETY");
 
     /// Whether to enable the new operator decl and precedencegroup lookup
     /// behavior. This is a staging flag, and will be removed in the future.
@@ -382,6 +399,9 @@ namespace swift {
 
     /// Access or distribution level of the whole module being parsed.
     LibraryLevel LibraryLevel = LibraryLevel::Other;
+
+    /// The name of the package this module belongs to.
+    std::string PackageName;
 
     /// Warn about cases where Swift 3 would infer @objc but later versions
     /// of Swift do not.
@@ -417,19 +437,6 @@ namespace swift {
 
     /// Whether collect tokens during parsing for syntax coloring.
     bool CollectParsedToken = false;
-
-    /// Whether to parse syntax tree. If the syntax tree is built, the generated
-    /// AST may not be correct when syntax nodes are reused as part of
-    /// incrementals parsing.
-    bool BuildSyntaxTree = false;
-
-    /// Whether parsing is occurring for creation of syntax tree only, and no typechecking will occur after
-    /// parsing e.g. when parsing for SwiftSyntax. This is intended to affect parsing, e.g. disable
-    /// unnecessary name lookups that are not useful for pure syntactic parsing.
-    bool ParseForSyntaxTreeOnly = false;
-
-    /// Whether to verify the parsed syntax tree and emit related diagnostics.
-    bool VerifySyntaxTree = false;
 
     /// Whether to disable the evaluation of '#if' decls, such that the bodies
     /// of active clauses aren't hoisted into the enclosing scope.
@@ -526,8 +533,14 @@ namespace swift {
     /// Enables dumping type witness systems from associated type inference.
     bool DumpTypeWitnessSystems = false;
 
+    /// Enables dumping macro expansions.
+    bool DumpMacroExpansions = false;
+
     /// The model of concurrency to be used.
     ConcurrencyModel ActiveConcurrencyModel = ConcurrencyModel::Standard;
+
+    /// Allows the explicit 'import Builtin' within Swift modules.
+    bool EnableBuiltinModule = false;
 
     bool isConcurrencyModelTaskToThread() const {
       return ActiveConcurrencyModel == ConcurrencyModel::TaskToThread;
@@ -630,6 +643,21 @@ namespace swift {
       llvm::raw_svector_ostream OS(Scratch);
       OS << EffectiveLanguageVersion;
       return llvm::hash_combine(Target.str(), OS.str());
+    }
+
+    /// Return a hash code of any components from these options that should
+    /// contribute to a Swift Dependency Scanning hash.
+    llvm::hash_code getModuleScanningHashComponents() const {
+      auto hashValue = getPCHHashComponents();
+      if (TargetVariant.has_value())
+        hashValue = llvm::hash_combine(hashValue, TargetVariant.value().str());
+      if (ClangTarget.has_value())
+        hashValue = llvm::hash_combine(hashValue, ClangTarget.value().str());
+      if (SDKVersion.has_value())
+        hashValue = llvm::hash_combine(hashValue, SDKVersion.value().getAsString());
+      if (VariantSDKVersion.has_value())
+        hashValue = llvm::hash_combine(hashValue, VariantSDKVersion.value().getAsString());
+      return hashValue;
     }
 
   private:
@@ -762,6 +790,14 @@ namespace swift {
     /// Disable validating the persistent PCH.
     bool PCHDisableValidation = false;
 
+    /// Don't verify input files for Clang modules if the module has been
+    /// successfully validated or loaded during this build session.
+    bool ValidateModulesOnce = false;
+
+    /// Use the last modification time of this file as the underlying Clang
+    /// build session timestamp.
+    std::string BuildSessionFilePath;
+
     /// \see Mode
     enum class Modes : uint8_t {
       /// Set up Clang for importing modules into Swift and generating IR from
@@ -813,7 +849,7 @@ namespace swift {
 
     /// When building a PCM, rely on the Swift frontend's command-line -Xcc flags
     /// to build the Clang module via Clang frontend directly,
-    /// and completly bypass the Clang driver.
+    /// and completely bypass the Clang driver.
     bool DirectClangCC1ModuleBuild = false;
 
     /// Return a hash code of any components from these options that should
@@ -834,6 +870,12 @@ namespace swift {
                           DisableSwiftBridgeAttr,
                           DisableOverlayModules,
                           EnableClangSPI);
+    }
+
+    /// Return a hash code of any components from these options that should
+    /// contribute to a Swift Dependency Scanning hash.
+    llvm::hash_code getModuleScanningHashComponents() const {
+      return getPCHHashComponents();
     }
 
     std::vector<std::string> getRemappedExtraArgs(

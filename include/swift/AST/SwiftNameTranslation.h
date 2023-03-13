@@ -65,7 +65,14 @@ getNameForCxx(const ValueDecl *VD,
 
 enum RepresentationKind { Representable, Unsupported };
 
-enum RepresentationError { UnrepresentableActorClass };
+enum RepresentationError {
+  UnrepresentableAsync,
+  UnrepresentableIsolatedInActor,
+  UnrepresentableRequiresClientEmission,
+  UnrepresentableGeneric,
+  UnrepresentableGenericRequirements,
+  UnrepresentableThrows
+};
 
 struct DeclRepresentation {
   RepresentationKind kind;

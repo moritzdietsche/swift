@@ -515,11 +515,9 @@ public:
                                  const std::string &mangledName,
                                  MangledNameKind kind,
                                  Demangler &dem) {
-    size_t stringSize = mangledName.size() + 1; // + 1 for terminating NUL.
-
-    char *copiedString = dem.Allocate<char>(stringSize);
-    memcpy(copiedString, mangledName.data(), stringSize);
-    return demangle(RemoteRef<char>(remoteAddress, copiedString), kind, dem);
+    StringRef mangledNameCopy = dem.copyString(mangledName);
+    return demangle(RemoteRef<char>(remoteAddress, mangledNameCopy.data()),
+                    kind, dem);
   }
 
   /// Given a demangle tree, attempt to turn it into a type.
@@ -1246,6 +1244,9 @@ public:
       case GenericRequirementKind::Layout:
         return TypeLookupError(
             "Unexpected layout requirement in runtime generic signature");
+      case GenericRequirementKind::SameShape:
+        return TypeLookupError(
+            "Unexpected same-shape requirement in runtime generic signature");
       }
     }
 
@@ -1495,7 +1496,12 @@ public:
   
     return demangledSymbol;
   }
-  
+
+  Demangle::NodePointer buildContextManglingForSymbol(const std::string &symbol,
+                                                      Demangler &dem) {
+    return buildContextManglingForSymbol(dem.copyString(symbol), dem);
+  }
+
   /// Given a read context descriptor, attempt to build a demangling tree
   /// for it.
   Demangle::NodePointer
@@ -2768,6 +2774,9 @@ private:
             }
             break;
           }
+
+          case GenericRequirementKind::SameShape:
+            llvm_unreachable("Implement me");
           }
         }
 
@@ -2906,9 +2915,11 @@ private:
   template <
       typename T = BuilderType,
       typename std::enable_if_t<
-          !std::is_same<
-              bool,
-              decltype(T::needsToPrecomputeParentGenericContextShapes)>::value,
+          !(std::is_same<
+                const bool,
+                decltype(T::needsToPrecomputeParentGenericContextShapes)>::
+                value &&
+            T::needsToPrecomputeParentGenericContextShapes),
           bool> = true>
   BuiltTypeDecl buildNominalTypeDecl(ContextDescriptorRef descriptor) {
     // Build the demangling tree from the context tree.
@@ -2921,13 +2932,14 @@ private:
     return decl;
   }
 
-  template <
-      typename T = BuilderType,
-      typename std::enable_if_t<
-          std::is_same<
-              bool,
-              decltype(T::needsToPrecomputeParentGenericContextShapes)>::value,
-          bool> = true>
+  template <typename T = BuilderType,
+            typename std::enable_if_t<
+                std::is_same<
+                    const bool,
+                    decltype(T::needsToPrecomputeParentGenericContextShapes)>::
+                        value &&
+                    T::needsToPrecomputeParentGenericContextShapes,
+                bool> = true>
   BuiltTypeDecl buildNominalTypeDecl(ContextDescriptorRef descriptor) {
     // Build the demangling tree from the context tree.
     Demangler dem;
@@ -2944,12 +2956,23 @@ private:
                 countLevels(parentContext, runningCount);
 
           auto genericContext = current->getGenericContext();
-          if (!genericContext)
-            return;
-          auto contextHeader = genericContext->getGenericContextHeader();
-
-          paramsPerLevel.emplace_back(contextHeader.NumParams - runningCount);
-          runningCount += paramsPerLevel.back();
+          // Only consider generic contexts of type class, enum or struct.
+          // There are other context types that can be generic, but they should
+          // not affect the generic shape.
+          if (current->getKind() == ContextDescriptorKind::Class ||
+              current->getKind() == ContextDescriptorKind::Enum ||
+              current->getKind() == ContextDescriptorKind::Struct) {
+            if (genericContext) {
+              auto contextHeader = genericContext->getGenericContextHeader();
+              paramsPerLevel.emplace_back(contextHeader.NumParams -
+                                          runningCount);
+              runningCount += paramsPerLevel.back();
+            } else {
+              // If there is no generic context, this is a non-generic type
+              // which has 0 generic parameters.
+              paramsPerLevel.emplace_back(0);
+            }
+          }
         };
     countLevels(descriptor, runningCount);
     BuiltTypeDecl decl = Builder.createTypeDecl(node, paramsPerLevel);
@@ -3003,11 +3026,6 @@ private:
     for (auto param : generics->getGenericParams()) {
       switch (param.getKind()) {
       case GenericParamKind::Type:
-        // We don't know about type parameters with extra arguments.
-        if (param.hasExtraArgument()) {
-          return {};
-        }
-        
         // The type should have a key argument unless it's been same-typed
         // to another type.
         if (param.hasKeyArgument()) {
@@ -3034,6 +3052,9 @@ private:
         }
         break;
         
+      case GenericParamKind::TypePack:
+        assert(false && "Packs not supported here yet");
+
       default:
         // We don't know about this kind of parameter.
         return {};

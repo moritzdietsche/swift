@@ -12,6 +12,7 @@
 
 #include "clang/AST/DeclObjC.h"
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/Comment.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ProtocolConformance.h"
@@ -67,6 +68,7 @@ PrintOptions SymbolGraph::getDeclarationFragmentsPrintOptions() const {
   Opts.PrintGenericRequirements = true;
   Opts.PrintInherited = false;
   Opts.ExplodeEnumCaseDecls = true;
+  Opts.PrintFactoryInitializerComment = false;
 
   Opts.ExclusiveAttrList.clear();
 
@@ -188,6 +190,15 @@ SymbolGraph::isRequirementOrDefaultImplementation(const ValueDecl *VD) const {
 // MARK: - Symbols (Nodes)
 
 void SymbolGraph::recordNode(Symbol S) {
+  if (Walker.Options.SkipProtocolImplementations && S.getInheritedDecl()) {
+    const auto *DocCommentProvidingDecl =
+      getDocCommentProvidingDecl(S.getLocalSymbolDecl(), /*AllowSerialized=*/true);
+
+    // allow implementation symbols to remain if they have their own comment
+    if (DocCommentProvidingDecl != S.getLocalSymbolDecl())
+      return;
+  }
+
   Nodes.insert(S);
 
   // Record all of the possible relationships (edges) originating
@@ -263,8 +274,10 @@ void SymbolGraph::recordMemberRelationship(Symbol S) {
     case swift::DeclContextKind::SubscriptDecl:
     case swift::DeclContextKind::AbstractFunctionDecl:
     case swift::DeclContextKind::SerializedLocal:
+    case swift::DeclContextKind::Package:
     case swift::DeclContextKind::Module:
     case swift::DeclContextKind::FileUnit:
+    case swift::DeclContextKind::MacroDecl:
       break;
   }
 }
@@ -292,7 +305,7 @@ bool SymbolGraph::synthesizedMemberIsBestCandidate(const ValueDecl *VD,
 }
 
 void SymbolGraph::recordConformanceSynthesizedMemberRelationships(Symbol S) {
-  if (!Walker.Options.EmitSynthesizedMembers) {
+  if (!Walker.Options.EmitSynthesizedMembers || Walker.Options.SkipProtocolImplementations) {
     return;
   }
   const auto D = S.getLocalSymbolDecl();
@@ -376,7 +389,7 @@ void SymbolGraph::recordConformanceSynthesizedMemberRelationships(Symbol S) {
 
 void
 SymbolGraph::recordInheritanceRelationships(Symbol S) {
-  const auto VD = S.getSymbolDecl();
+  const auto VD = S.getLocalSymbolDecl();
   if (const auto *NTD = dyn_cast<NominalTypeDecl>(VD)) {
     for (const auto &InheritanceLoc : NTD->getInherited()) {
       auto Ty = InheritanceLoc.getType();
@@ -389,7 +402,7 @@ SymbolGraph::recordInheritanceRelationships(Symbol S) {
         continue;
       }
 
-      recordEdge(Symbol(this, VD, nullptr),
+      recordEdge(Symbol(this, NTD, nullptr),
                  Symbol(this, InheritedTypeDecl, nullptr),
                  RelationshipKind::InheritsFrom());
     }
@@ -411,11 +424,21 @@ void SymbolGraph::recordDefaultImplementationRelationships(Symbol S) {
 
           // If P is from a different module, and it's being added to a type
           // from the current module, add a `memberOf` relation to the extended
-          // protocol.
+          // protocol or the respective extension block.
           if (!Walker.isOurModule(MemberVD->getModuleContext()) && VD->getDeclContext()) {
-            if (auto *ExP = VD->getDeclContext()->getSelfNominalTypeDecl()) {
+            if (const auto *Extension =
+                    dyn_cast_or_null<ExtensionDecl>(VD->getDeclContext())) {
+              if (this->Walker.shouldBeRecordedAsExtension(Extension)) {
+                recordEdge(Symbol(this, VD, nullptr),
+                           Symbol(this, Extension, nullptr),
+                           RelationshipKind::MemberOf());
+                continue;
+              }
+            }
+            if (auto *ExtendedProtocol =
+                    VD->getDeclContext()->getSelfNominalTypeDecl()) {
               recordEdge(Symbol(this, VD, nullptr),
-                         Symbol(this, ExP, nullptr),
+                         Symbol(this, ExtendedProtocol, nullptr),
                          RelationshipKind::MemberOf());
             }
           }
@@ -535,6 +558,21 @@ void SymbolGraph::serialize(llvm::json::OStream &OS) {
         S.serialize(OS);
       }
     });
+
+#ifndef NDEBUG
+    // FIXME (solver-based-verification-sorting): In assert builds sort the
+    // edges so we get consistent symbol graph output. This allows us to compare
+    // the string representation of the symbolgraph between the solver-based
+    // and AST-based result.
+    // This can be removed once the AST-based cursor info has been removed.
+    SmallVector<Edge> Edges(this->Edges.begin(), this->Edges.end());
+    std::sort(Edges.begin(), Edges.end(), [](const Edge &LHS, const Edge &RHS) {
+      SmallString<256> LHSTargetUSR, RHSTargetUSR;
+      LHS.Target.getUSR(LHSTargetUSR);
+      RHS.Target.getUSR(RHSTargetUSR);
+      return LHSTargetUSR < RHSTargetUSR;
+    });
+#endif
 
     OS.attributeArray("relationships", [&](){
       for (const auto &Relationship : Edges) {

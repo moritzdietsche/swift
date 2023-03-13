@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2018 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2022 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -93,6 +93,8 @@ CONSTANT_OWNERSHIP_INST(Owned, ObjCMetatypeToObject)
 // not though.
 CONSTANT_OWNERSHIP_INST(None, AddressToPointer)
 CONSTANT_OWNERSHIP_INST(None, AllocStack)
+CONSTANT_OWNERSHIP_INST(None, AllocPack)
+CONSTANT_OWNERSHIP_INST(None, PackLength)
 CONSTANT_OWNERSHIP_INST(None, BeginAccess)
 CONSTANT_OWNERSHIP_INST(None, BindMemory)
 CONSTANT_OWNERSHIP_INST(None, RebindMemory)
@@ -107,6 +109,7 @@ CONSTANT_OWNERSHIP_INST(None, DynamicFunctionRef)
 CONSTANT_OWNERSHIP_INST(None, PreviousDynamicFunctionRef)
 CONSTANT_OWNERSHIP_INST(None, GlobalAddr)
 CONSTANT_OWNERSHIP_INST(None, BaseAddrForOffset)
+CONSTANT_OWNERSHIP_INST(None, HasSymbol)
 CONSTANT_OWNERSHIP_INST(None, IndexAddr)
 CONSTANT_OWNERSHIP_INST(None, IndexRawPointer)
 CONSTANT_OWNERSHIP_INST(None, InitEnumDataAddr)
@@ -128,6 +131,7 @@ CONSTANT_OWNERSHIP_INST(None, RefElementAddr)
 CONSTANT_OWNERSHIP_INST(None, RefTailAddr)
 CONSTANT_OWNERSHIP_INST(None, RefToRawPointer)
 CONSTANT_OWNERSHIP_INST(None, SelectEnumAddr)
+CONSTANT_OWNERSHIP_INST(None, SelectValue)
 CONSTANT_OWNERSHIP_INST(None, StringLiteral)
 CONSTANT_OWNERSHIP_INST(None, StructElementAddr)
 CONSTANT_OWNERSHIP_INST(None, SuperMethod)
@@ -141,7 +145,7 @@ CONSTANT_OWNERSHIP_INST(None, UncheckedTrivialBitCast)
 CONSTANT_OWNERSHIP_INST(None, ValueMetatype)
 CONSTANT_OWNERSHIP_INST(None, WitnessMethod)
 CONSTANT_OWNERSHIP_INST(None, StoreBorrow)
-CONSTANT_OWNERSHIP_INST(None, ConvertEscapeToNoEscape)
+CONSTANT_OWNERSHIP_INST(Owned, ConvertEscapeToNoEscape)
 CONSTANT_OWNERSHIP_INST(Unowned, InitBlockStorageHeader)
 CONSTANT_OWNERSHIP_INST(None, DifferentiabilityWitnessFunction)
 // TODO: It would be great to get rid of these.
@@ -152,6 +156,12 @@ CONSTANT_OWNERSHIP_INST(None, GetAsyncContinuation)
 CONSTANT_OWNERSHIP_INST(None, GetAsyncContinuationAddr)
 CONSTANT_OWNERSHIP_INST(None, ThinToThickFunction)
 CONSTANT_OWNERSHIP_INST(None, ExtractExecutor)
+CONSTANT_OWNERSHIP_INST(None, OpenPackElement)
+CONSTANT_OWNERSHIP_INST(None, DynamicPackIndex)
+CONSTANT_OWNERSHIP_INST(None, PackPackIndex)
+CONSTANT_OWNERSHIP_INST(None, ScalarPackIndex)
+CONSTANT_OWNERSHIP_INST(None, PackElementGet)
+CONSTANT_OWNERSHIP_INST(None, TuplePackElementAddr)
 
 #undef CONSTANT_OWNERSHIP_INST
 
@@ -166,7 +176,6 @@ CONSTANT_OWNERSHIP_INST(None, ExtractExecutor)
   }
 CONSTANT_OR_NONE_OWNERSHIP_INST(Guaranteed, StructExtract)
 CONSTANT_OR_NONE_OWNERSHIP_INST(Guaranteed, TupleExtract)
-CONSTANT_OR_NONE_OWNERSHIP_INST(Guaranteed, SelectValue)
 CONSTANT_OR_NONE_OWNERSHIP_INST(Guaranteed, DifferentiableFunctionExtract)
 CONSTANT_OR_NONE_OWNERSHIP_INST(Guaranteed, LinearFunctionExtract)
 // OpenExistentialValue opens the boxed value inside an existential
@@ -271,6 +280,7 @@ FORWARDING_OWNERSHIP_INST(InitExistentialRef)
 FORWARDING_OWNERSHIP_INST(DifferentiableFunction)
 FORWARDING_OWNERSHIP_INST(LinearFunction)
 FORWARDING_OWNERSHIP_INST(MarkMustCheck)
+FORWARDING_OWNERSHIP_INST(MarkUnresolvedReferenceBinding)
 FORWARDING_OWNERSHIP_INST(MoveOnlyWrapperToCopyableValue)
 FORWARDING_OWNERSHIP_INST(CopyableToMoveOnlyWrapperValue)
 #undef FORWARDING_OWNERSHIP_INST
@@ -346,7 +356,11 @@ ValueOwnershipKind ValueOwnershipKindClassifier::visitLoadInst(LoadInst *LI) {
 
 ValueOwnershipKind
 ValueOwnershipKindClassifier::visitPartialApplyInst(PartialApplyInst *PA) {
-  if (PA->isOnStack())
+  // partial_apply instructions are modeled as creating an owned value during
+  // OSSA, to track borrows of their captures, and so that they can themselves
+  // be borrowed during calls, but they become trivial once ownership is
+  // lowered away.
+  if (PA->isOnStack() && !PA->getFunction()->hasOwnership())
     return OwnershipKind::None;
   return OwnershipKind::Owned;
 }
@@ -382,6 +396,8 @@ struct ValueOwnershipKindBuiltinVisitor
 // This returns a value at +1 that is destroyed strictly /after/ the
 // UnsafeGuaranteedEnd. This provides the guarantee that we want.
 CONSTANT_OWNERSHIP_BUILTIN(Owned, COWBufferForReading)
+CONSTANT_OWNERSHIP_BUILTIN(None, AddressOfBorrowOpaque)
+CONSTANT_OWNERSHIP_BUILTIN(None, UnprotectedAddressOfBorrowOpaque)
 CONSTANT_OWNERSHIP_BUILTIN(None, AShr)
 CONSTANT_OWNERSHIP_BUILTIN(None, GenericAShr)
 CONSTANT_OWNERSHIP_BUILTIN(None, Add)
@@ -487,11 +503,15 @@ CONSTANT_OWNERSHIP_BUILTIN(None, AllocRaw)
 CONSTANT_OWNERSHIP_BUILTIN(None, AssertConf)
 CONSTANT_OWNERSHIP_BUILTIN(None, UToSCheckedTrunc)
 CONSTANT_OWNERSHIP_BUILTIN(None, StackAlloc)
+CONSTANT_OWNERSHIP_BUILTIN(None, UnprotectedStackAlloc)
 CONSTANT_OWNERSHIP_BUILTIN(None, StackDealloc)
 CONSTANT_OWNERSHIP_BUILTIN(None, SToSCheckedTrunc)
 CONSTANT_OWNERSHIP_BUILTIN(None, SToUCheckedTrunc)
 CONSTANT_OWNERSHIP_BUILTIN(None, UToUCheckedTrunc)
 CONSTANT_OWNERSHIP_BUILTIN(None, IntToFPWithOverflow)
+CONSTANT_OWNERSHIP_BUILTIN(None, BitWidth)
+CONSTANT_OWNERSHIP_BUILTIN(None, IsNegative)
+CONSTANT_OWNERSHIP_BUILTIN(None, WordAtIndex)
 
 // This is surprising, Builtin.unreachable returns a "Never" value which is
 // trivially typed.
@@ -553,6 +573,7 @@ CONSTANT_OWNERSHIP_BUILTIN(None, EndAsyncLet)
 CONSTANT_OWNERSHIP_BUILTIN(None, StartAsyncLetWithLocalBuffer)
 CONSTANT_OWNERSHIP_BUILTIN(None, EndAsyncLetLifetime)
 CONSTANT_OWNERSHIP_BUILTIN(None, CreateTaskGroup)
+CONSTANT_OWNERSHIP_BUILTIN(None, CreateTaskGroupWithFlags)
 CONSTANT_OWNERSHIP_BUILTIN(None, DestroyTaskGroup)
 CONSTANT_OWNERSHIP_BUILTIN(None, TaskRunInline)
 CONSTANT_OWNERSHIP_BUILTIN(None, Copy)

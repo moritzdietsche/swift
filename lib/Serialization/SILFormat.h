@@ -158,6 +158,9 @@ namespace sil_block {
     SIL_INST_LINEAR_FUNCTION_EXTRACT,
     SIL_INST_INCREMENT_PROFILER_COUNTER,
     SIL_MOVEONLY_DEINIT,
+    SIL_INST_HAS_SYMBOL,
+    SIL_PACK_ELEMENT_GET,
+    SIL_PACK_ELEMENT_SET,
   };
 
   using SILInstNoOperandLayout = BCRecordLayout<
@@ -293,6 +296,8 @@ namespace sil_block {
                      BCFixed<1>,  // is dynamically replacable
                      BCFixed<1>,  // exact self class
                      BCFixed<1>,  // is distributed
+                     BCFixed<1>,  // is runtime accessible
+                     BCFixed<1>,  // are lexical lifetimes force-enabled
                      TypeIDField, // SILFunctionType
                      DeclIDField,  // SILFunction name or 0 (replaced function)
                      DeclIDField,  // SILFunction name or 0 (used ad-hoc requirement witness function)
@@ -463,6 +468,29 @@ namespace sil_block {
     ValueIDField
   >;
 
+  // The pack_element_get instruction.
+  using SILPackElementGetLayout = BCRecordLayout<
+    SIL_PACK_ELEMENT_GET,
+    TypeIDField,            // element type
+    SILTypeCategoryField,   // element type category
+    TypeIDField,            // pack type
+    SILTypeCategoryField,   // pack type category
+    ValueIDField,           // pack value
+    ValueIDField            // index value
+  >;
+
+  // The pack_element_set instruction.
+  using SILPackElementSetLayout = BCRecordLayout<
+    SIL_PACK_ELEMENT_SET,
+    TypeIDField,            // element type
+    SILTypeCategoryField,   // element type category
+    ValueIDField,           // element value
+    TypeIDField,            // pack type
+    SILTypeCategoryField,   // pack type category
+    ValueIDField,           // pack value
+    ValueIDField            // index value
+  >;
+
   // The tail_addr instruction.
   using SILTailAddrLayout = BCRecordLayout<
     SIL_TAIL_ADDR,
@@ -528,6 +556,12 @@ namespace sil_block {
     IdentifierIDField,       // PGO func hash
     BCVBR<8>,                // counter index
     BCVBR<8>                 // num counters
+  >;
+
+  using SILInstHasSymbolLayout = BCRecordLayout<
+    SIL_INST_HAS_SYMBOL,
+    ValueIDField,               // decl
+    BCArray<IdentifierIDField>  // referenced functions
   >;
 }
 

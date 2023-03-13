@@ -193,7 +193,7 @@ TreatArrayLiteralAsDictionary *
 TreatArrayLiteralAsDictionary::attempt(ConstraintSystem &cs, Type dictionaryTy,
                                        Type arrayTy,
                                        ConstraintLocator *locator) {
-  if (!cs.isArrayType(arrayTy))
+  if (!arrayTy->isArrayType())
     return nullptr;
 
   // Determine the ArrayExpr from the locator.
@@ -400,25 +400,26 @@ bool MissingConformance::diagnose(const Solution &solution, bool asNote) const {
     auto &cs = solution.getConstraintSystem();
     auto context = cs.getContextualTypePurpose(locator->getAnchor());
     MissingContextualConformanceFailure failure(
-        solution, context, NonConformingType, ProtocolType, locator);
+        solution, context, getNonConformingType(), getProtocolType(), locator);
     return failure.diagnose(asNote);
   }
 
   MissingConformanceFailure failure(
-      solution, locator, std::make_pair(NonConformingType, ProtocolType));
+      solution, locator,
+      std::make_pair(getNonConformingType(), getProtocolType()));
   return failure.diagnose(asNote);
 }
 
-bool MissingConformance::diagnoseForAmbiguity(
+bool RequirementFix::diagnoseForAmbiguity(
     CommonFixesArray commonFixes) const {
-  auto *primaryFix = commonFixes.front().second->getAs<MissingConformance>();
+  auto *primaryFix = commonFixes.front().second;
   assert(primaryFix);
 
   if (llvm::all_of(
           commonFixes,
           [&primaryFix](
               const std::pair<const Solution *, const ConstraintFix *> &entry) {
-            return primaryFix->isEqual(entry.second);
+            return primaryFix->getLocator() == entry.second->getLocator();
           }))
     return diagnose(*commonFixes.front().first);
 
@@ -433,8 +434,9 @@ bool MissingConformance::isEqual(const ConstraintFix *other) const {
     return false;
 
   return IsContextual == conformanceFix->IsContextual &&
-         NonConformingType->isEqual(conformanceFix->NonConformingType) &&
-         ProtocolType->isEqual(conformanceFix->ProtocolType);
+         getNonConformingType()->isEqual(
+             conformanceFix->getNonConformingType()) &&
+         getProtocolType()->isEqual(conformanceFix->getProtocolType());
 }
 
 MissingConformance *
@@ -467,6 +469,11 @@ SkipSameTypeRequirement::create(ConstraintSystem &cs, Type lhs, Type rhs,
 
 bool SkipSameShapeRequirement::diagnose(const Solution &solution,
                                        bool asNote) const {
+  if (getLocator()->isLastElement<LocatorPathElt::PackShape>()) {
+    SameShapeExpansionFailure failure(solution, LHS, RHS, getLocator());
+    return failure.diagnose(asNote);
+  }
+
   SameShapeRequirementFailure failure(solution, LHS, RHS, getLocator());
   return failure.diagnose(asNote);
 }
@@ -615,6 +622,10 @@ bool AllowTupleTypeMismatch::coalesceAndDiagnose(
     purpose = cs.getContextualTypePurpose(locator->getAnchor());
   }
 
+  if (!getFromType()->is<TupleType>() || !getToType()->is<TupleType>()) {
+    return false;
+  }
+
   TupleContextualFailure failure(solution, purpose, getFromType(), getToType(),
                                  indices, locator);
   return failure.diagnose(asNote);
@@ -721,10 +732,31 @@ AllowFunctionTypeMismatch::create(ConstraintSystem &cs, Type lhs, Type rhs,
       AllowFunctionTypeMismatch(cs, lhs, rhs, locator, index);
 }
 
+bool GenericArgumentsMismatch::coalesceAndDiagnose(
+    const Solution &solution, ArrayRef<ConstraintFix *> secondaryFixes,
+    bool asNote) const {
+  std::set<unsigned> scratch(getMismatches().begin(), getMismatches().end());
+
+  for (auto *fix : secondaryFixes) {
+    auto *genericArgsFix = fix->castTo<GenericArgumentsMismatch>();
+    for (auto mismatchIdx : genericArgsFix->getMismatches())
+      scratch.insert(mismatchIdx);
+  }
+
+  SmallVector<unsigned> mismatches(scratch.begin(), scratch.end());
+  return diagnose(solution, mismatches, asNote);
+}
+
 bool GenericArgumentsMismatch::diagnose(const Solution &solution,
                                         bool asNote) const {
+  return diagnose(solution, getMismatches(), asNote);
+}
+
+bool GenericArgumentsMismatch::diagnose(const Solution &solution,
+                                        ArrayRef<unsigned> mismatches,
+                                        bool asNote) const {
   GenericArgumentsMismatchFailure failure(solution, getFromType(), getToType(),
-                                          getMismatches(), getLocator());
+                                          mismatches, getLocator());
   return failure.diagnose(asNote);
 }
 
@@ -1321,6 +1353,54 @@ bool NotCompileTimeConst::diagnose(const Solution &solution, bool asNote) const 
   return failure.diagnose(asNote);
 }
 
+MustBeCopyable::MustBeCopyable(ConstraintSystem &cs, Type noncopyableTy, ConstraintLocator *locator)
+    : ConstraintFix(cs, FixKind::MustBeCopyable, locator, FixBehavior::Error),
+      noncopyableTy(noncopyableTy) {}
+
+bool MustBeCopyable::diagnose(const Solution &solution, bool asNote) const {
+  NotCopyableFailure failure(solution, noncopyableTy, getLocator());
+  return failure.diagnose(asNote);
+}
+
+MustBeCopyable* MustBeCopyable::create(ConstraintSystem &cs,
+                                              Type noncopyableTy,
+                                              ConstraintLocator *locator) {
+  return new (cs.getAllocator()) MustBeCopyable(cs, noncopyableTy, locator);
+}
+
+bool MustBeCopyable::diagnoseForAmbiguity(CommonFixesArray commonFixes) const {
+  // Only diagnose if all solutions agreed on the same errant non-copyable type.
+  Type firstNonCopyable;
+  for (const auto &solutionAndFix : commonFixes) {
+    const auto *solution = solutionAndFix.first;
+    const auto *fix = solutionAndFix.second->getAs<MustBeCopyable>();
+
+    auto otherNonCopyable = solution->simplifyType(fix->noncopyableTy);
+    if (!firstNonCopyable)
+      firstNonCopyable = otherNonCopyable;
+
+    if (firstNonCopyable->getCanonicalType() != otherNonCopyable->getCanonicalType()) {
+      return false; // fixes differed, so decline to emit a tailored diagnostic.
+    }
+  }
+
+  return diagnose(*commonFixes.front().first);
+}
+
+bool AllowInvalidPackElement::diagnose(const Solution &solution,
+                                       bool asNote) const {
+  InvalidPackElement failure(solution, packElementType, getLocator());
+  return failure.diagnose(asNote);
+}
+
+AllowInvalidPackElement *
+AllowInvalidPackElement::create(ConstraintSystem &cs,
+                                Type packElementType,
+                                ConstraintLocator *locator) {
+  return new (cs.getAllocator())
+      AllowInvalidPackElement(cs, packElementType, locator);
+}
+
 bool CollectionElementContextualMismatch::diagnose(const Solution &solution,
                                                    bool asNote) const {
   CollectionElementContextualFailure failure(
@@ -1631,7 +1711,7 @@ ExpandArrayIntoVarargs::attempt(ConstraintSystem &cs, Type argType,
   if (!(argLoc && argLoc->getParameterFlags().isVariadic()))
     return nullptr;
 
-  auto elementType = cs.isArrayType(argType);
+  auto elementType = argType->isArrayType();
   if (!elementType)
     return nullptr;
 
@@ -1639,7 +1719,7 @@ ExpandArrayIntoVarargs::attempt(ConstraintSystem &cs, Type argType,
   options |= ConstraintSystem::TypeMatchFlags::TMF_ApplyingFix;
   options |= ConstraintSystem::TypeMatchFlags::TMF_GenerateConstraints;
 
-  auto result = cs.matchTypes(*elementType, paramType, ConstraintKind::Subtype,
+  auto result = cs.matchTypes(elementType, paramType, ConstraintKind::Subtype,
                               options, builder);
 
   if (result.isFailure())
@@ -2595,4 +2675,30 @@ RenameConflictingPatternVariables::create(ConstraintSystem &cs, Type expectedTy,
       size, alignof(RenameConflictingPatternVariables));
   return new (mem)
       RenameConflictingPatternVariables(cs, expectedTy, conflicts, locator);
+}
+
+bool MacroMissingPound::diagnose(const Solution &solution,
+                                                 bool asNote) const {
+  AddMissingMacroPound failure(solution, macro, getLocator());
+  return failure.diagnose(asNote);
+}
+
+MacroMissingPound *
+MacroMissingPound::create(ConstraintSystem &cs, MacroDecl *macro,
+                          ConstraintLocator *locator) {
+  return new (cs.getAllocator()) MacroMissingPound(cs, macro, locator);
+}
+
+bool AllowGlobalActorMismatch::diagnose(const Solution &solution,
+                                        bool asNote) const {
+  GlobalActorFunctionMismatchFailure failure(solution, getFromType(),
+                                             getToType(), getLocator());
+  return failure.diagnose(asNote);
+}
+
+AllowGlobalActorMismatch *
+AllowGlobalActorMismatch::create(ConstraintSystem &cs, Type fromType,
+                                 Type toType, ConstraintLocator *locator) {
+  return new (cs.getAllocator())
+      AllowGlobalActorMismatch(cs, fromType, toType, locator);
 }

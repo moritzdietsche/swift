@@ -69,7 +69,7 @@ let releaseDevirtualizerPass = FunctionPass(
 
 /// Tries to de-virtualize the final release of a stack-promoted object.
 private func tryDevirtualizeReleaseOfObject(
-  _ context: PassContext,
+  _ context: FunctionPassContext,
   _ release: RefCountingInst,
   _ deallocStackRef: DeallocStackRefInst
 ) {
@@ -78,7 +78,7 @@ private func tryDevirtualizeReleaseOfObject(
   // Check if the release instruction right before the `dealloc_stack_ref` really releases
   // the allocated object (and not something else).
   var finder = FindAllocationOfRelease(allocation: allocRefInstruction)
-  if !finder.allocationIsRoot(of: release.operand) {
+  if !finder.allocationIsRoot(of: release.operand.value) {
     return
   }
 
@@ -88,7 +88,7 @@ private func tryDevirtualizeReleaseOfObject(
     return
   }
 
-  let builder = Builder(at: release, location: release.location, context)
+  let builder = Builder(before: release, location: release.location, context)
 
   var object: Value = allocRefInstruction
   if object.type != type {

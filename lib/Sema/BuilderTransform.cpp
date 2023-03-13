@@ -16,9 +16,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "MiscDiagnostics.h"
-#include "TypeChecker.h"
 #include "TypeCheckAvailability.h"
-#include "swift/Sema/IDETypeChecking.h"
+#include "TypeChecker.h"
 #include "swift/AST/ASTPrinter.h"
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ASTWalker.h"
@@ -27,14 +26,15 @@
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/Sema/ConstraintSystem.h"
+#include "swift/Sema/IDETypeChecking.h"
 #include "swift/Sema/SolutionResult.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include <iterator>
 #include <map>
 #include <memory>
-#include <utility>
 #include <tuple>
+#include <utility>
 
 using namespace swift;
 using namespace constraints;
@@ -358,14 +358,13 @@ protected:
     // If there is a constraint system, generate constraints for the pattern
     // binding.
     if (cs) {
-      SolutionApplicationTarget target(patternBinding);
-      if (cs->generateConstraints(target, FreeTypeVariableBinding::Disallow))
+      SyntacticElementTarget target(patternBinding);
+      if (cs->generateConstraints(target))
         hadError = true;
     }
   }
 
-  VarDecl *visitBraceStmt(BraceStmt *braceStmt) {
-    SmallVector<Expr *, 4> expressions;
+  void visitBraceElement(ASTNode node, SmallVectorImpl<Expr *> &expressions) {
     auto addChild = [&](VarDecl *childVar) {
       if (!childVar)
         return;
@@ -373,58 +372,67 @@ protected:
       expressions.push_back(builder.buildVarRef(childVar, childVar->getLoc()));
     };
 
-    for (auto node : braceStmt->getElements()) {
-      // Implicit returns in single-expression function bodies are treated
-      // as the expression.
-      if (auto returnStmt =
-              dyn_cast_or_null<ReturnStmt>(node.dyn_cast<Stmt *>())) {
-        assert(returnStmt->isImplicit());
-        node = returnStmt->getResult();
-      }
-
-      if (auto stmt = node.dyn_cast<Stmt *>()) {
-        addChild(visit(stmt));
-        continue;
-      }
-
-      if (auto decl = node.dyn_cast<Decl *>()) {
-        // Just ignore #if; the chosen children should appear in the
-        // surrounding context.  This isn't good for source tools but it
-        // at least works.
-        if (isa<IfConfigDecl>(decl))
-          continue;
-
-        // Skip #warning/#error; we'll handle them when applying the builder.
-        if (isa<PoundDiagnosticDecl>(decl)) {
-          continue;
-        }
-
-        // Pattern bindings are okay so long as all of the entries are
-        // initialized.
-        if (auto patternBinding = dyn_cast<PatternBindingDecl>(decl)) {
-          visitPatternBindingDecl(patternBinding);
-          continue;
-        }
-
-        // Ignore variable declarations, because they're always handled within
-        // their enclosing pattern bindings.
-        if (isa<VarDecl>(decl))
-          continue;
-
-        if (!unhandledNode)
-          unhandledNode = decl;
-
-        continue;
-      }
-
-      auto expr = node.get<Expr *>();
-      if (cs && builder.supports(ctx.Id_buildExpression)) {
-        expr = buildCallIfWanted(expr->getLoc(), ctx.Id_buildExpression,
-                                 { expr }, { Identifier() });
-      }
-
-      addChild(captureExpr(expr, /*oneWay=*/true, node.get<Expr *>()));
+    // Implicit returns in single-expression function bodies are treated
+    // as the expression.
+    if (auto returnStmt =
+            dyn_cast_or_null<ReturnStmt>(node.dyn_cast<Stmt *>())) {
+      assert(returnStmt->isImplicit());
+      node = returnStmt->getResult();
     }
+
+    if (auto stmt = node.dyn_cast<Stmt *>()) {
+      addChild(visit(stmt));
+      return;
+    }
+
+    if (auto decl = node.dyn_cast<Decl *>()) {
+      // Just ignore #if; the chosen children should appear in the
+      // surrounding context.  This isn't good for source tools but it
+      // at least works.
+      if (isa<IfConfigDecl>(decl))
+        return;
+
+      // Skip #warning/#error; we'll handle them when applying the builder.
+      if (isa<PoundDiagnosticDecl>(decl))
+        return;
+
+      // Pattern bindings are okay so long as all of the entries are
+      // initialized.
+      if (auto patternBinding = dyn_cast<PatternBindingDecl>(decl)) {
+        visitPatternBindingDecl(patternBinding);
+        return;
+      }
+
+      // Ignore variable declarations, because they're always handled within
+      // their enclosing pattern bindings.
+      if (isa<VarDecl>(decl))
+        return;
+
+      if (!unhandledNode)
+        unhandledNode = decl;
+
+      return;
+    }
+
+    auto expr = node.get<Expr *>();
+    if (auto *SVE = dyn_cast<SingleValueStmtExpr>(expr)) {
+      // This should never be treated as an expression in a result builder, it
+      // should have statement semantics.
+      visitBraceElement(SVE->getStmt(), expressions);
+      return;
+    }
+    if (cs && builder.supports(ctx.Id_buildExpression)) {
+      expr = buildCallIfWanted(expr->getLoc(), ctx.Id_buildExpression,
+                               {expr}, {Identifier()});
+    }
+
+    addChild(captureExpr(expr, /*oneWay=*/true, node.get<Expr *>()));
+  }
+
+  VarDecl *visitBraceStmt(BraceStmt *braceStmt) {
+    SmallVector<Expr *, 4> expressions;
+    for (auto node : braceStmt->getElements())
+      visitBraceElement(node, expressions);
 
     if (!cs || hadError)
       return nullptr;
@@ -486,6 +494,7 @@ protected:
   }
 
   CONTROL_FLOW_STMT(Yield)
+  CONTROL_FLOW_STMT(Forget)
   CONTROL_FLOW_STMT(Defer)
 
   VarDecl *visitIfStmt(IfStmt *ifStmt) {
@@ -651,14 +660,14 @@ protected:
       subjectExpr = new (ctx) OneWayExpr(subjectExpr);
 
       // FIXME: Add contextual type purpose for switch subjects?
-      SolutionApplicationTarget target(subjectExpr, dc, CTP_Unused, Type(),
-                                       /*isDiscarded=*/false);
-      if (cs->generateConstraints(target, FreeTypeVariableBinding::Disallow)) {
+      SyntacticElementTarget target(subjectExpr, dc, CTP_Unused, Type(),
+                                    /*isDiscarded=*/false);
+      if (cs->generateConstraints(target)) {
         hadError = true;
         return nullptr;
       }
 
-      cs->setSolutionApplicationTarget(switchStmt, target);
+      cs->setTargetFor(switchStmt, target);
       subjectExpr = target.getAsExpr();
       assert(subjectExpr && "Must have a subject expression here");
     }
@@ -744,7 +753,7 @@ protected:
         // HACK: still allow empty bodies if typechecking for code
         // completion. Code completion ignores diagnostics
         // and won't get any types if we fail.
-        if (!ctx.SourceMgr.hasCodeCompletionBuffer()) {
+        if (!ctx.SourceMgr.hasIDEInspectionTargetBuffer()) {
           hadError = true;
           return nullptr;
         }
@@ -778,15 +787,15 @@ protected:
 
     // Generate constraints for the loop header. This also wires up the
     // types for the patterns.
-    auto target = SolutionApplicationTarget::forForEachStmt(
+    auto target = SyntacticElementTarget::forForEachStmt(
         forEachStmt, dc, /*bindPatternVarsOneWay=*/true);
     if (cs) {
-      if (cs->generateConstraints(target, FreeTypeVariableBinding::Disallow)) {
+      if (cs->generateConstraints(target)) {
         hadError = true;
         return nullptr;
       }
 
-      cs->setSolutionApplicationTarget(forEachStmt, target);
+      cs->setTargetFor(forEachStmt, target);
     }
 
     // Visit the loop body itself.
@@ -878,15 +887,14 @@ protected:
     }
 
     if (cs) {
-     SolutionApplicationTarget target(
-         throwStmt->getSubExpr(), dc, CTP_ThrowStmt,
-         ctx.getErrorExistentialType(),
-         /*isDiscarded=*/false);
-     if (cs->generateConstraints(target, FreeTypeVariableBinding::Disallow))
-       hadError = true;
+      SyntacticElementTarget target(throwStmt->getSubExpr(), dc, CTP_ThrowStmt,
+                                    ctx.getErrorExistentialType(),
+                                    /*isDiscarded=*/false);
+      if (cs->generateConstraints(target))
+        hadError = true;
 
-     cs->setSolutionApplicationTarget(throwStmt, target);
-   }
+      cs->setTargetFor(throwStmt, target);
+    }
 
     return nullptr;
   }
@@ -959,8 +967,8 @@ protected:
   VarDecl *captureExpr(Expr *expr, SmallVectorImpl<ASTNode> &container) {
     auto *var = builder.buildVar(expr->getStartLoc());
     Pattern *pattern = NamedPattern::createImplicit(ctx, var);
-    auto *PB = PatternBindingDecl::createImplicit(ctx, StaticSpellingKind::None,
-                                                  pattern, expr, dc);
+    auto *PB = PatternBindingDecl::createImplicit(
+        ctx, StaticSpellingKind::None, pattern, expr, dc, var->getStartLoc());
     return recordVar(PB, container);
   }
 
@@ -972,7 +980,8 @@ protected:
         ctx, NamedPattern::createImplicit(ctx, var),
         type ? type : PlaceholderType::get(ctx, var));
     auto *PB = PatternBindingDecl::createImplicit(
-        ctx, StaticSpellingKind::None, placeholder, /*init=*/initExpr, dc);
+        ctx, StaticSpellingKind::None, placeholder, /*init=*/initExpr, dc,
+        var->getStartLoc());
     return recordVar(PB, container);
   }
 
@@ -1000,7 +1009,88 @@ protected:
     return failTransform(stmt);                                                \
   }
 
-  std::pair<NullablePtr<VarDecl>, Optional<UnsupportedElt>>
+  /// Visit the element of a brace statement, returning \c None if the element
+  /// was transformed successfully, or an unsupported element if the element
+  /// cannot be handled.
+  Optional<UnsupportedElt>
+  transformBraceElement(ASTNode element, SmallVectorImpl<ASTNode> &newBody,
+                        SmallVectorImpl<Expr *> &buildBlockArguments) {
+    if (auto *returnStmt = getAsStmt<ReturnStmt>(element)) {
+      assert(returnStmt->isImplicit());
+      element = returnStmt->getResult();
+    }
+
+    if (auto *decl = element.dyn_cast<Decl *>()) {
+      switch (decl->getKind()) {
+        // Just ignore #if; the chosen children should appear in
+        // the surrounding context.  This isn't good for source
+        // tools but it at least works.
+      case DeclKind::IfConfig:
+        // Skip #warning/#error; we'll handle them when applying
+        // the builder.
+      case DeclKind::PoundDiagnostic:
+      case DeclKind::PatternBinding:
+      case DeclKind::Var:
+      case DeclKind::Param:
+        newBody.push_back(element);
+        return None;
+
+      default:
+        return UnsupportedElt(decl);
+      }
+      llvm_unreachable("Unhandled case in switch!");
+    }
+
+    if (auto *stmt = element.dyn_cast<Stmt *>()) {
+      // Throw is allowed as is.
+      if (auto *throwStmt = dyn_cast<ThrowStmt>(stmt)) {
+        newBody.push_back(throwStmt);
+        return None;
+      }
+
+      // Allocate variable with a placeholder type
+      auto *resultVar = buildPlaceholderVar(stmt->getStartLoc(), newBody);
+
+      auto result = visit(stmt, resultVar);
+      if (!result)
+        return UnsupportedElt(stmt);
+
+      newBody.push_back(result.get());
+      buildBlockArguments.push_back(
+          builder.buildVarRef(resultVar, stmt->getStartLoc()));
+      return None;
+    }
+
+    auto *expr = element.get<Expr *>();
+    if (auto *SVE = dyn_cast<SingleValueStmtExpr>(expr)) {
+      // This should never be treated as an expression in a result builder, it
+      // should have statement semantics.
+      return transformBraceElement(SVE->getStmt(), newBody,
+                                   buildBlockArguments);
+    }
+    if (builder.supports(ctx.Id_buildExpression)) {
+      expr = builder.buildCall(expr->getLoc(), ctx.Id_buildExpression, {expr},
+                               {Identifier()});
+    }
+
+    if (isa<CodeCompletionExpr>(expr)) {
+      // Insert the CodeCompletionExpr directly into the buildBlock call. That
+      // way, we can extract the contextual type of the code completion token
+      // to rank code completion items that match the type expected by
+      // buildBlock higher.
+      buildBlockArguments.push_back(expr);
+    } else {
+      auto *capture = captureExpr(expr, newBody);
+      // A reference to the synthesized variable is passed as an argument
+      // to buildBlock.
+      buildBlockArguments.push_back(
+          builder.buildVarRef(capture, element.getStartLoc()));
+    }
+
+    return None;
+  }
+
+  std::pair<NullablePtr<Expr>, Optional<UnsupportedElt>>
   transform(BraceStmt *braceStmt, SmallVectorImpl<ASTNode> &newBody) {
     SmallVector<Expr *, 4> buildBlockArguments;
 
@@ -1009,68 +1099,13 @@ protected:
     };
 
     for (auto element : braceStmt->getElements()) {
-      if (auto *returnStmt = getAsStmt<ReturnStmt>(element)) {
-        assert(returnStmt->isImplicit());
-        element = returnStmt->getResult();
+      if (auto unsupported =
+              transformBraceElement(element, newBody, buildBlockArguments)) {
+        return failTransform(*unsupported);
       }
-
-      if (auto *decl = element.dyn_cast<Decl *>()) {
-        switch (decl->getKind()) {
-        // Just ignore #if; the chosen children should appear in
-        // the surrounding context.  This isn't good for source
-        // tools but it at least works.
-        case DeclKind::IfConfig:
-        // Skip #warning/#error; we'll handle them when applying
-        // the builder.
-        case DeclKind::PoundDiagnostic:
-        case DeclKind::PatternBinding:
-        case DeclKind::Var:
-        case DeclKind::Param:
-          newBody.push_back(element);
-          break;
-
-        default:
-          return failTransform(decl);
-        }
-
-        continue;
-      }
-
-      if (auto *stmt = element.dyn_cast<Stmt *>()) {
-        // Throw is allowed as is.
-        if (auto *throwStmt = dyn_cast<ThrowStmt>(stmt)) {
-          newBody.push_back(throwStmt);
-          continue;
-        }
-
-        // Allocate variable with a placeholder type
-        auto *resultVar = buildPlaceholderVar(stmt->getStartLoc(), newBody);
-
-        auto result = visit(stmt, resultVar);
-        if (!result)
-          return failTransform(stmt);
-
-        newBody.push_back(result.get());
-        buildBlockArguments.push_back(
-            builder.buildVarRef(resultVar, stmt->getStartLoc()));
-        continue;
-      }
-
-      auto *expr = element.get<Expr *>();
-      if (builder.supports(ctx.Id_buildExpression)) {
-        expr = builder.buildCall(expr->getLoc(), ctx.Id_buildExpression, {expr},
-                                 {Identifier()});
-      }
-
-      auto *capture = captureExpr(expr, newBody);
-      // A reference to the synthesized variable is passed as an argument
-      // to buildBlock.
-      buildBlockArguments.push_back(
-          builder.buildVarRef(capture, element.getStartLoc()));
     }
 
     // Synthesize `buildBlock` or `buildPartial` based on captured arguments.
-    NullablePtr<VarDecl> buildBlockVar;
     {
       // If the builder supports `buildPartialBlock(first:)` and
       // `buildPartialBlock(accumulated:next:)`, use this to combine
@@ -1085,16 +1120,19 @@ protected:
             {buildBlockArguments.front()},
             /*argLabels=*/{ctx.Id_first});
 
-        buildBlockVar = captureExpr(buildPartialFirst, newBody);
+        auto *buildBlockVar = captureExpr(buildPartialFirst, newBody);
 
         for (auto *argExpr : llvm::drop_begin(buildBlockArguments)) {
           auto *accumPartialBlock = builder.buildCall(
               braceStmt->getStartLoc(), ctx.Id_buildPartialBlock,
-              {builder.buildVarRef(buildBlockVar.get(), argExpr->getStartLoc()),
+              {builder.buildVarRef(buildBlockVar, argExpr->getStartLoc()),
                argExpr},
               {ctx.Id_accumulated, ctx.Id_next});
           buildBlockVar = captureExpr(accumPartialBlock, newBody);
         }
+
+        return std::make_pair(
+            builder.buildVarRef(buildBlockVar, braceStmt->getStartLoc()), None);
       }
       // If `buildBlock` does not exist at this point, it could be the case that
       // `buildPartialBlock` did not have the sufficient availability for this
@@ -1106,17 +1144,14 @@ protected:
             builder.getType());
         return failTransform(braceStmt);
       }
-      // Otherwise, call `buildBlock` on all subexpressions.
-      else {
-        // Call Builder.buildBlock(... args ...)
-        auto *buildBlock = builder.buildCall(
-            braceStmt->getStartLoc(), ctx.Id_buildBlock, buildBlockArguments,
-            /*argLabels=*/{});
-        buildBlockVar = captureExpr(buildBlock, newBody);
-      }
-    }
 
-    return std::make_pair(buildBlockVar.get(), None);
+      // Otherwise, call `buildBlock` on all subexpressions.
+      // Call Builder.buildBlock(... args ...)
+      auto *buildBlock = builder.buildCall(
+          braceStmt->getStartLoc(), ctx.Id_buildBlock, buildBlockArguments,
+          /*argLabels=*/{});
+      return std::make_pair(buildBlock, None);
+    }
   }
 
   std::pair<bool, UnsupportedElt>
@@ -1129,10 +1164,10 @@ protected:
       return std::make_pair(true, element);
     };
 
-    NullablePtr<VarDecl> buildBlockVar;
+    NullablePtr<Expr> buildBlockVarRef;
     Optional<UnsupportedElt> unsupported;
 
-    std::tie(buildBlockVar, unsupported) = transform(braceStmt, elements);
+    std::tie(buildBlockVarRef, unsupported) = transform(braceStmt, elements);
     if (unsupported)
       return failure(*unsupported);
 
@@ -1144,14 +1179,12 @@ protected:
     // are attached to the beginning of the brace instead of its end.
     auto resultLoc = braceStmt->getStartLoc();
     if (bodyVar) {
-      elements.push_back(new (ctx) AssignExpr(
-          builder.buildVarRef(bodyVar.get(), resultLoc),
-          /*EqualLoc=*/SourceLoc(),
-          builder.buildVarRef(buildBlockVar.get(), resultLoc),
-          /*Implicit=*/true));
+      elements.push_back(
+          new (ctx) AssignExpr(builder.buildVarRef(bodyVar.get(), resultLoc),
+                               /*EqualLoc=*/SourceLoc(), buildBlockVarRef.get(),
+                               /*Implicit=*/true));
     } else {
-      Expr *buildBlockResult =
-          builder.buildVarRef(buildBlockVar.get(), resultLoc);
+      Expr *buildBlockResult = buildBlockVarRef.get();
       // Otherwise, it's a top-level brace and we need to synthesize
       // a call to `buildFialBlock` if supported.
       if (builder.supports(ctx.Id_buildFinalResult, {Identifier()})) {
@@ -1208,9 +1241,9 @@ protected:
     if (!isBuildableIfChain(ifStmt, numPayloads, isOptional))
       return failTransform(ifStmt);
 
-    SmallVector<std::pair<VarDecl *, Stmt *>, 4> branchVars;
+    SmallVector<std::pair<Expr *, Stmt *>, 4> branchVarRefs;
 
-    auto transformed = transformIf(ifStmt, branchVars);
+    auto transformed = transformIf(ifStmt, branchVarRefs);
     if (!transformed)
       return failTransform(ifStmt);
 
@@ -1224,41 +1257,22 @@ protected:
       // `if` goes first.
       doBody.push_back(ifStmt);
 
-      assert(numPayloads == branchVars.size());
+      assert(numPayloads == branchVarRefs.size());
 
       SmallVector<Expr *, 4> buildEitherCalls;
       for (unsigned i = 0; i != numPayloads; i++) {
-        VarDecl *branchVar;
+        Expr *branchVarRef;
         Stmt *anchor;
 
-        std::tie(branchVar, anchor) = branchVars[i];
+        std::tie(branchVarRef, anchor) = branchVarRefs[i];
 
-        auto *branchVarRef =
-            builder.buildVarRef(branchVar, ifStmt->getEndLoc());
         auto *builderCall =
             buildWrappedChainPayload(branchVarRef, i, numPayloads, isOptional);
 
-        auto isTopLevel = [&](Stmt *anchor) {
-          if (ifStmt->getThenStmt() == anchor)
-            return true;
-
-          // The situation is this:
-          //
-          // if <cond> {
-          //   ...
-          // } else if <other-cond> {
-          //   ...
-          // }
-          if (auto *innerIf = getAsStmt<IfStmt>(ifStmt->getElseStmt()))
-            return innerIf->getThenStmt() == anchor;
-
-          return ifStmt->getElseStmt() == anchor;
-        };
-
         // The operand should have optional type if we had optional results,
         // so we just need to call `buildIf` now, since we're at the top level.
-        if (isOptional && isTopLevel(anchor)) {
-          builderCall = buildCallIfWanted(ifStmt->getEndLoc(),
+        if (isOptional) {
+          builderCall = buildCallIfWanted(ifStmt->getThenStmt()->getStartLoc(),
                                           builder.getBuildOptionalId(),
                                           builderCall, /*argLabels=*/{});
         }
@@ -1287,7 +1301,7 @@ protected:
             /*argLabels=*/{}));
       }
 
-      auto *ifVarRef = builder.buildVarRef(ifVar.get(), ifStmt->getEndLoc());
+      auto *ifVarRef = builder.buildVarRef(ifVar.get(), ifStmt->getStartLoc());
       doBody.push_back(TypeJoinExpr::create(ctx, ifVarRef, buildEitherCalls));
     }
 
@@ -1296,7 +1310,7 @@ protected:
 
   NullablePtr<IfStmt>
   transformIf(IfStmt *ifStmt,
-              SmallVectorImpl<std::pair<VarDecl *, Stmt *>> &branchVars) {
+              SmallVectorImpl<std::pair<Expr *, Stmt *>> &branchVarRefs) {
     Optional<UnsupportedElt> unsupported;
 
     // If there is a #available in the condition, wrap the 'then' or 'else'
@@ -1305,14 +1319,14 @@ protected:
     bool supportsAvailability =
         availabilityCond && builder.supports(ctx.Id_buildLimitedAvailability);
 
-    NullablePtr<VarDecl> thenVar;
+    NullablePtr<Expr> thenVarRef;
     NullablePtr<Stmt> thenBranch;
     {
       SmallVector<ASTNode, 4> thenBody;
 
       auto *ifBraceStmt = cast<BraceStmt>(ifStmt->getThenStmt());
 
-      std::tie(thenVar, unsupported) = transform(ifBraceStmt, thenBody);
+      std::tie(thenVarRef, unsupported) = transform(ifBraceStmt, thenBody);
       if (unsupported) {
         recordUnsupported(*unsupported);
         return nullptr;
@@ -1320,27 +1334,25 @@ protected:
 
       if (supportsAvailability &&
           !availabilityCond->getAvailability()->isUnavailability()) {
-        auto *thenVarRef =
-            builder.buildVarRef(thenVar.get(), ifBraceStmt->getEndLoc());
-
         auto *builderCall = buildCallIfWanted(
-            ifStmt->getThenStmt()->getEndLoc(), ctx.Id_buildLimitedAvailability,
-            {thenVarRef}, {Identifier()});
+            ifBraceStmt->getStartLoc(), ctx.Id_buildLimitedAvailability,
+            {thenVarRef.get()}, {Identifier()});
 
-        thenVar = captureExpr(builderCall, thenBody);
+        thenVarRef = builder.buildVarRef(captureExpr(builderCall, thenBody),
+                                         ifBraceStmt->getStartLoc());
       }
 
       thenBranch = cloneBraceWith(ifBraceStmt, thenBody);
-      branchVars.push_back({thenVar.get(), thenBranch.get()});
+      branchVarRefs.push_back({thenVarRef.get(), thenBranch.get()});
     }
 
     NullablePtr<Stmt> elseBranch;
 
     if (auto *elseStmt = ifStmt->getElseStmt()) {
-      NullablePtr<VarDecl> elseVar;
+      NullablePtr<Expr> elseVarRef;
 
       if (auto *innerIfStmt = getAsStmt<IfStmt>(elseStmt)) {
-        elseBranch = transformIf(innerIfStmt, branchVars);
+        elseBranch = transformIf(innerIfStmt, branchVarRefs);
         if (!elseBranch) {
           recordUnsupported(innerIfStmt);
           return nullptr;
@@ -1349,7 +1361,7 @@ protected:
         auto *elseBraceStmt = cast<BraceStmt>(elseStmt);
         SmallVector<ASTNode> elseBody;
 
-        std::tie(elseVar, unsupported) = transform(elseBraceStmt, elseBody);
+        std::tie(elseVarRef, unsupported) = transform(elseBraceStmt, elseBody);
         if (unsupported) {
           recordUnsupported(*unsupported);
           return nullptr;
@@ -1359,18 +1371,16 @@ protected:
         // call to buildLimitedAvailability(_:).
         if (supportsAvailability &&
             availabilityCond->getAvailability()->isUnavailability()) {
-          auto *elseVarRef =
-              builder.buildVarRef(elseVar.get(), elseBraceStmt->getEndLoc());
+          auto *builderCall = buildCallIfWanted(
+              elseBraceStmt->getStartLoc(), ctx.Id_buildLimitedAvailability,
+              {elseVarRef.get()}, {Identifier()});
 
-          auto *builderCall = buildCallIfWanted(elseBraceStmt->getStartLoc(),
-                                                ctx.Id_buildLimitedAvailability,
-                                                {elseVarRef}, {Identifier()});
-
-          elseVar = captureExpr(builderCall, elseBody);
+          elseVarRef = builder.buildVarRef(captureExpr(builderCall, elseBody),
+                                           elseBraceStmt->getStartLoc());
         }
 
         elseBranch = cloneBraceWith(elseBraceStmt, elseBody);
-        branchVars.push_back({elseVar.get(), elseBranch.get()});
+        branchVarRefs.push_back({elseVarRef.get(), elseBranch.get()});
       }
     }
 
@@ -1392,7 +1402,7 @@ protected:
     SmallVector<ASTNode, 4> doBody;
 
     SmallVector<ASTNode, 4> cases;
-    SmallVector<VarDecl *, 4> caseVars;
+    SmallVector<Expr *, 4> caseVarRefs;
 
     for (auto *caseStmt : switchStmt->getCases()) {
       auto transformed = transformCase(caseStmt);
@@ -1400,7 +1410,7 @@ protected:
         return failTransform(caseStmt);
 
       cases.push_back(transformed->second);
-      caseVars.push_back(transformed->first);
+      caseVarRefs.push_back(transformed->first);
     }
 
     // If there are no 'case' statements in the body let's try
@@ -1408,7 +1418,7 @@ protected:
     // before failing a builder transform, otherwise type-checker
     // might end up without any diagnostics which leads to crashes
     // in SILGen.
-    if (caseVars.empty()) {
+    if (caseVarRefs.empty()) {
       TypeChecker::checkSwitchExhaustiveness(switchStmt, dc,
                                              /*limitChecking=*/true);
       return failTransform(switchStmt);
@@ -1422,15 +1432,13 @@ protected:
     doBody.push_back(transformedSwitch);
 
     SmallVector<Expr *, 4> injectedExprs;
-    for (auto idx : indices(caseVars)) {
-      auto caseStmt = cases[idx];
-      auto *caseVar = caseVars[idx];
+    for (auto idx : indices(caseVarRefs)) {
+      auto *caseVarRef = caseVarRefs[idx];
 
       // Build the expression that injects the case variable into appropriate
       // buildEither(first:)/buildEither(second:) chain.
-      Expr *caseVarRef = builder.buildVarRef(caseVar, caseStmt.getEndLoc());
       Expr *injectedCaseExpr = buildWrappedChainPayload(
-          caseVarRef, idx, caseVars.size(), /*isOptional=*/false);
+          caseVarRef, idx, caseVarRefs.size(), /*isOptional=*/false);
 
       injectedExprs.push_back(injectedCaseExpr);
     }
@@ -1442,7 +1450,7 @@ protected:
     return DoStmt::createImplicit(ctx, LabeledStmtInfo(), doBody);
   }
 
-  Optional<std::pair<VarDecl *, CaseStmt *>> transformCase(CaseStmt *caseStmt) {
+  Optional<std::pair<Expr *, CaseStmt *>> transformCase(CaseStmt *caseStmt) {
     auto *body = caseStmt->getBody();
 
     // Explicitly disallow `case` statements with empty bodies
@@ -1453,16 +1461,16 @@ protected:
         // HACK: still allow empty bodies if typechecking for code
         // completion. Code completion ignores diagnostics
         // and won't get any types if we fail.
-        if (!ctx.SourceMgr.hasCodeCompletionBuffer())
+        if (!ctx.SourceMgr.hasIDEInspectionTargetBuffer())
           return None;
       }
     }
 
-    NullablePtr<VarDecl> caseVar;
+    NullablePtr<Expr> caseVarRef;
     Optional<UnsupportedElt> unsupported;
     SmallVector<ASTNode, 4> newBody;
 
-    std::tie(caseVar, unsupported) = transform(body, newBody);
+    std::tie(caseVarRef, unsupported) = transform(body, newBody);
 
     if (unsupported) {
       recordUnsupported(*unsupported);
@@ -1477,7 +1485,7 @@ protected:
         caseStmt->getCaseBodyVariablesOrEmptyArray(), caseStmt->isImplicit(),
         caseStmt->getFallthroughStmt());
 
-    return std::make_pair(caseVar.get(), newCase);
+    return std::make_pair(caseVarRef.get(), newCase);
   }
 
   /// do {
@@ -1521,12 +1529,12 @@ protected:
         ArrayExpr::create(ctx, /*LBrace=*/endLoc, /*Elements=*/{},
                           /*Commas=*/{}, /*RBrace=*/endLoc));
 
-    NullablePtr<VarDecl> bodyVar;
+    NullablePtr<Expr> bodyVarRef;
     Optional<UnsupportedElt> unsupported;
 
     SmallVector<ASTNode, 4> newBody;
     {
-      std::tie(bodyVar, unsupported) =
+      std::tie(bodyVarRef, unsupported) =
           transform(forEachStmt->getBody(), newBody);
       if (unsupported)
         return failTransform(*unsupported);
@@ -1540,9 +1548,8 @@ protected:
             DeclNameLoc(endLoc), /*implicit=*/true);
         arrayAppendRef->setFunctionRefKind(FunctionRefKind::SingleApply);
 
-        auto bodyVarRef = builder.buildVarRef(bodyVar.get(), endLoc);
         auto *argList = ArgumentList::createImplicit(
-            ctx, endLoc, {Argument::unlabeled(bodyVarRef)}, endLoc);
+            ctx, endLoc, {Argument::unlabeled(bodyVarRef.get())}, endLoc);
 
         newBody.push_back(
             CallExpr::createImplicit(ctx, arrayAppendRef, argList));
@@ -1579,6 +1586,7 @@ protected:
   UNSUPPORTED_STMT(Throw)
   UNSUPPORTED_STMT(Return)
   UNSUPPORTED_STMT(Yield)
+  UNSUPPORTED_STMT(Forget)
   UNSUPPORTED_STMT(Defer)
   UNSUPPORTED_STMT(Guard)
   UNSUPPORTED_STMT(While)
@@ -1633,9 +1641,8 @@ class BuilderClosureRewriter
   const Solution &solution;
   DeclContext *dc;
   AppliedBuilderTransform builderTransform;
-  std::function<
-      Optional<SolutionApplicationTarget> (SolutionApplicationTarget)>
-        rewriteTarget;
+  std::function<Optional<SyntacticElementTarget>(SyntacticElementTarget)>
+      rewriteTarget;
 
   /// Retrieve the temporary variable that will be used to capture the
   /// value of the given expression.
@@ -1657,9 +1664,9 @@ class BuilderClosureRewriter
 
   /// Rewrite an expression without any particularly special context.
   Expr *rewriteExpr(Expr *expr) {
-    auto result = rewriteTarget(
-      SolutionApplicationTarget(expr, dc, CTP_Unused, Type(),
-                                /*isDiscarded=*/false));
+    auto result =
+        rewriteTarget(SyntacticElementTarget(expr, dc, CTP_Unused, Type(),
+                                             /*isDiscarded=*/false));
     if (result)
       return result->getAsExpr();
 
@@ -1698,9 +1705,9 @@ private:
       Type bodyResultInterfaceType =
           solution.simplifyType(builderTransform.bodyResultType);
 
-      SolutionApplicationTarget returnTarget(capturedExpr, dc, CTP_ReturnStmt,
-                                             bodyResultInterfaceType,
-                                             /*isDiscarded=*/false);
+      SyntacticElementTarget returnTarget(capturedExpr, dc, CTP_ReturnStmt,
+                                          bodyResultInterfaceType,
+                                          /*isDiscarded=*/false);
       Expr *resultExpr = nullptr;
       if (auto resultTarget = rewriteTarget(returnTarget))
         resultExpr = resultTarget->getAsExpr();
@@ -1759,15 +1766,111 @@ private:
 
 public:
   BuilderClosureRewriter(
-      const Solution &solution,
-      DeclContext *dc,
+      const Solution &solution, DeclContext *dc,
       const AppliedBuilderTransform &builderTransform,
-      std::function<
-          Optional<SolutionApplicationTarget> (SolutionApplicationTarget)>
-            rewriteTarget
-    ) : ctx(solution.getConstraintSystem().getASTContext()),
-        solution(solution), dc(dc), builderTransform(builderTransform),
-        rewriteTarget(rewriteTarget) { }
+      std::function<Optional<SyntacticElementTarget>(SyntacticElementTarget)>
+          rewriteTarget)
+      : ctx(solution.getConstraintSystem().getASTContext()), solution(solution),
+        dc(dc), builderTransform(builderTransform),
+        rewriteTarget(rewriteTarget) {}
+
+  /// Visit the element of a brace statement, returning \c false if the element
+  /// was rewritten successfully, or \c true if there was an error.
+  bool visitBraceElement(ASTNode node, std::vector<ASTNode> &newElements) {
+    // Implicit returns in single-expression function bodies are treated
+    // as the expression.
+    if (auto returnStmt =
+            dyn_cast_or_null<ReturnStmt>(node.dyn_cast<Stmt *>())) {
+      assert(returnStmt->isImplicit());
+      node = returnStmt->getResult();
+    }
+
+    if (auto expr = node.dyn_cast<Expr *>()) {
+      if (auto *SVE = dyn_cast<SingleValueStmtExpr>(expr)) {
+        // This should never be treated as an expression in a result builder, it
+        // should have statement semantics.
+        return visitBraceElement(SVE->getStmt(), newElements);
+      }
+      // Skip error expressions.
+      if (isa<ErrorExpr>(expr))
+        return false;
+
+      // Each expression turns into a 'let' that captures the value of
+      // the expression.
+      auto recorded = takeCapturedExpr(expr);
+
+      // Rewrite the expression
+      Expr *finalExpr = rewriteExpr(recorded.generatedExpr);
+
+      // Form a new pattern binding to bind the temporary variable to the
+      // transformed expression.
+      declareTemporaryVariable(recorded.temporaryVar, newElements, finalExpr);
+      return false;
+    }
+
+    if (auto stmt = node.dyn_cast<Stmt *>()) {
+      // "throw" statements produce no value. Transform them directly.
+      if (auto throwStmt = dyn_cast<ThrowStmt>(stmt)) {
+        if (auto newStmt = visitThrowStmt(throwStmt)) {
+          newElements.push_back(newStmt.get());
+        }
+        return false;
+      }
+
+      // Each statement turns into a (potential) temporary variable
+      // binding followed by the statement itself.
+      auto captured = takeCapturedStmt(stmt);
+
+      declareTemporaryVariable(captured.first, newElements);
+
+      auto finalStmt =
+          visit(stmt, ResultBuilderTarget{ResultBuilderTarget::TemporaryVar,
+                                          std::move(captured)});
+
+      // Re-write of statements that envolve type-checking
+      // could fail, such a failure terminates the walk.
+      if (!finalStmt)
+        return true;
+
+      newElements.push_back(finalStmt.get());
+      return false;
+    }
+
+    auto decl = node.get<Decl *>();
+
+    // Skip #if declarations.
+    if (isa<IfConfigDecl>(decl)) {
+      newElements.push_back(decl);
+      return false;
+    }
+
+    // Diagnose #warning / #error during application.
+    if (auto poundDiag = dyn_cast<PoundDiagnosticDecl>(decl)) {
+      TypeChecker::typeCheckDecl(poundDiag);
+      newElements.push_back(decl);
+      return false;
+    }
+
+    // Skip variable declarations; they're always part of a pattern
+    // binding.
+    if (isa<VarDecl>(decl)) {
+      TypeChecker::typeCheckDecl(decl);
+      newElements.push_back(decl);
+      return false;
+    }
+
+    // Handle pattern bindings.
+    if (auto patternBinding = dyn_cast<PatternBindingDecl>(decl)) {
+      auto resultTarget = rewriteTarget(SyntacticElementTarget{patternBinding});
+      assert(resultTarget.has_value() &&
+             "Could not rewrite pattern binding entries!");
+      TypeChecker::typeCheckDecl(resultTarget->getAsPatternBinding());
+      newElements.push_back(resultTarget->getAsPatternBinding());
+      return false;
+    }
+
+    llvm_unreachable("Cannot yet handle declarations");
+  }
 
   NullablePtr<Stmt>
   visitBraceStmt(BraceStmt *braceStmt, ResultBuilderTarget target,
@@ -1776,100 +1879,12 @@ public:
 
     // If there is an "inner" target corresponding to this brace, declare
     // it's temporary variable if needed.
-    if (innerTarget) {
+    if (innerTarget)
       declareTemporaryVariable(innerTarget->captured.first, newElements);
-    }
 
     for (auto node : braceStmt->getElements()) {
-      // Implicit returns in single-expression function bodies are treated
-      // as the expression.
-      if (auto returnStmt =
-              dyn_cast_or_null<ReturnStmt>(node.dyn_cast<Stmt *>())) {
-        assert(returnStmt->isImplicit());
-        node = returnStmt->getResult();
-      }
-
-      if (auto expr = node.dyn_cast<Expr *>()) {
-        // Skip error expressions.
-        if (isa<ErrorExpr>(expr))
-          continue;
-
-        // Each expression turns into a 'let' that captures the value of
-        // the expression.
-        auto recorded = takeCapturedExpr(expr);
-
-        // Rewrite the expression
-        Expr *finalExpr = rewriteExpr(recorded.generatedExpr);
-
-        // Form a new pattern binding to bind the temporary variable to the
-        // transformed expression.
-        declareTemporaryVariable(recorded.temporaryVar, newElements, finalExpr);
-        continue;
-      }
-
-      if (auto stmt = node.dyn_cast<Stmt *>()) {
-        // "throw" statements produce no value. Transform them directly.
-        if (auto throwStmt = dyn_cast<ThrowStmt>(stmt)) {
-          if (auto newStmt = visitThrowStmt(throwStmt)) {
-            newElements.push_back(newStmt.get());
-          }
-          continue;
-        }
-
-        // Each statement turns into a (potential) temporary variable
-        // binding followed by the statement itself.
-        auto captured = takeCapturedStmt(stmt);
-
-        declareTemporaryVariable(captured.first, newElements);
-
-        auto finalStmt = visit(
-            stmt,
-            ResultBuilderTarget{ResultBuilderTarget::TemporaryVar,
-                                  std::move(captured)});
-
-        // Re-write of statements that envolve type-checking
-        // could fail, such a failure terminates the walk.
-        if (!finalStmt)
-          return nullptr;
-
-        newElements.push_back(finalStmt.get());
-        continue;
-      }
-
-      auto decl = node.get<Decl *>();
-
-      // Skip #if declarations.
-      if (isa<IfConfigDecl>(decl)) {
-        newElements.push_back(decl);
-        continue;
-      }
-
-      // Diagnose #warning / #error during application.
-      if (auto poundDiag = dyn_cast<PoundDiagnosticDecl>(decl)) {
-        TypeChecker::typeCheckDecl(poundDiag);
-        newElements.push_back(decl);
-        continue;
-      }
-
-      // Skip variable declarations; they're always part of a pattern
-      // binding.
-      if (isa<VarDecl>(decl)) {
-        TypeChecker::typeCheckDecl(decl);
-        newElements.push_back(decl);
-        continue;
-      }
-
-      // Handle pattern bindings.
-      if (auto patternBinding = dyn_cast<PatternBindingDecl>(decl)) {
-        auto resultTarget = rewriteTarget(SolutionApplicationTarget{patternBinding});
-        assert(resultTarget.hasValue()
-               && "Could not rewrite pattern binding entries!");
-        TypeChecker::typeCheckDecl(resultTarget->getAsPatternBinding());
-        newElements.push_back(resultTarget->getAsPatternBinding());
-        continue;
-      }
-
-      llvm_unreachable("Cannot yet handle declarations");
+      if (visitBraceElement(node, newElements))
+        return nullptr;
     }
 
     // If there is an "inner" target corresponding to this brace, initialize
@@ -1888,8 +1903,8 @@ public:
 
   NullablePtr<Stmt> visitIfStmt(IfStmt *ifStmt, ResultBuilderTarget target) {
     // Rewrite the condition.
-    if (auto condition = rewriteTarget(
-            SolutionApplicationTarget(ifStmt->getCond(), dc)))
+    if (auto condition =
+            rewriteTarget(SyntacticElementTarget(ifStmt->getCond(), dc)))
       ifStmt->setCond(*condition->getAsStmtCondition());
 
     assert(target.kind == ResultBuilderTarget::TemporaryVar);
@@ -2043,8 +2058,7 @@ public:
                                     ResultBuilderTarget target) {
     // Translate the subject expression.
     ConstraintSystem &cs = solution.getConstraintSystem();
-    auto subjectTarget =
-        rewriteTarget(*cs.getSolutionApplicationTarget(switchStmt));
+    auto subjectTarget = rewriteTarget(*cs.getTargetFor(switchStmt));
     if (!subjectTarget)
       return nullptr;
 
@@ -2089,7 +2103,7 @@ public:
                                   ResultBuilderTarget target) {
     // Translate the patterns and guard expressions for each case label item.
     for (auto &caseLabelItem : caseStmt->getMutableCaseLabelItems()) {
-      SolutionApplicationTarget caseLabelTarget(&caseLabelItem, dc);
+      SyntacticElementTarget caseLabelTarget(&caseLabelItem, dc);
       if (!rewriteTarget(caseLabelTarget))
         return nullptr;
     }
@@ -2121,8 +2135,7 @@ public:
                                      ResultBuilderTarget target) {
     // Translate the for-each loop header.
     ConstraintSystem &cs = solution.getConstraintSystem();
-    auto forEachTarget =
-        rewriteTarget(*cs.getSolutionApplicationTarget(forEachStmt));
+    auto forEachTarget = rewriteTarget(*cs.getTargetFor(forEachStmt));
     if (!forEachTarget)
       return nullptr;
 
@@ -2173,8 +2186,7 @@ public:
 
   NullablePtr<Stmt> visitThrowStmt(ThrowStmt *throwStmt) {
     // Rewrite the error.
-    auto target = *solution.getConstraintSystem()
-        .getSolutionApplicationTarget(throwStmt);
+    auto target = *solution.getConstraintSystem().getTargetFor(throwStmt);
     if (auto result = rewriteTarget(target))
       throwStmt->setSubExpr(result->getAsExpr());
     else
@@ -2197,6 +2209,7 @@ public:
 
   UNHANDLED_RESULT_BUILDER_STMT(Return)
   UNHANDLED_RESULT_BUILDER_STMT(Yield)
+  UNHANDLED_RESULT_BUILDER_STMT(Forget)
   UNHANDLED_RESULT_BUILDER_STMT(Guard)
   UNHANDLED_RESULT_BUILDER_STMT(While)
   UNHANDLED_RESULT_BUILDER_STMT(Defer)
@@ -2213,13 +2226,10 @@ public:
 } // end anonymous namespace
 
 BraceStmt *swift::applyResultBuilderTransform(
-    const Solution &solution,
-    AppliedBuilderTransform applied,
-    BraceStmt *body,
+    const Solution &solution, AppliedBuilderTransform applied, BraceStmt *body,
     DeclContext *dc,
-    std::function<
-        Optional<SolutionApplicationTarget> (SolutionApplicationTarget)>
-          rewriteTarget) {
+    std::function<Optional<SyntacticElementTarget>(SyntacticElementTarget)>
+        rewriteTarget) {
   BuilderClosureRewriter rewriter(solution, dc, applied, rewriteTarget);
   auto captured = rewriter.takeCapturedStmt(body);
   auto result = rewriter.visitBraceStmt(
@@ -2231,7 +2241,8 @@ BraceStmt *swift::applyResultBuilderTransform(
 }
 
 Optional<BraceStmt *> TypeChecker::applyResultBuilderBodyTransform(
-    FuncDecl *func, Type builderType) {
+    FuncDecl *func, Type builderType,
+    bool ClosuresInResultBuilderDontParticipateInInference) {
   // Pre-check the body: pre-check any expressions in it and look
   // for return statements.
   //
@@ -2287,6 +2298,10 @@ Optional<BraceStmt *> TypeChecker::applyResultBuilderBodyTransform(
   }
 
   ConstraintSystemOptions options = ConstraintSystemFlags::AllowFixes;
+  if (ClosuresInResultBuilderDontParticipateInInference) {
+    options |= ConstraintSystemFlags::
+        ClosuresInResultBuildersDontParticipateInInference;
+  }
   auto resultInterfaceTy = func->getResultInterfaceType();
   auto resultContextType = func->mapTypeIntoContext(resultInterfaceTy);
 
@@ -2318,6 +2333,7 @@ Optional<BraceStmt *> TypeChecker::applyResultBuilderBodyTransform(
 
   if (auto result = cs.matchResultBuilder(
           func, builderType, resultContextType, resultConstraintKind,
+          /*contextualType=*/Type(),
           cs.getConstraintLocator(func->getBody()))) {
     if (result->isFailure())
       return nullptr;
@@ -2341,6 +2357,24 @@ Optional<BraceStmt *> TypeChecker::applyResultBuilderBodyTransform(
   SmallVector<Solution, 4> solutions;
   bool solvingFailed = cs.solve(solutions);
 
+  auto reportSolutionsToSolutionCallback = [&](const SolutionResult &result) {
+    if (!cs.getASTContext().SolutionCallback) {
+      return;
+    }
+    switch (result.getKind()) {
+    case SolutionResult::Success:
+      cs.getASTContext().SolutionCallback->sawSolution(result.getSolution());
+      break;
+    case SolutionResult::Ambiguous:
+      for (auto &solution : result.getAmbiguousSolutions()) {
+        cs.getASTContext().SolutionCallback->sawSolution(solution);
+      }
+      break;
+    default:
+      break;
+    }
+  };
+
   if (solvingFailed || solutions.size() != 1) {
     // Try to fix the system or provide a decent diagnostic.
     auto salvagedResult = cs.salvage();
@@ -2352,14 +2386,17 @@ Optional<BraceStmt *> TypeChecker::applyResultBuilderBodyTransform(
 
     case SolutionResult::Kind::Error:
     case SolutionResult::Kind::Ambiguous:
+      reportSolutionsToSolutionCallback(salvagedResult);
       return nullptr;
 
     case SolutionResult::Kind::UndiagnosedError:
-      cs.diagnoseFailureFor(SolutionApplicationTarget(func));
+      reportSolutionsToSolutionCallback(salvagedResult);
+      cs.diagnoseFailureFor(SyntacticElementTarget(func));
       salvagedResult.markAsDiagnosed();
       return nullptr;
 
     case SolutionResult::Kind::TooComplex:
+      reportSolutionsToSolutionCallback(salvagedResult);
       func->diagnose(diag::expression_too_complex)
         .highlight(func->getBodySourceRange());
       salvagedResult.markAsDiagnosed();
@@ -2370,24 +2407,32 @@ Optional<BraceStmt *> TypeChecker::applyResultBuilderBodyTransform(
   }
 
   if (cs.isDebugMode()) {
-    auto &log = llvm::errs();
+    auto indent = cs.solverState ? cs.solverState->getCurrentIndent() : 0;
+    auto &log = llvm::errs().indent(indent);
     log << "--- Applying Solution ---\n";
-    solutions.front().dump(log);
+    solutions.front().dump(log, indent);
     log << '\n';
+  }
+
+  if (cs.getASTContext().SolutionCallback) {
+    for (auto &solution : solutions) {
+      cs.getASTContext().SolutionCallback->sawSolution(solution);
+    }
+    return nullptr;
   }
 
   // FIXME: Shouldn't need to do this.
   cs.applySolution(solutions.front());
 
   // Apply the solution to the function body.
-  if (auto result = cs.applySolution(
-          solutions.front(),
-          SolutionApplicationTarget(func))) {
+  if (auto result =
+          cs.applySolution(solutions.front(), SyntacticElementTarget(func))) {
     performSyntacticDiagnosticsForTarget(*result, /*isExprStmt*/ false);
     auto *body = result->getFunctionBody();
 
     if (cs.isDebugMode()) {
-      auto &log = llvm::errs();
+      auto indent = cs.solverState ? cs.solverState->getCurrentIndent() : 0;
+      auto &log = llvm::errs().indent(indent);
       log << "--- Type-checked function body ---\n";
       body->dump(log);
       log << '\n';
@@ -2403,6 +2448,7 @@ Optional<ConstraintSystem::TypeMatchResult>
 ConstraintSystem::matchResultBuilder(AnyFunctionRef fn, Type builderType,
                                      Type bodyResultType,
                                      ConstraintKind bodyResultConstraintKind,
+                                     Type contextualType,
                                      ConstraintLocatorBuilder locator) {
   builderType = simplifyType(builderType);
   auto builder = builderType->getAnyNominal();
@@ -2457,7 +2503,9 @@ ConstraintSystem::matchResultBuilder(AnyFunctionRef fn, Type builderType,
     return None;
   }
 
-  if (Context.LangOpts.hasFeature(Feature::ResultBuilderASTTransform)) {
+  auto disableASTTransform = [&](NominalTypeDecl *builder) { return false; };
+
+  if (!disableASTTransform(builder)) {
     auto transformedBody = getBuilderTransformedBody(fn, builder);
     // If this builder transform has not yet been applied to this function,
     // let's do it and cache the result.
@@ -2477,13 +2525,16 @@ ConstraintSystem::matchResultBuilder(AnyFunctionRef fn, Type builderType,
         // If we're solving for code completion and the body contains the code
         // completion location, skipping it won't get us to a useful solution so
         // just bail.
-        if (isForCodeCompletion() && containsCodeCompletionLoc(fn.getBody())) {
+        if (isForCodeCompletion() &&
+            containsIDEInspectionTarget(fn.getBody())) {
           return getTypeMatchFailure(locator);
         }
 
         // Record the first unhandled construct as a fix.
-        if (recordFix(SkipUnhandledConstructInResultBuilder::create(
-                *this, unsupported, builder, getConstraintLocator(locator)))) {
+        if (recordFix(
+                SkipUnhandledConstructInResultBuilder::create(
+                    *this, unsupported, builder, getConstraintLocator(locator)),
+                /*impact=*/100)) {
           return getTypeMatchFailure(locator);
         }
 
@@ -2513,8 +2564,8 @@ ConstraintSystem::matchResultBuilder(AnyFunctionRef fn, Type builderType,
     if (isDebugMode()) {
       auto &log = llvm::errs();
       auto indent = solverState ? solverState->getCurrentIndent() : 0;
-      log.indent(indent) << "------- Transfomed Body -------\n";
-      transformedBody->second->dump(log);
+      log.indent(indent) << "------- Transformed Body -------\n";
+      transformedBody->second->dump(log, &getASTContext(), indent);
       log << '\n';
     }
 
@@ -2522,6 +2573,7 @@ ConstraintSystem::matchResultBuilder(AnyFunctionRef fn, Type builderType,
 
     transformInfo.builderType = builderType;
     transformInfo.bodyResultType = bodyResultType;
+    transformInfo.contextualType = contextualType;
     transformInfo.transformedBody = transformedBody->second;
 
     // Record the transformation.
@@ -2560,7 +2612,7 @@ ConstraintSystem::matchResultBuilder(AnyFunctionRef fn, Type builderType,
       // If we're solving for code completion and the body contains the code
       // completion location, skipping it won't get us to a useful solution so
       // just bail.
-      if (isForCodeCompletion() && containsCodeCompletionLoc(fn.getBody())) {
+      if (isForCodeCompletion() && containsIDEInspectionTarget(fn.getBody())) {
         return getTypeMatchFailure(locator);
       }
 
@@ -2665,6 +2717,10 @@ public:
     return ResultBuilderBodyPreCheck::Okay;
   }
 
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::Arguments;
+  }
+
   PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
     if (SkipPrecheck)
       return Action::SkipChildren(E);
@@ -2767,7 +2823,7 @@ ResultBuilderOpSupport TypeChecker::checkBuilderOpSupport(
 
     auto loc = extractNearestSourceLoc(dc);
     auto context = ExportContext::forFunctionBody(dc, loc);
-    return TypeChecker::checkDeclarationAvailability(D, context).hasValue();
+    return TypeChecker::checkDeclarationAvailability(D, context).has_value();
   };
 
   bool foundMatch = false;
@@ -2890,7 +2946,7 @@ void swift::printResultBuilderBuildFunction(
     componentTypeString = "<#Component#>";
 
   // Render the code.
-  std::string stubIndentStr = stubIndent.getValueOr(std::string());
+  std::string stubIndentStr = stubIndent.value_or(std::string());
   ExtraIndentStreamPrinter printer(out, stubIndentStr);
 
   // If we're supposed to provide a full stub, add a newline and the introducer

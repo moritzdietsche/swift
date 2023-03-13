@@ -78,6 +78,15 @@ namespace irgen {
                                 llvm::Value *storageAddress,
                                 const PointerAuthEntity &entity);
 
+    static PointerAuthInfo emit(IRGenFunction &IGF,
+                                clang::PointerAuthQualifier pointerAuthQual,
+                                llvm::Value *storageAddress);
+
+    static PointerAuthInfo emit(IRGenFunction &IGF,
+                                const PointerAuthSchema &schema,
+                                llvm::Value *storageAddress,
+                                llvm::ConstantInt *otherDiscriminator);
+
     static PointerAuthInfo forFunctionPointer(IRGenModule &IGM,
                                               CanSILFunctionType fnType);
 
@@ -175,6 +184,7 @@ namespace irgen {
       AsyncLetGetThrowing,
       AsyncLetFinish,
       TaskGroupWaitNext,
+      TaskGroupWaitAll,
       DistributedExecuteTarget,
     };
 
@@ -247,6 +257,7 @@ namespace irgen {
       case SpecialKind::AsyncLetGetThrowing:
       case SpecialKind::AsyncLetFinish:
       case SpecialKind::TaskGroupWaitNext:
+      case SpecialKind::TaskGroupWaitAll:
         return true;
       case SpecialKind::DistributedExecuteTarget:
         return false;
@@ -277,6 +288,7 @@ namespace irgen {
       case SpecialKind::AsyncLetGetThrowing:
       case SpecialKind::AsyncLetFinish:
       case SpecialKind::TaskGroupWaitNext:
+      case SpecialKind::TaskGroupWaitAll:
         return true;
       case SpecialKind::DistributedExecuteTarget:
         return false;
@@ -319,6 +331,14 @@ namespace irgen {
     llvm::Type *awaitSignature = nullptr;
     bool useSignature = false;
 
+    // True when this function pointer points to a non-throwing foreign
+    // function.
+    bool isForeignNoThrow = false;
+
+    // True when this function pointer points to a foreign function that traps
+    // on exception in the always_inline thunk.
+    bool foreignCallCatchesExceptionInThunk = false;
+
     explicit FunctionPointer(Kind kind, llvm::Value *value,
                              const Signature &signature)
         : FunctionPointer(kind, value, PointerAuthInfo(), signature) {}
@@ -340,7 +360,7 @@ namespace irgen {
           AuthInfo(authInfo), Sig(signature), awaitSignature(awaitSignature) {
       // The function pointer should have function type.
       assert(!value->getContext().supportsTypedPointers() ||
-             value->getType()->getPointerElementType()->isFunctionTy());
+             value->getType()->getNonOpaquePointerElementType()->isFunctionTy());
       // TODO: maybe assert similarity to signature.getType()?
       if (authInfo) {
         if (kind == Kind::Function) {
@@ -479,6 +499,24 @@ namespace irgen {
     bool shouldSuppressPolymorphicArguments() const {
       return kind.shouldSuppressPolymorphicArguments();
     }
+
+    void setForeignNoThrow() { isForeignNoThrow = true; }
+
+    bool canThrowForeignException() const {
+      return getForeignInfo().canThrow && !isForeignNoThrow;
+    }
+
+    void setForeignCallCatchesExceptionInThunk() {
+      foreignCallCatchesExceptionInThunk = true;
+    }
+
+    bool doesForeignCallCatchExceptionInThunk() {
+      return foreignCallCatchesExceptionInThunk;
+    }
+
+    bool shouldUseInvoke() const {
+      return canThrowForeignException() && !foreignCallCatchesExceptionInThunk;
+    }
   };
 
   class Callee {
@@ -569,6 +607,7 @@ namespace irgen {
     /// Given that this callee is an ObjC method, return the receiver
     /// argument.  This might not be 'self' anymore.
     llvm::Value *getObjCMethodSelector() const;
+    bool isDirectObjCMethod() const;
   };
 
   FunctionPointer::Kind classifyFunctionPointerKind(SILFunction *fn);

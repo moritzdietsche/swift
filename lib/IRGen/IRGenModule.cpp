@@ -85,13 +85,6 @@ static llvm::StructType *createStructType(IRGenModule &IGM,
                                   name, packed);
 }
 
-/// A helper for creating pointer-to-struct types.
-static llvm::PointerType *createStructPointerType(IRGenModule &IGM,
-                                                  StringRef name,
-                                  std::initializer_list<llvm::Type*> types) {
-  return createStructType(IGM, name, types)->getPointerTo(DefaultAS);
-}
-
 static clang::CodeGenerator *createClangCodeGenerator(ASTContext &Context,
                                                  llvm::LLVMContext &LLVMContext,
                                                       const IRGenOptions &Opts,
@@ -103,8 +96,11 @@ static clang::CodeGenerator *createClangCodeGenerator(ASTContext &Context,
   auto &ClangContext = Importer->getClangASTContext();
 
   auto &CGO = Importer->getClangCodeGenOpts();
-  if (CGO.OpaquePointers)
+  if (CGO.OpaquePointers) {
     LLVMContext.setOpaquePointers(true);
+  } else {
+    LLVMContext.setOpaquePointers(false);
+  }
 
   CGO.OptimizationLevel = Opts.shouldOptimize() ? 3 : 0;
 
@@ -355,24 +351,36 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   // A full type metadata record is basically just an adjustment to the
   // address point of a type metadata.  Resilience may cause
   // additional data to be laid out prior to this address point.
-  static_assert(MetadataAdjustmentIndex::ValueType == 1,
+  static_assert(MetadataAdjustmentIndex::ValueType == 2,
                 "Adjustment index must be synchronized with this layout");
   FullTypeMetadataStructTy = createStructType(*this, "swift.full_type", {
+    Int8PtrTy,
     WitnessTablePtrTy,
     TypeMetadataStructTy
   });
   FullTypeMetadataPtrTy = FullTypeMetadataStructTy->getPointerTo(DefaultAS);
 
+  FullForeignTypeMetadataStructTy = createStructType(*this, "swift.full_foreign_type", {
+    WitnessTablePtrTy,
+    TypeMetadataStructTy
+  });
+
   DeallocatingDtorTy = llvm::FunctionType::get(VoidTy, RefCountedPtrTy, false);
   llvm::Type *dtorPtrTy = DeallocatingDtorTy->getPointerTo();
+
+  FullExistentialTypeMetadataStructTy = createStructType(*this, "swift.full_existential_type", {
+    WitnessTablePtrTy,
+    TypeMetadataStructTy
+  });
 
   // A full heap metadata is basically just an additional small prefix
   // on a full metadata, used for metadata corresponding to heap
   // allocations.
-  static_assert(MetadataAdjustmentIndex::Class == 2,
+  static_assert(MetadataAdjustmentIndex::Class == 3,
                 "Adjustment index must be synchronized with this layout");
   FullHeapMetadataStructTy =
                   createStructType(*this, "swift.full_heapmetadata", {
+    Int8PtrTy,
     dtorPtrTy,
     WitnessTablePtrTy,
     TypeMetadataStructTy
@@ -628,6 +636,10 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
                        {RelativeAddressTy, RelativeAddressTy, RelativeAddressTy,
                         RelativeAddressTy, Int32Ty});
 
+  RuntimeDiscoverableAttributeTy =
+    createStructType(*this, "swift.runtime_attr",
+                     {Int32Ty, RelativeAddressTy, Int32Ty});
+
   AsyncFunctionPointerTy = createStructType(*this, "swift.async_func_pointer",
                                             {RelativeAddressTy, Int32Ty}, true);
   SwiftContextTy = llvm::StructType::create(getLLVMContext(), "swift.context");
@@ -690,14 +702,28 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
       *this, "swift.async_task_and_context",
       { SwiftTaskPtrTy, SwiftContextPtrTy });
 
-  ContinuationAsyncContextTy = createStructType(
-      *this, "swift.continuation_context",
-      {SwiftContextTy,       // AsyncContext header
-       SizeTy,               // flags
-       SizeTy,               // await synchronization
-       ErrorPtrTy,           // error result pointer
-       OpaquePtrTy,          // normal result address
-       SwiftExecutorTy});    // resume to executor
+  if (Context.LangOpts.isConcurrencyModelTaskToThread()) {
+    ContinuationAsyncContextTy = createStructType(
+        *this, "swift.continuation_context",
+        {SwiftContextTy,       // AsyncContext header
+         SizeTy,               // flags
+         SizeTy,               // await synchronization
+         ErrorPtrTy,           // error result pointer
+         OpaquePtrTy,          // normal result address
+         SwiftExecutorTy,      // resume to executor
+         SizeTy                // pointer to condition variable
+         });
+  } else {
+    ContinuationAsyncContextTy = createStructType(
+        *this, "swift.continuation_context",
+        {SwiftContextTy,       // AsyncContext header
+         SizeTy,               // flags
+         SizeTy,               // await synchronization
+         ErrorPtrTy,           // error result pointer
+         OpaquePtrTy,          // normal result address
+         SwiftExecutorTy       // resume to executor
+         });
+  }
   ContinuationAsyncContextPtrTy =
     ContinuationAsyncContextTy->getPointerTo(DefaultAS);
 
@@ -1124,7 +1150,7 @@ IRGenModule::createStringConstant(StringRef Str, bool willBeRelativelyAddressed,
   llvm::Constant *IRGenModule::get##NAME() {                                   \
     if (NAME)                                                                  \
       return NAME;                                                             \
-    NAME = Module.getOrInsertGlobal(SYM, FullTypeMetadataStructTy);            \
+    NAME = Module.getOrInsertGlobal(SYM, FullExistentialTypeMetadataStructTy);            \
     if (useDllStorage() && !isStandardLibrary())                               \
       ApplyIRLinkage(IRLinkage::ExternalImport)                                \
           .to(cast<llvm::GlobalVariable>(NAME));                               \
@@ -1183,6 +1209,12 @@ Address IRGenModule::getAddrOfObjCISAMask() {
         .to(cast<llvm::GlobalVariable>(ObjCISAMaskPtr));
   }
   return Address(ObjCISAMaskPtr, IntPtrTy, getPointerAlignment());
+}
+
+llvm::Constant *
+IRGenModule::getAddrOfAccessibleFunctionRecord(SILFunction *accessibleFn) {
+  auto entity = LinkEntity::forAccessibleFunctionRecord(accessibleFn);
+  return getAddrOfLLVMVariable(entity, ConstantInit(), DebugTypeInfo());
 }
 
 ModuleDecl *IRGenModule::getSwiftModule() const {
@@ -1293,7 +1325,7 @@ bool swift::irgen::shouldRemoveTargetFeature(StringRef feature) {
 }
 
 void IRGenModule::setHasNoFramePointer(llvm::AttrBuilder &Attrs) {
-  Attrs.addAttribute("frame-pointer", "none");
+  Attrs.addAttribute("frame-pointer", "non-leaf");
 }
 
 void IRGenModule::setHasNoFramePointer(llvm::Function *F) {
@@ -1864,6 +1896,7 @@ bool IRGenModule::canMakeStaticObjectsReadOnly() {
   // rdar://101126543
   return false;
 
+#if 0
   if (getOptions().DisableReadonlyStaticObjects)
     return false;
 
@@ -1874,6 +1907,7 @@ bool IRGenModule::canMakeStaticObjectsReadOnly() {
 
   return getAvailabilityContext().isContainedIn(
           Context.getImmortalRefCountSymbolsAvailability());
+#endif
 }
 
 void IRGenerator::addGenModule(SourceFile *SF, IRGenModule *IGM) {
@@ -1885,14 +1919,26 @@ void IRGenerator::addGenModule(SourceFile *SF, IRGenModule *IGM) {
   Queue.push_back(IGM);
 }
 
+IRGenModule *IRGenerator::getGenModule(SourceFile *SF) {
+  // If we're emitting for a single module, or a single file, we always use the
+  // primary IGM.
+  if (GenModules.size() == 1)
+    return getPrimaryIGM();
+
+ IRGenModule *IGM = GenModules[SF];
+ assert(IGM);
+ return IGM;
+}
+
 IRGenModule *IRGenerator::getGenModule(DeclContext *ctxt) {
   if (GenModules.size() == 1 || !ctxt) {
     return getPrimaryIGM();
   }
-  SourceFile *SF = ctxt->getParentSourceFile();
+  SourceFile *SF = ctxt->getOutermostParentSourceFile();
   if (!SF) {
     return getPrimaryIGM();
   }
+
   IRGenModule *IGM = GenModules[SF];
   assert(IGM);
   return IGM;
@@ -1936,8 +1982,9 @@ TypeExpansionContext IRGenModule::getMaximalTypeExpansionContext() const {
                                        getSILModule().isWholeModule());
 }
 
-const TypeLayoutEntry &IRGenModule::getTypeLayoutEntry(SILType T) {
-  return Types.getTypeLayoutEntry(T);
+const TypeLayoutEntry
+&IRGenModule::getTypeLayoutEntry(SILType T, bool useStructLayouts) {
+  return Types.getTypeLayoutEntry(T, useStructLayouts);
 }
 
 
